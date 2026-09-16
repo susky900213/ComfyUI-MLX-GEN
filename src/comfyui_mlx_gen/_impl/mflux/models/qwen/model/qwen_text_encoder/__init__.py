@@ -1,1 +1,0 @@
-# Qwen Text Encoder components

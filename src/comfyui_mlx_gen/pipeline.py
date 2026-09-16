@@ -110,8 +110,7 @@ def encode_text(defn, comps, text: str, cache, cache_key: str) -> Any:
         return prompt_encoder.encode_prompt(
             prompt=text,
             tokenizer=comps["tokenizer"],
-            text_encoder=comps["text_encoder"],
-            prompt_cache=None,
+            text_encoder=comps["text_encoder"]
         )
 
     encoding, _hit = cache.get_or_create("prompt_encoding", cache_key, build)

@@ -1,2 +1,0 @@
-# Z-Image model components
-
