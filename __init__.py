@@ -1,0 +1,46 @@
+"""ComfyUI-MLX-GEN 入口：注册节点（项目根目录，供 ComfyUI 以文件夹名加载）。"""
+
+import sys
+from pathlib import Path
+
+# 把 src 目录加入 sys.path，使 "comfyui_mlx_gen" 可被顶层导入
+SRC = Path(__file__).resolve().parent / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from comfyui_mlx_gen.nodes import (  # noqa: E402
+    clip_loader,
+    loader,
+    lora,
+    pil_to_torch,
+    sampler,
+    save,
+    text_encoder,
+    vae_decode,
+)
+
+NODE_CLASS_MAPPINGS = {
+    "MlxClipLoader": clip_loader.MlxClipLoader,
+    "MlxTextEncoder": text_encoder.MlxTextEncoder,
+    "MlxTransformerLoader": loader.MlxTransformerLoader,
+    "MlxModelLoraApply": lora.MlxModelLoraApply,
+    "MlxClipLoraApply": lora.MlxClipLoraApply,
+    "MlxKSamplerMLX": sampler.MlxKSamplerMLX,
+    "MlxVAEDecodeRawPIL": vae_decode.MlxVAEDecodeRawPIL,
+    "MlxSaveImage": save.MlxSaveImage,
+    "MlxPilToTorch": pil_to_torch.MlxPilToTorch,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "MlxClipLoader": "MLX CLIP 加载",
+    "MlxTextEncoder": "MLX 文本编码器",
+    "MlxTransformerLoader": "MLX 模型加载",
+    "MlxModelLoraApply": "MLX 模型 LoRA",
+    "MlxClipLoraApply": "MLX CLIP LoRA",
+    "MlxKSamplerMLX": "MLX 采样器",
+    "MlxVAEDecodeRawPIL": "MLX VAE 解码（PIL）",
+    "MlxSaveImage": "MLX 保存图片",
+    "MlxPilToTorch": "MLX PIL → 张量",
+}
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

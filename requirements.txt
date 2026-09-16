@@ -1,0 +1,2 @@
+# 唯一需要新装入 ComfyUI .venv 的包（mflux 走 vendor/，不 pip 安装）
+mlx==0.31.2
