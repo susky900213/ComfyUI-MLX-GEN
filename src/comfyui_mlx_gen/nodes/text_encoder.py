@@ -61,6 +61,12 @@ class MlxTextEncoder:
         # 空提示词按空格编码（与 mflux 对 negative_prompt 的处理一致）
         prompt = text if text and text.strip() else " "
 
+        # Ideogram 4 的 position ids / image token 数取决于目标宽高，而文本节点此时
+        # 还不知道采样尺寸。因此这里只传递原始 caption；真正的规范化、校验和编码由
+        # 采样器在拿到 width/height 后完成。负向节点保持标准连线，但其文本不会被模型使用。
+        if entry.family == "ideogram4":
+            return (MlxConditioning(clip=clip, text=text or "", encoding_key=""),)
+
         # 视频 / 音频家族（MiniMax-H3）：先组装成 H3 的三段式 presentation，再用
         # Qwen3-VL 编码；条件编码器不量化要常驻约 50 GB，所以必须 q8 / q4
         if entry.media != "image":

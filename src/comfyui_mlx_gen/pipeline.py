@@ -22,16 +22,22 @@ encoder、scheduler、vae 等），采样循环与权重加载由我们自己实
   `QwenLatentCreator.create_noise` 纯噪声起（`[1, seq, 64]`，**不接参考图**），
   默认 20 步 + flow_match_euler_discrete + guidance 4.0（见 `_sample_qwen_image`；
   latent 形状与 edit 一致，因此解码仍走同一个 `decode_latents`）。
+- ideogram4 本地文生图：采样器拿到目标宽高后才编码 JSON caption；文本编码器用完
+  立即释放，再加载 conditional / unconditional 两套 FP8 transformer，按官方
+  Ideogram4Scheduler 预设执行双模型 CFG；latent 用 Ideogram4LatentCreator 解包并
+  交给 Flux2VAE.decode。
 
-组件分工（延迟装配）：采样器只加载 transformer；text_encoder + tokenizer 由
+组件分工（延迟装配）：普通图片家族的采样器只加载 transformer；text_encoder + tokenizer 由
 MlxTextEncoder 自己加载并编码，VAE 由 MlxVAEEncoder / MlxVAEDecoder 按
 MlxVaeHandle 物化（编码与解码共用同一份实例）。采样器按 handle 里的缓存键
-直接取编码结果，不再碰文本编码器。
+直接取编码结果，不再碰文本编码器。Ideogram 4 是例外：条件依赖目标宽高，所以由
+采样器延迟编码；采样阶段同时物化两套 transformer。
 """
 
 from __future__ import annotations
 
 from inspect import signature
+from pathlib import Path
 from typing import Any, Sequence
 
 import mlx.core as mx
@@ -58,7 +64,17 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
     comp = entry.components[role]
     if not selection:
         raise ValueError(f"没有为 {role} 指定权重目录（请在节点上重新选择）")
-    return paths.resolve(comp.source, selection, role)
+    kind, resolved = paths.resolve(comp.source, selection, role)
+    # Ideogram 4 的权重根目录有 transformer/ 与 unconditional_transformer/ 两个
+    # 同级目录。现有 ComfyUI 模型目录只要求用户给 transformer 建一个软链；若没有
+    # 单独的 unconditional_transformer 软链，就从它解析后的真实目录寻找同级组件。
+    if kind == "missing" and role == "unconditional_transformer":
+        cond_kind, cond_path = paths.resolve(comp.source, selection, "transformer")
+        if cond_kind == "dir":
+            sibling = Path(cond_path).resolve().parent / "unconditional_transformer"
+            if sibling.is_dir():
+                return "dir", str(sibling)
+    return kind, resolved
 
 
 def resolve_class_kwargs(entry, kind: str, model_config) -> dict[str, Any]:
@@ -95,6 +111,19 @@ def resolve_class_kwargs(entry, kind: str, model_config) -> dict[str, Any]:
     return class_kwargs
 
 
+def component_class_kwargs(entry, role: str, path: str, model_config) -> dict[str, Any]:
+    """按组件实际目录生成构造参数；Ideogram 4 从本地 config.json 读取尺寸。"""
+    if entry.family == "ideogram4":
+        initializer = runtime.import_object(
+            "mflux.models.ideogram4.ideogram4_initializer:Ideogram4Initializer"
+        )
+        if role in ("transformer", "unconditional_transformer"):
+            return {"config": initializer._transformer_config(Path(path))}
+        if role == "text_encoder":
+            return initializer._text_encoder_kwargs(Path(path))
+    return resolve_class_kwargs(entry, role, model_config)
+
+
 def prepare_components(
     entry,
     roles: tuple[str, ...],
@@ -126,7 +155,7 @@ def prepare_components(
                 # 错误维度、加载权重对不上）；按当前 role 的目录名现算 config，
                 # 再只留构造函数接受的键（overrides 里混着运行时开关）。
                 model_config = weights.config_for_path(selection, entry.default_config)
-                class_kwargs = resolve_class_kwargs(entry, role, model_config)
+                class_kwargs = component_class_kwargs(entry, role, path, model_config)
                 # quantize=None → 用权重自带的档位（QuantizationResolution.resolve）
                 instance, _bits = components.create_and_load(
                     entry, role, kind, path, quantize, raw, class_kwargs=class_kwargs
@@ -195,9 +224,9 @@ def _attach_vl(comps: dict[str, Any]) -> None:
     comps["vl_encoder"] = enc_cls(encoder=comps["text_encoder"].encoder)
 
 
-def transformer_cache_key(model_handle) -> str:
-    """transformer 单独一项（不再与 VAE 绑成一个 bundle）。"""
-    return runtime.cache_key({"kind": "transformer", "model": model_handle})
+def transformer_cache_key(model_handle, role: str = "transformer") -> str:
+    """transformer 单独一项（Ideogram 4 的两套 transformer 按 role 分键）。"""
+    return runtime.cache_key({"kind": "transformer", "role": role, "model": model_handle})
 
 
 def vae_component(handle, cache) -> Any:
@@ -217,7 +246,7 @@ def vae_component(handle, cache) -> Any:
 
     def build():
         instance, _bits = components.create_and_load(
-            entry, "vae", kind, resolved, int(handle.quantize)
+            entry, "vae", kind, resolved, int(handle.quantize) or None
         )
         return instance
 
@@ -237,26 +266,30 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
     _ensure_image_family(entry, "MLX 采样器")
     model_config = weights.config_for_path(model_handle.model_path, entry.default_config)
 
-    def build_transformer():
-        kind, path = component_path(entry, "transformer", model_handle.model_path)
+    def build_transformer(role: str = "transformer"):
+        kind, path = component_path(entry, role, model_handle.model_path)
         if kind == "missing":
-            raise FileNotFoundError(f"未找到 transformer 权重: {path}")
+            raise FileNotFoundError(f"未找到 {role} 权重: {path}")
         # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例），
         # 但 overrides 里还混着运行时开关（qwen_edit_plus 之类）→ 要按签名过滤
         instance, _bits = components.create_and_load(
             entry,
-            "transformer",
+            role,
             kind,
             path,
-            model_handle.quantize,
-            class_kwargs=resolve_class_kwargs(entry, "transformer", model_config),
+            model_handle.quantize or None,
+            class_kwargs=component_class_kwargs(entry, role, path, model_config),
         )
         return instance
 
+    roles = ("transformer", "unconditional_transformer") if entry.family == "ideogram4" else ("transformer",)
     return {
-        "transformer": cache.get_or_create(
-            "module", transformer_cache_key(model_handle), build_transformer
+        role: cache.get_or_create(
+            "module",
+            transformer_cache_key(model_handle, role),
+            lambda role=role: build_transformer(role),
         )[0]
+        for role in roles
     }
 
 
@@ -341,6 +374,97 @@ def cached_encoding(cache, key: str, label: str) -> Any:
     if not hit or encoding is None:
         raise RuntimeError(f"{label}向条件的编码已失效，请重新运行「MLX 文本编码器」节点")
     return encoding
+
+
+# --- Ideogram 4：条件编码依赖目标宽高，因此由采样器在加载 transformer 前完成 ---
+IDEOGRAM4_SCHEDULERS: dict[str, str] = {
+    "ideogram4_default": "V4_DEFAULT_20",
+    "ideogram4_quality": "V4_QUALITY_48",
+    "ideogram4_turbo": "V4_TURBO_12",
+}
+IDEOGRAM4_PROMPT_BUCKET = "ideogram4_prompt"
+
+
+def ideogram4_preset(scheduler_name: str):
+    """ComfyUI scheduler widget 值 → MFLUX 的 Ideogram 4 官方预设。"""
+    preset_name = IDEOGRAM4_SCHEDULERS.get(scheduler_name)
+    if preset_name is None:
+        choices = ", ".join(IDEOGRAM4_SCHEDULERS)
+        raise ValueError(
+            f"Ideogram 4 必须选择自己的采样预设（{choices}），收到 {scheduler_name!r}"
+        )
+    scheduler = runtime.import_object(
+        "mflux.models.ideogram4.model.ideogram4_scheduler.scheduler:Ideogram4Scheduler"
+    )
+    return scheduler.get_preset(preset_name)
+
+
+def ideogram4_encoding_key(clip, prompt: str, width: int, height: int) -> str:
+    return runtime.cache_key(
+        {
+            "kind": "ideogram4_prompt",
+            "clip": clip,
+            "prompt": prompt,
+            "width": int(width),
+            "height": int(height),
+        }
+    )
+
+
+def prepare_ideogram4_conditioning(entry, clip, prompt: str, width: int, height: int, cache) -> str:
+    """编码 Ideogram 4 caption，并在返回前释放文本编码器。
+
+    缓存值是 ``(inputs, text_features)``。其中 inputs 同时包含目标图像 token 的
+    position/segment/indicator，因此宽高是缓存键的一部分，不能在 MlxTextEncoder
+    节点（尚不知道采样尺寸）提前计算。
+    """
+    if entry.family != "ideogram4":
+        raise ValueError(f"{entry.family} 不能走 Ideogram 4 条件编码")
+    latent_creator = runtime.import_object(entry.latent_creator)
+    latent_creator.validate_dimensions(width=int(width), height=int(height))
+    prompt_encoder = runtime.import_object(entry.prompt_encoder)
+    prompt = prompt_encoder.resolve_prompt(
+        prompt,
+        strict_caption_validation=False,
+        warn_on_caption_issues=True,
+    )
+    key = ideogram4_encoding_key(clip, prompt, width, height)
+    module_key = runtime.cache_key({"kind": "module", "clip": clip})
+
+    def build():
+        comps = prepare_encoder(entry, clip, cache, module_key)
+        inputs = prompt_encoder.build_inputs(
+            comps["tokenizer"], [prompt], height=int(height), width=int(width)
+        )
+        max_text_tokens = int(inputs["max_text_tokens"])
+        # 官方 encode_prompt 把图像占位 token 一起送进 36 层 Qwen；它们位于文本之后且
+        # attention mask 为 0，因果注意力下不会影响前面的文本输出。这里只编码真实文本段，
+        # 与官方文本特征等价，同时避免在 1024² 时为 4096 个占位 token 做无效前向。
+        token_ids = inputs["token_ids"][:, :max_text_tokens]
+        attention_mask = mx.ones(token_ids.shape, dtype=mx.int32)
+        position_ids = inputs["text_position_ids"][:, :max_text_tokens, 0]
+        features = comps["text_encoder"].get_prompt_embeds(
+            token_ids, attention_mask, position_ids
+        )
+        # Transformer 入口立即把官方 float32 输出转成 ModelConfig.precision；提前转换后缓存，
+        # 数值等价且把条件缓存减半。图像 token 的零特征在采样阶段按目标尺寸补回。
+        model_config_cls = runtime.import_object(
+            "mflux.models.common.config.model_config:ModelConfig"
+        )
+        features = features.astype(model_config_cls.precision)
+        mx.eval(features, inputs["position_ids"], inputs["segment_ids"], inputs["indicator"])
+        print(
+            f"[Ideogram 4 条件] {int(inputs['max_text_tokens'])} 个文本 token + "
+            f"{int(inputs['num_image_tokens'])} 个图像 token | features {tuple(features.shape)}"
+        )
+        return inputs, features
+
+    try:
+        cache.get_or_create(IDEOGRAM4_PROMPT_BUCKET, key, build)
+    finally:
+        # 采样要同时驻留两套约 8.7 GB transformer；编码完成或失败后都立即让出文本编码器。
+        cache.evict("module", module_key)
+    return key
 
 
 def edit_prompt_encoding_key(clip, text: str, image_digest: str, count: int) -> str:
@@ -773,7 +897,8 @@ def _sample_flux2(defn, comps, params, cache, model_config, guidance):
         if guidance > 1.0
         else None
     )
-    use_compile = bool(params.get("compile_model", True))
+    apple_silicon = runtime.import_object("mflux.utils.apple_silicon:AppleSiliconUtil")
+    use_compile = bool(params.get("compile_model", True)) and not apple_silicon.is_m1_or_m2()
     transformer = comps["transformer"]
     final = []
     for latents, latent_ids, _latent_h, _latent_w in per_seed:
@@ -1161,6 +1286,102 @@ def _sample_qwen_image(defn, comps, params, cache, model_config, guidance):
     return stacked
 
 
+def _sample_ideogram4(defn, comps, params, cache):
+    """Ideogram 4 FP8 文生图；与 MFLUX Ideogram4.generate_image 的去噪语义一致。"""
+    preset = ideogram4_preset(params["scheduler_name"])
+    num_steps = int(preset.num_steps)
+    prompt_data, hit = cache.get(IDEOGRAM4_PROMPT_BUCKET, params["positive_encoding_key"])
+    if not hit or prompt_data is None:
+        raise RuntimeError("Ideogram 4 正向条件已失效，请重新运行「MLX 文本编码器」节点")
+    inputs, text_features = prompt_data
+    scheduler = runtime.import_object(
+        "mflux.models.ideogram4.model.ideogram4_scheduler.scheduler:Ideogram4Scheduler"
+    )
+    t_values, s_values = scheduler.make_timesteps(
+        num_steps=num_steps,
+        height=int(params["height"]),
+        width=int(params["width"]),
+        mu=float(preset.mu),
+        std=float(preset.std),
+    )
+    latent_creator = runtime.import_object(defn.latent_creator)
+    conditional = comps["transformer"]
+    unconditional = comps["unconditional_transformer"]
+    max_text_tokens = int(inputs["max_text_tokens"])
+    num_image_tokens = int(inputs["num_image_tokens"])
+    llm_features = mx.concatenate(
+        [
+            text_features,
+            mx.zeros(
+                (text_features.shape[0], num_image_tokens, text_features.shape[-1]),
+                dtype=text_features.dtype,
+            ),
+        ],
+        axis=1,
+    )
+    text_padding = mx.zeros(
+        (1, max_text_tokens, conditional.config.in_channels), dtype=mx.float32
+    )
+    prompt_encoder = runtime.import_object(defn.prompt_encoder)
+    negative_inputs = prompt_encoder.negative_inputs(inputs, llm_features)
+    apple_silicon = runtime.import_object("mflux.utils.apple_silicon:AppleSiliconUtil")
+    use_compile = bool(params.get("compile_model", True)) and not apple_silicon.is_m1_or_m2()
+
+    def predict_conditional(z, t, padding, features):
+        joined = mx.concatenate([padding, z], axis=1)
+        output = conditional(
+            llm_features=features,
+            x=joined,
+            t=t,
+            position_ids=inputs["position_ids"],
+            segment_ids=inputs["segment_ids"],
+            indicator=inputs["indicator"],
+        )
+        return output[:, max_text_tokens:, :]
+
+    def predict_unconditional(z, t):
+        return unconditional(
+            llm_features=negative_inputs["llm_features"],
+            x=z,
+            t=t,
+            position_ids=negative_inputs["position_ids"],
+            segment_ids=negative_inputs["segment_ids"],
+            indicator=negative_inputs["indicator"],
+        )
+
+    if use_compile:
+        predict_conditional = mx.compile(predict_conditional)
+        predict_unconditional = mx.compile(predict_unconditional)
+
+    final = []
+    for batch_index in range(int(params["batch_size"])):
+        z = latent_creator.create_noise(
+            seed=int(params["seed"]) + batch_index,
+            width=int(params["width"]),
+            height=int(params["height"]),
+            latent_dim=conditional.config.in_channels,
+        )
+        # 官方循环正序 step、反序读取 schedule（高噪声 → 低噪声）。
+        for step_index in range(num_steps):
+            schedule_index = num_steps - 1 - step_index
+            t_value = float(t_values[schedule_index])
+            s_value = float(s_values[schedule_index])
+            guide = float(preset.guidance_schedule[schedule_index])
+            t = mx.full((1,), t_value, dtype=mx.float32)
+            pos_v = predict_conditional(z, t, text_padding, llm_features)
+            if abs(guide - 1.0) < 1e-6:
+                velocity = pos_v
+            else:
+                neg_v = predict_unconditional(z, t)
+                velocity = guide * pos_v + (1.0 - guide) * neg_v
+            z = z + velocity * (s_value - t_value)
+            mx.eval(z)
+        final.append(z)
+    stacked = mx.concatenate(final, axis=0)
+    mx.eval(stacked)
+    return stacked
+
+
 def run_sampler(defn, model_handle, comps, params, cache):
     """跑完整采样，返回带缓存数组的 latent 句柄。
 
@@ -1195,6 +1416,8 @@ def run_sampler(defn, model_handle, comps, params, cache):
             return _sample_flux2(defn, comps, params, cache, model_config, guidance)
         if defn.family == "qwen_image":
             return _sample_qwen_image(defn, comps, params, cache, model_config, guidance)
+        if defn.family == "ideogram4":
+            return _sample_ideogram4(defn, comps, params, cache)
         return _sample_z_image(defn, comps, params, cache, model_config, guidance)
 
     key = runtime.cache_key(
@@ -1231,6 +1454,11 @@ def decode_latents(defn, comps, latents, height, width):
     """
     latent_creator = runtime.import_object(defn.latent_creator)
     vae = comps["vae"]
+    if defn.family == "ideogram4":
+        if latents.ndim == 2:
+            latents = latents[None, ...]
+        unpacked = latent_creator.unpack_latents(latents, height, width)
+        return vae.decode(unpacked)
     if defn.family == "flux2":
         if latents.ndim == 2:
             latents = latents[None, ...]  # [seq, C] → [1, seq, C]

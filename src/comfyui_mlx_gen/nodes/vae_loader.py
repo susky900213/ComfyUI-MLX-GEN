@@ -17,7 +17,7 @@ from ..types import MlxVaeHandle, entry_for, model_types, vae
 
 NO_WEIGHTS = "<无可用权重>"
 PRECISIONS = ["bfloat16", "float16", "float32"]
-QUANTIZE_OPTIONS = [4, 8, 16]
+QUANTIZE_OPTIONS = [0, 4, 8, 16]
 # 图片链路只有 "vae"；MiniMax-H3 还有 "audio_vae"（权重通常也放在 vae/ 下，
 # 因此 MlxVAELoader 的候选取两个目录的并集，解析时 audio_vae 缺失会退回 vae/）
 ROLES = ["vae", "audio_vae"]

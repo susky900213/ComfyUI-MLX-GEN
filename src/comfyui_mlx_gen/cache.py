@@ -13,6 +13,8 @@ _TYPE_CAPS: dict[str, int] = {
     # 正/负条件各占一条，再多留几档给换提示词的情况
     # （flux2/z_image 存编码数组；qwen_edit 存 (embeds, mask)，1.5 MB 量级）
     "prompt_encoding": 6,
+    # Ideogram 4 的每条条件为多层 Qwen 特征；只保留当前工作流的一条，换 prompt / 尺寸即淘汰
+    "ideogram4_prompt": 1,
     "component_weights": 2,
     "image": 6,
     # 参考图条件（flux2：packed + grid ids + 宽高；qwen_edit：packed + ids + patch 尺寸），

@@ -1,6 +1,6 @@
 """运行环境 + 唯一 import 入口。
 
-- sys.path 指向 _impl（我们自己拷贝的 mflux 源码），不 pip 安装 mflux
+- 若插件自带 _impl，则优先使用；否则使用 requirements.txt 安装的 mflux
 - 校验 MLX 版本与 Metal 设备
 - 缓存键生成、内存水位检查、缓存清理
 """
@@ -19,11 +19,14 @@ from typing import Any
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 IMPL_DIR = PLUGIN_DIR / "_impl"
-REQUIRED_MLX = "0.31.2"
+REQUIRED_MLX = ">=0.32.0,<0.33.0"
 
 
 # --- sys.path / 导入（唯一入口） ---
 def ensure_impl_path() -> str:
+    if not IMPL_DIR.is_dir():
+        # PyPI mflux 0.19.1 自带 Ideogram 4；无需改 sys.path。
+        return ""
     p = str(IMPL_DIR)
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -51,7 +54,7 @@ def check_mlx() -> str:
         import mlx.core as mx  # type: ignore
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            f"无法导入 MLX（需要 mlx=={REQUIRED_MLX}），"
+            f"无法导入 MLX（需要 mlx{REQUIRED_MLX}），"
             f"请在 ComfyUI 的 .venv 里 pip install -r requirements.txt：{exc}"
         ) from exc
     if not hasattr(mx, "metal") or not mx.metal.is_available():

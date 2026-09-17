@@ -111,7 +111,7 @@ class MlxVAEDecodeRawPIL:
                 "model_type": (types, {"default": default_type}),
                 "model_path": (vae_paths, {"default": vae_paths[0]}),
                 "precision": (["bfloat16", "float16", "float32"], {"default": "bfloat16"}),
-                "quantize": ([4, 8, 16], {"default": 8}),
+                "quantize": ([0, 4, 8, 16], {"default": 8}),
                 "batch_index": ("INT", {"default": -1, "min": -1, "max": 3}),
             },
             # 只有 MiniMax-H3 用得上：接第二个 MlxVAELoader（role=audio_vae）才出声音

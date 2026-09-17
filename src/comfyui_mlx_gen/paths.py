@@ -1,7 +1,7 @@
 """路径解析与扫描（独立于 ComfyUI 默认模型目录）。
 
 模型根目录：/Users/apple/ComfyUI-Shared/models/mlx
-子目录：transformer/ vae/ text_encoder/ tokenizer/ lora/
+子目录：transformer/ unconditional_transformer/ vae/ text_encoder/ tokenizer/ lora/
 每个子目录下可以有多个「模型文件夹」，也可以是单个 .safetensors 文件。
 """
 
@@ -12,7 +12,14 @@ from pathlib import Path
 # 模型根目录（D-3）
 MODEL_ROOT = Path("/Users/apple/ComfyUI-Shared/models/mlx")
 
-COMPONENT_DIRS: tuple[str, ...] = ("transformer", "vae", "text_encoder", "tokenizer", "lora")
+COMPONENT_DIRS: tuple[str, ...] = (
+    "transformer",
+    "unconditional_transformer",
+    "vae",
+    "text_encoder",
+    "tokenizer",
+    "lora",
+)
 
 
 def component_dir(component: str) -> Path:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from inspect import signature
 from typing import Any
 
 from . import runtime, weights
@@ -75,12 +76,19 @@ def apply_weights(
             mflux_version=loaded.version,
         ),
     )
-    return wa.apply_and_quantize_single(
+    kwargs = dict(
         weights=loaded_weights,
         model=instance,
         component=data_def,
         quantize_arg=quantize,
     )
+    # MFLUX 0.19.1 的新版接口允许模型族提供逐层量化 predicate（Ideogram 4 的
+    # Fp8Linear 需要它）；兼容仓库既有环境中没有该参数的旧接口。
+    if "quantization_predicate" in signature(wa.apply_and_quantize_single).parameters:
+        kwargs["quantization_predicate"] = getattr(
+            runtime.import_object(defn.weight_def), "quantization_predicate", None
+        )
+    return wa.apply_and_quantize_single(**kwargs)
 
 
 def load_tokenizer(defn: Any, component: str, kind: str, path: str, max_length: int | None = None) -> Any:

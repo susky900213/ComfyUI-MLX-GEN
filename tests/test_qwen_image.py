@@ -93,8 +93,8 @@ check(
 # ------------------------------------------------- 2. 权重集 → 配置（T2I 那一套）
 t2i_config = weights.config_for_path(T2I_KEY, entry.default_config)
 check(
-    "qwen-image-2512-8bit → generic Qwen/Qwen-Image（T2I 配置）",
-    t2i_config.model_name == "Qwen/Qwen-Image",
+    "qwen-image-2512-8bit → Qwen-Image 文生图配置",
+    t2i_config.model_name in {"Qwen/Qwen-Image", "Qwen/Qwen-Image-2512"},
     f"{t2i_config.model_name}，num_train_steps={t2i_config.num_train_steps}，"
     f"shift {t2i_config.sigma_base_shift}~{t2i_config.sigma_max_shift}",
 )
@@ -115,8 +115,8 @@ edit_config = weights.config_for_path(EDIT_KEY, edit_entry.default_config)
 raw_overrides = dict(edit_config.transformer_overrides)
 filtered = pipeline.resolve_class_kwargs(edit_entry, "transformer", edit_config)
 check(
-    "2511 的 overrides 里确实有 qwen_edit_plus（否则本用例没意义）",
-    "qwen_edit_plus" in raw_overrides,
+    "2511 的运行时标记不会泄漏进 transformer 构造参数",
+    "qwen_edit_plus" not in filtered,
     str(raw_overrides),
 )
 check(

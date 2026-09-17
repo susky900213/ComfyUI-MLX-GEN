@@ -1,0 +1,36 @@
+{
+  "id": "mlx-ideogram-4-fp8",
+  "revision": 0,
+  "last_node_id": 11,
+  "last_link_id": 11,
+  "nodes": [
+    {"id": 1, "type": "MlxClipLoader", "pos": [40, 40], "size": [360, 210], "flags": {}, "order": 0, "mode": 0, "inputs": [], "outputs": [{"name": "CLIP", "type": "CLIP", "links": [2, 4], "slot_index": 0}], "properties": {"Node name for S&R": "MlxClipLoader"}, "widgets_values": ["ideogram4", "text_encoder", "ideogram-4-fp8", "bfloat16", 2048, 0]},
+    {"id": 2, "type": "MlxTextEncoder", "pos": [40, 300], "size": [480, 300], "flags": {}, "order": 2, "mode": 0, "inputs": [{"name": "clip", "type": "CLIP", "link": 2, "slot_index": 0}], "outputs": [{"name": "condition", "type": "condition", "links": [3], "slot_index": 0}], "properties": {"Node name for S&R": "MlxTextEncoder"}, "title": "Ideogram 4 正向 JSON caption", "widgets_values": ["{\n  \"high_level_description\": \"A premium square poster for a jazz festival, printed on warm ivory paper.\",\n  \"style_description\": {\n    \"aesthetics\": \"bold Swiss editorial design, refined letterpress texture\",\n    \"lighting\": \"flat graphic lighting\",\n    \"medium\": \"screen-printed poster\",\n    \"color_palette\": [\"#F4E9D8\", \"#D64B32\", \"#172A3A\"]\n  },\n  \"compositional_deconstruction\": {\n    \"background\": \"Warm ivory paper with subtle fibers.\",\n    \"elements\": [\n      {\"type\": \"text\", \"bbox\": [80, 80, 260, 920], \"text\": \"MIDNIGHT JAZZ\", \"desc\": \"Large condensed navy sans-serif title.\"},\n      {\"type\": \"obj\", \"bbox\": [300, 170, 830, 830], \"desc\": \"A red abstract saxophone formed from sweeping geometric ribbons.\"},\n      {\"type\": \"text\", \"bbox\": [850, 120, 920, 880], \"text\": \"FRIDAY 9 PM • BLUE NOTE HALL\", \"desc\": \"Small uppercase event details.\"}\n    ]\n  }\n}"]},
+    {"id": 3, "type": "MlxTextEncoder", "pos": [40, 650], "size": [360, 150], "flags": {}, "order": 3, "mode": 0, "inputs": [{"name": "clip", "type": "CLIP", "link": 4, "slot_index": 0}], "outputs": [{"name": "condition", "type": "condition", "links": [5], "slot_index": 0}], "properties": {"Node name for S&R": "MlxTextEncoder"}, "title": "保持标准负向连线（Ideogram 4 会忽略文本）", "widgets_values": [""]},
+    {"id": 4, "type": "MlxTransformerLoader", "pos": [560, 40], "size": [360, 230], "flags": {}, "order": 1, "mode": 0, "inputs": [], "outputs": [{"name": "model", "type": "model", "links": [1], "slot_index": 0}], "properties": {"Node name for S&R": "MlxTransformerLoader"}, "widgets_values": ["ideogram4", "ideogram-4-fp8", 0, "bfloat16", true, 2]},
+    {"id": 6, "type": "MlxVAELoader", "pos": [560, 320], "size": [360, 210], "flags": {}, "order": 4, "mode": 0, "inputs": [], "outputs": [{"name": "vae", "type": "mlx_vae", "links": [7], "slot_index": 0}], "properties": {"Node name for S&R": "MlxVAELoader"}, "widgets_values": ["ideogram4", "ideogram-4-fp8", "bfloat16", 0, "vae"]},
+    {"id": 5, "type": "MlxKSamplerMLX", "pos": [980, 180], "size": [420, 500], "flags": {}, "order": 5, "mode": 0, "inputs": [{"name": "model", "type": "model", "link": 1, "slot_index": 0}, {"name": "positive", "type": "condition", "link": 3, "slot_index": 1}, {"name": "negative", "type": "condition", "link": 5, "slot_index": 2}], "outputs": [{"name": "latents", "type": "latents", "links": [6], "slot_index": 0}], "properties": {"Node name for S&R": "MlxKSamplerMLX"}, "title": "Ideogram 4 本地文生图（V4_DEFAULT_20）", "widgets_values": [42, 20, 1024, 1024, 1, 7.0, "ideogram4_default", 124, 12.0, 3.0, "auto"]},
+    {"id": 7, "type": "MlxVAEDecoder", "pos": [1440, 200], "size": [340, 260], "flags": {}, "order": 6, "mode": 0, "inputs": [{"name": "vae", "type": "mlx_vae", "link": 7, "slot_index": 0}, {"name": "latents", "type": "latents", "link": 6, "slot_index": 1}], "outputs": [{"name": "images", "type": "images", "links": [8, 9], "slot_index": 0}], "properties": {"Node name for S&R": "MlxVAEDecoder"}, "widgets_values": [-1]},
+    {"id": 8, "type": "MlxSaveImage", "pos": [1820, 40], "size": [340, 180], "flags": {}, "order": 7, "mode": 0, "inputs": [{"name": "images", "type": "images", "link": 8, "slot_index": 0}], "outputs": [], "properties": {"Node name for S&R": "MlxSaveImage"}, "widgets_values": ["ideogram-4-fp8", "<auto>"]},
+    {"id": 9, "type": "MlxPilToTorch", "pos": [1820, 260], "size": [340, 140], "flags": {}, "order": 8, "mode": 0, "inputs": [{"name": "images", "type": "images", "link": 9, "slot_index": 0}], "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [10, 11], "slot_index": 0}, {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}, {"name": "AUDIO", "type": "AUDIO", "links": null, "slot_index": 2}], "properties": {"Node name for S&R": "MlxPilToTorch"}, "widgets_values": []},
+    {"id": 10, "type": "SaveImage", "pos": [2200, 260], "size": [300, 280], "flags": {}, "order": 9, "mode": 0, "inputs": [{"name": "images", "type": "IMAGE", "link": 10, "slot_index": 0}], "outputs": [], "properties": {"Node name for S&R": "SaveImage"}, "widgets_values": ["ComfyUI-MLX-GEN-ideogram4"]},
+    {"id": 11, "type": "PreviewImage", "pos": [2200, 580], "size": [300, 280], "flags": {}, "order": 10, "mode": 0, "inputs": [{"name": "images", "type": "IMAGE", "link": 11, "slot_index": 0}], "outputs": [], "properties": {"Node name for S&R": "PreviewImage"}, "widgets_values": []}
+  ],
+  "links": [
+    [1, 4, 0, 5, 0, "model"],
+    [2, 1, 0, 2, 0, "CLIP"],
+    [3, 2, 0, 5, 1, "condition"],
+    [4, 1, 0, 3, 0, "CLIP"],
+    [5, 3, 0, 5, 2, "condition"],
+    [6, 5, 0, 7, 1, "latents"],
+    [7, 6, 0, 7, 0, "mlx_vae"],
+    [8, 7, 0, 8, 0, "images"],
+    [9, 7, 0, 9, 0, "images"],
+    [10, 9, 0, 10, 0, "IMAGE"],
+    [11, 9, 0, 11, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.85, "offset": [0, 0]}},
+  "version": "0.4"
+}

@@ -18,7 +18,8 @@ from __future__ import annotations
 from .. import paths, runtime
 from ..types import MlxModelHandle, entry_for, model_types
 
-QUANTIZE_OPTIONS = [4, 8, 16]
+# 0 = 保留磁盘精度（Ideogram 4 官方 checkpoint 已是 FP8，不应再做一次在线量化）。
+QUANTIZE_OPTIONS = [0, 4, 8, 16]
 NO_WEIGHTS = "<无可用权重>"
 
 

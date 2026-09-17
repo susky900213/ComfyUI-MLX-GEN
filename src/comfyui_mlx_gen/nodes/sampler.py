@@ -4,9 +4,10 @@
 条条件」两个入口（`positive` / `negative`，类型都是 condition，由两
 个独立的 MlxTextEncoder 节点分别产出，各自只带一条提示词）。
 
-本节点只加载 transformer；编码已由 MlxTextEncoder 算好并按 key 存在
-cache.py 里，这里按 key 取用，不再加载文本编码器；VAE 也不在这里加载
-（采样阶段不需要，交给 VAE 编码 / 解码节点按 handle 物化）。
+普通图片家族在本节点只加载 transformer；编码已由 MlxTextEncoder 算好并按 key
+存在 cache.py 里，这里按 key 取用。Ideogram 4 的条件依赖目标尺寸，是唯一例外：
+本节点先延迟编码并释放文本编码器，再加载两套 transformer。VAE 一律不在采样阶段
+加载，交给 VAE 编码 / 解码节点按 handle 物化。
 
 Flux.2 参考图编辑（edit）：把「MLX VAE 编码」的输出接到可选入口 `ref_images`
 上即可 —— 采样时会按 mflux `Flux2KleinEdit` 的语义，把参考图 latent 拼在目标
@@ -26,6 +27,10 @@ Qwen-Image-Edit 多图编辑（edit）：同样接 `ref_images`，但条件必�
 入参含 Config 对象与步号 int，不支持 `mx.compile`（`entry.supports_compile=False`
 会强制关掉编译开关），CFG 用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定）。
 
+Ideogram 4 本地文生图：三个加载器选 `ideogram4` + `ideogram-4-fp8`，仍沿用本节点
+的 model / positive / negative 三条标准连线；负向文本会被忽略，scheduler 必须选择
+ideogram4_default / quality / turbo 之一，步数和 guidance schedule 由预设决定。
+
 widget 里的 steps / scheduler / guidance 只是工作流自己填的值（初始默认取
 「第一个大类」登记的 default_steps / default_scheduler / default_guidance）；真正用哪套
 ModelConfig 由连进来的 handle 的权重目录名现算，因此新增权重目录不用改这里。
@@ -43,7 +48,14 @@ from ..cache import CACHE
 from ..h3.latent_creator.h3_layout import valid_frame_counts
 from ..types import condition, entry_for, model, model_types, ref_images
 
-SCHEDULERS = ["linear", "flow_match_euler_discrete", "seedvr2_euler"]
+SCHEDULERS = [
+    "linear",
+    "flow_match_euler_discrete",
+    "seedvr2_euler",
+    "ideogram4_default",
+    "ideogram4_quality",
+    "ideogram4_turbo",
+]
 KV_CACHE_MODES = ["auto", "off"]
 # 画布档位：图片链路原有的几档 + MiniMax-H3 的推荐档位（H3 必须是 32 的倍数，
 # 且宽高比要在 [1/4, 4] 之内；见 h3/pipeline.make_plan）
@@ -181,6 +193,11 @@ class MlxKSamplerMLX:
                 "并把它接到本节点的 ref_images 入口（条件也要用「MLX Qwen 编辑条件」节点）"
             )
         if ref_images is not None:
+            if entry.family == "ideogram4":
+                raise NotImplementedError(
+                    "Ideogram 4 本地权重目前只支持文生图，不支持 Remix、参考图或蒙版编辑；"
+                    "请断开 ref_images"
+                )
             if entry.family == "qwen_image":
                 raise ValueError(
                     "qwen_image 是文生图大类，本大类不接参考图（qwen-image-2512 这类"
@@ -232,6 +249,28 @@ class MlxKSamplerMLX:
             "ref_count": ref_count,
             "kv_cache": kv_cache,
         }
+        if entry.family == "ideogram4":
+            if not positive.text.strip():
+                raise ValueError("Ideogram 4 的正向 caption 不能为空")
+            preset = pipeline.ideogram4_preset(scheduler)
+            if int(steps) != preset.num_steps or float(guidance) != preset.guidance_schedule[-1]:
+                print(
+                    f"[MlxKSamplerMLX] Ideogram 4 的 {scheduler} 预设固定使用 "
+                    f"{preset.num_steps} 步及内置 guidance schedule；已忽略 steps / guidance widget"
+                )
+            params["steps"] = int(preset.num_steps)
+            params["guidance"] = float(preset.guidance_schedule[-1])
+            params["positive_encoding_key"] = pipeline.prepare_ideogram4_conditioning(
+                entry,
+                positive.clip,
+                positive.text,
+                int(width),
+                int(height),
+                CACHE,
+            )
+            params["negative_encoding_key"] = ""
+            if negative.text.strip():
+                print("[MlxKSamplerMLX] Ideogram 4 固定使用空无条件分支，已忽略 negative 文本")
         # 只加载 transformer；编码按 key 从 cache.py 取，VAE 由编码/解码节点按 handle 物化
         comps = pipeline.prepare_sampler_components(entry, model, CACHE)
         handle = pipeline.run_sampler(entry, model, comps, params, CACHE)

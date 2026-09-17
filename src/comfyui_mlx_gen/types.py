@@ -258,12 +258,14 @@ def _components(
     vae: str,
     text_encoder: str,
     tokenizer_name: str,
+    transformer_name: str = "transformer",
+    unconditional_transformer: str = "",
     text_encoder_attach: str = "",
     audio_vae: str = "",
 ) -> dict[str, ComponentDef]:
     """构造各 role 的组件定义（只写「用哪个类」，路径来自 widget）。"""
     comps = {
-        "transformer": ComponentDef("transformer", transformer, "local"),
+        "transformer": ComponentDef(transformer_name, transformer, "local"),
         "vae": ComponentDef("vae", vae, "local"),
         "text_encoder": ComponentDef(
             "text_encoder", text_encoder, "local", attach_import=text_encoder_attach
@@ -271,6 +273,10 @@ def _components(
         # tokenizer 没有 class_import，由 weight_def 的 TokenizerDefinition 决定
         "tokenizer": ComponentDef(tokenizer_name, "", "local"),
     }
+    if unconditional_transformer:
+        comps["unconditional_transformer"] = ComponentDef(
+            "unconditional_transformer", unconditional_transformer, "local"
+        )
     if audio_vae:  # 只有 MiniMax-H3 有第二个 VAE（音频）
         comps["audio_vae"] = ComponentDef("audio_vae", audio_vae, "local")
     return comps
@@ -394,6 +400,51 @@ QWEN_IMAGE = MlxModelEntry(
 )
 
 
+# --- Ideogram 4 FP8（本地文生图；条件 / 无条件各一套 transformer）------------
+IDEOGRAM4 = MlxModelEntry(
+    family="ideogram4",
+    weight_def=(
+        "mflux.models.ideogram4.weights.ideogram4_weight_definition:Ideogram4WeightDefinition"
+    ),
+    components=_components(
+        transformer=(
+            "mflux.models.ideogram4.model.ideogram4_transformer.transformer:"
+            "Ideogram4Transformer"
+        ),
+        transformer_name="conditional_transformer",
+        unconditional_transformer=(
+            "mflux.models.ideogram4.model.ideogram4_transformer.transformer:"
+            "Ideogram4Transformer"
+        ),
+        vae="mflux.models.flux2.model.flux2_vae.vae:Flux2VAE",
+        text_encoder=(
+            "mflux.models.ideogram4.model.ideogram4_text_encoder.text_encoder:"
+            "Qwen3TextEncoder"
+        ),
+        tokenizer_name="ideogram4",
+    ),
+    default_config="ideogram4_fp8",
+    default_steps=20,
+    default_scheduler="ideogram4_default",
+    default_guidance=7.0,
+    supports_compile=True,
+    prompt_encoder=(
+        "mflux.models.ideogram4.model.ideogram4_text_encoder.prompt_encoder:"
+        "Ideogram4PromptEncoder"
+    ),
+    latent_creator=(
+        "mflux.models.ideogram4.latent_creator.ideogram4_latent_creator:"
+        "Ideogram4LatentCreator"
+    ),
+    supported=True,
+    notes=(
+        "本地 Ideogram 4 FP8 文生图；使用标准 MLX Loader / Text Encoder / KSampler / "
+        "VAE Decoder 节点链。模型原生包含 conditional 与 unconditional 两套 transformer；"
+        "不支持 Remix、蒙版编辑或自定义负向提示词。"
+    ),
+)
+
+
 # --- MiniMax-H3（文生视频 + 立体声）：绕开 mflux 的注册表与整体加载路径 ---
 MINIMAX_H3 = MlxModelEntry(
     family="minimax_h3",
@@ -430,6 +481,7 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
     "flux2": FLUX2_KLEIN,
     "qwen_edit": QWEN_EDIT,
     "qwen_image": QWEN_IMAGE,
+    "ideogram4": IDEOGRAM4,
     # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
     "minimax_h3": MINIMAX_H3,
 }

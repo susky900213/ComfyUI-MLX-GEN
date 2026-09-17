@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from inspect import signature
 from pathlib import Path
 import re
 from typing import Any
@@ -132,7 +133,10 @@ def _load_single_file(wl: Any, comp: Any, file: Path) -> tuple[dict[str, Any], i
         prefixes = tuple(comp.weight_prefix_filters)
         raw = {k: v for k, v in raw.items() if k.startswith(prefixes)}
     if comp.precision is not None:
-        raw = wl._convert_precision(raw, comp.precision, precision_override=comp.precision_override)
+        convert_kwargs = {}
+        if "precision_override" in signature(wl._convert_precision).parameters:
+            convert_kwargs["precision_override"] = getattr(comp, "precision_override", None)
+        raw = wl._convert_precision(raw, comp.precision, **convert_kwargs)
 
     if comp.mapping_getter is None:
         if comp.bulk_transform is not None:
