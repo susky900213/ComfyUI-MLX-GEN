@@ -10,6 +10,11 @@ cache.py 里，这里按 key 取用，不再加载文本编码器。
 widget 里的 steps / scheduler / guidance 只是工作流自己填的值（初始默认取
 「第一个大类」登记的 default_steps / default_scheduler）；真正用哪套
 ModelConfig 由连进来的 handle 的权重目录名现算，因此新增权重目录不用改这里。
+
+注意（选 flux2 时）：默认值取自第一个大类（z_image）的 `linear`，而 Flux2 走
+flow-match，请把 scheduler 改成 `flow_match_euler_discrete`（`workflows/
+flux2-klein-9b-*.json` 已填好）；steps 取 4、guidance 保持 1.0（Klein 是蒸馏
+模型，不开 CFG，只有 guidance > 1.0 时才会用负面条件）。
 """
 
 from __future__ import annotations

@@ -139,7 +139,7 @@ class MlxModelEntry:
     default_steps: int  # 节点 widget 的默认步数（工作流里可改）
     default_scheduler: str  # 节点 widget 的默认调度器（工作流里可改）
     prompt_encoder: str  # 提示编码入口（"module:Class.method"）
-    prompt_encoder_args: dict[str, Any]  # 目前仅登记，编码入口自己决定
+    prompt_encoder_args: dict[str, Any]  # 编码入口的额外参数（flux2 会用；"cache" 暂不支持）
     latent_creator: str  # "module:Class"
     supported: bool = True  # False = 尚未验证，选中时节点拒绝执行
     notes: str = ""
@@ -201,8 +201,12 @@ FLUX2_KLEIN = MlxModelEntry(
         "cache": True,
     },
     latent_creator="mflux.models.flux2.latent_creator.flux2_latent_creator:Flux2LatentCreator",
-    supported=False,
-    notes="待 M2 验证；权重定义只写了 9b，4b/base 需要另加配置。",
+    supported=True,
+    notes=(
+        "已对接文生图（txt2img）；权重定义只写了 9b（flux.2-klein-9b-*），"
+        "4b / base 需要另加配置。默认 guidance=1.0（klein 蒸馏模型不开 CFG），"
+        "调度器请用 flow_match_euler_discrete。"
+    ),
 )
 
 # 键 = 模型大类（= model_type 下拉）；大类内用哪套配置由权重目录名决定

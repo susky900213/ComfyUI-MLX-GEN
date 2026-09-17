@@ -45,7 +45,7 @@ class MlxTransformerLoader:
 
     def load(self, model_type, model_path, quantize, precision, compile, compile_cache_limit):
         # 未知大类 → 直接报错（不静默回退，避免加载到错的类）；
-        # 已知但尚未验证的大类（flux2）提示还没实现
+        # 已知但尚未验证的大类（MODEL_DEFS 里 supported=False）提示还没实现
         entry = entry_for(model_type)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
