@@ -58,14 +58,20 @@ class MlxTransformerLoader:
         kind, resolved = paths.resolve("local", model_path, "transformer")
         if kind == "missing":
             raise FileNotFoundError(f"未找到 transformer 权重: {resolved}")
-        # 视频 / 音频家族（MiniMax-H3）：transformer 入参含逐行 timestep 与 int 索引，
-        # 不支持 mx.compile；未量化约 108 GB 常驻，必须量化到 4 / 8 位
-        if entry.media != "image":
+        # MiniMax-H3：transformer 入参含逐行 timestep 与 int 索引，不支持 mx.compile；
+        # 未量化约 108 GB 常驻，必须量化到 4 / 8 位。
+        if entry.media == "video":
             if int(quantize) not in (4, 8):
                 raise ValueError(
                     f"{entry.family} 的 transformer 必须量化到 4 或 8 位（收到 {quantize}）；"
                     "不量化会超出 128 GB 机器的常驻预算"
                 )
+            if compile:
+                print(f"[MlxTransformerLoader] {entry.family} 不支持 mx.compile，已自动关掉编译")
+            compile, compile_cache_limit = False, 0
+        elif entry.media == "audio":
+            # YuE2 checkpoint 自带量化元数据（4bit / 8bit）或 BF16 权重；不在加载时
+            # 二次量化。保留 widget 值只用于句柄诊断与缓存键。
             if compile:
                 print(f"[MlxTransformerLoader] {entry.family} 不支持 mx.compile，已自动关掉编译")
             compile, compile_cache_limit = False, 0

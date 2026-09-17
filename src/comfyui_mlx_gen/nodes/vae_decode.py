@@ -96,6 +96,15 @@ def _decode_h3(latents, vae_handle, audio_handle, batch_index: int) -> MlxPilIma
     )
 
 
+def _decode_yue2(latents, vae_handle, batch_index: int) -> MlxPilImage:
+    """YuE2：``[frames,64]`` 声学 latent → 48 kHz 立体声载荷。"""
+    arr = _cached_latents(latents)
+    try:
+        return pipeline.decode_yue2_latents(arr, vae_handle, CACHE, batch_index)
+    finally:
+        pipeline.release_yue2_vae(vae_handle, CACHE)
+
+
 class MlxVAEDecodeRawPIL:
     @classmethod
     def INPUT_TYPES(cls):
@@ -132,10 +141,18 @@ class MlxVAEDecodeRawPIL:
         entry = entry_for(model_type)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
+        if latents.model and latents.model != model_type:
+            raise ValueError(
+                f"latents 是 {latents.model} 产出的，而 VAE 选的是 {model_type}，"
+                "请让解码器与采样器的 model_type 一致"
+            )
         if latents.kind == "h3_video":
             # 视频行与音频行在同一条 latent 状态里，按 handle 的 role 决定解哪一边
             handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
             return (_decode_h3(latents, handle, audio_vae, batch_index),)
+        if latents.kind == "yue2_audio":
+            handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
+            return (_decode_yue2(latents, handle, batch_index),)
         arr = _cached_latents(latents)
         # 按同款 handle 走共享键 → 与 MlxVAELoader / MlxVAEDecoder 命中同一份 VAE
         handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
@@ -184,6 +201,8 @@ class MlxVAEDecoder:
         if latents.kind == "h3_video":
             # 一份 latent 状态里有视频行 + 音频行，按 handle 的 role 取对应那一边
             return (_decode_h3(latents, vae, audio_vae, batch_index),)
+        if latents.kind == "yue2_audio":
+            return (_decode_yue2(latents, vae, batch_index),)
         arr = _cached_latents(latents)
         # 与 MlxVAEEncoder / MlxVAEDecodeRawPIL 共用同一个键 → 全流程只驻留一份 VAE
         vae_module = pipeline.vae_component(vae, CACHE)

@@ -58,6 +58,19 @@ class MlxTextEncoder:
                 "（MlxQwenEditEncoder）节点，而不是本节点 —— 否则会得到一条"
                 "没有任何视觉信息的条件"
             )
+        # YuE2 没有独立文本编码器：正向文本是 style、负向文本是 lyrics，原文一直
+        # 保留到采样器，再由主模型同目录下的 qwen.tiktoken 编码。空 lyrics 表示纯音乐。
+        if entry.media == "audio":
+            prompt = text or ""
+            cond = MlxConditioning(
+                clip=clip,
+                text=prompt,
+                encoding_key=runtime.cache_key(
+                    {"kind": "yue2_text", "clip": clip, "text": prompt}
+                ),
+            )
+            return (cond,)
+
         # 空提示词按空格编码（与 mflux 对 negative_prompt 的处理一致）
         prompt = text if text and text.strip() else " "
 
@@ -69,7 +82,7 @@ class MlxTextEncoder:
 
         # 视频 / 音频家族（MiniMax-H3）：先组装成 H3 的三段式 presentation，再用
         # Qwen3-VL 编码；条件编码器不量化要常驻约 50 GB，所以必须 q8 / q4
-        if entry.media != "image":
+        if entry.media == "video":
             if int(clip.quantize or 0) not in (4, 8):
                 raise ValueError(
                     f"{entry.family} 的条件编码器必须量化（在「MLX 条件加载器」里把 "

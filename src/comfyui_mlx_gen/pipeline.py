@@ -46,6 +46,9 @@ from . import components, image, paths, runtime, weights
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.weights import loader as h3_loader
 from .types import MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
+from .yue2 import pipeline as yue2_pipeline
+from .yue2.model import load_model as load_yue2_model
+from .yue2.vae import load_vae as load_yue2_vae
 
 # 各节点负责的组件 role（采样器不加载文本编码 / VAE，编码与解码节点各自按 handle 物化）。
 # 采样阶段只需要 transformer —— 这里是采样器的「声明式」role 清单，
@@ -1483,7 +1486,7 @@ H3_LATENT_BUCKET = "h3_latents"
 
 
 def _ensure_image_family(entry, node: str) -> None:
-    """图片侧入口的媒体守卫：视频 / 音频家族（minimax_h3）在这里被明确挡住。
+    """图片侧入口的媒体守卫：H3 / YuE2 在这里被明确挡住。
 
     句柄类型名是通用的（model / CLIP / mlx_vae），连线期挡不住错接，所以放在
     每个图片侧入口的最前面 —— 必须早于 `weights.config_for_path`，否则只会拿到
@@ -1493,8 +1496,199 @@ def _ensure_image_family(entry, node: str) -> None:
         raise ValueError(
             f"{entry.family} 是视频 / 音频家族，不能在「{node}」里使用；"
             "它的条件编码 / 采样 / 解码走 MlxTextEncoder / MlxKSamplerMLX / "
-            "MlxVAEDecodeRawPIL 的 H3 分支"
+            "MlxVAEDecodeRawPIL 的专用媒体分支"
         )
+
+
+# === YuE2（风格 + 歌词 → 48 kHz 立体声音乐）===================================
+YUE2_MODULE_BUCKET = "yue2_module"
+
+
+def _raw_component_selection(selection: str, role: str) -> Path:
+    """按 paths.resolve 的查找次序返回未 resolve 的路径，以保留第一层软链接目标。"""
+    selected = Path(str(selection)).expanduser()
+    if selected.is_absolute():
+        candidates = [selected]
+    elif "/" in str(selection):
+        candidates = [paths.MODEL_ROOT / selected, paths.component_dir(role) / selected]
+    else:
+        candidates = [paths.component_dir(role) / selected, paths.MODEL_ROOT / selected]
+    for candidate in candidates:
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+    return candidates[0]
+
+
+def yue2_variant_dir(selection: str, role: str) -> Path:
+    """把 YuE2 目录或单文件软链接还原成包含配置的精度变体目录。
+
+    推荐直接把 snapshot 的 ``4bit/`` / ``8bit/`` / ``bf16/`` 目录软链接到对应组件
+    目录；也兼容 ``transformer/foo.safetensors -> .../8bit/model.safetensors`` 这种
+    单文件软链接。不能直接使用通用 ``paths.resolve``，因为它会继续解析到 HF blob，
+    从而丢失同目录的 config、tokenizer 与生成配置。
+    """
+    raw = _raw_component_selection(selection, role)
+    expected = "model.safetensors" if role == "transformer" else "vae.safetensors"
+    required = (
+        ("config.json", "qwen.tiktoken", "yue2_generation_config.json", expected)
+        if role == "transformer"
+        else ("vae_config.json", expected)
+    )
+
+    candidates: list[Path] = []
+    if raw.is_dir():
+        candidates.append(raw)
+    else:
+        # 直接选择 snapshot 内的 HF 文件时，先试它的逻辑父目录，不跟随文件软链接。
+        candidates.append(raw.parent)
+    if raw.is_symlink():
+        target = raw.readlink()
+        if not target.is_absolute():
+            target = raw.parent / target
+        candidates.append(target if target.is_dir() else target.parent)
+
+    checked: list[str] = []
+    for candidate in candidates:
+        directory = candidate.resolve()
+        missing = [name for name in required if not (directory / name).is_file()]
+        checked.append(f"{directory}（缺 {', '.join(missing) or '无'}）")
+        if not missing:
+            return directory
+    raise FileNotFoundError(
+        f"无法从 {role}/{selection} 找到完整 YuE2 变体目录；检查过：{'；'.join(checked)}。"
+        "请把完整 4bit/、8bit/ 或 bf16/ 目录软链接进组件目录，或让单文件软链接"
+        "直接指向该目录中的 model.safetensors / vae.safetensors。"
+    )
+
+
+def yue2_component_cache_key(role: str, directory: Path) -> str:
+    return runtime.cache_key(
+        {"kind": "yue2_module", "role": role, "directory": str(directory)}
+    )
+
+
+def prepare_yue2_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
+    """加载 YuE2 主模型、固定 tokenizer 与生成配置；采样阶段不加载 VAE。"""
+    if entry.family != "yue2":
+        raise ValueError(f"prepare_yue2_sampler_components 收到非 YuE2 大类：{entry.family}")
+    directory = yue2_variant_dir(model_handle.model_path, "transformer")
+    key = yue2_component_cache_key("transformer", directory)
+
+    def build():
+        print(f"[YuE2 组件] 从 {directory} 加载主模型与 tokenizer")
+        return {
+            "transformer": load_yue2_model(directory),
+            "tokenizer": yue2_pipeline.Tokenizer(directory / "qwen.tiktoken"),
+            "generation_config": yue2_pipeline.load_generation_config(directory),
+            "directory": directory,
+        }
+
+    bundle, _hit = cache.get_or_create(YUE2_MODULE_BUCKET, key, build)
+    return bundle
+
+
+def release_yue2_sampler_components(entry, model_handle, cache) -> None:
+    """采样完成即释放 3B 主模型；latent 留在独立缓存中供 VAE 节点解码。"""
+    directory = yue2_variant_dir(model_handle.model_path, "transformer")
+    key = yue2_component_cache_key("transformer", directory)
+    if cache.evict(YUE2_MODULE_BUCKET, key):
+        print("[YuE2 组件] 已释放主模型（下次采样时重新懒加载）")
+
+
+def yue2_latent_cache_key(model_handle, params: dict[str, Any]) -> str:
+    return runtime.cache_key(
+        {"kind": "yue2_latents", "params": params, "model": model_handle}
+    )
+
+
+def has_yue2_latents(model_handle, params: dict[str, Any], cache) -> bool:
+    """在加载主模型前探测相同参数的声学 latent 是否还在缓存。"""
+    _latents, hit = cache.get("component_weights", yue2_latent_cache_key(model_handle, params))
+    return hit
+
+
+def run_yue2_sampler(entry, model_handle, comps, params: dict[str, Any], cache) -> MlxLatentHandle:
+    """ABC 规划 → 语义 codec AR → NAR 声学 latent。
+
+    ``comps`` 在缓存命中时允许为 ``None``；factory 不会执行，因此无需重新加载主模型。
+    """
+    key = yue2_latent_cache_key(model_handle, params)
+
+    def sample():
+        if comps is None:
+            raise RuntimeError("YuE2 latent 缓存已失效，请重新执行采样器")
+        latents, _info = yue2_pipeline.generate_music_latents(
+            comps["transformer"],
+            comps["tokenizer"],
+            comps["generation_config"],
+            params["style"],
+            params["lyrics"],
+            cot=params["cot"],
+            seed=int(params["seed"]),
+            steps=int(params["steps"]),
+            max_tokens=int(params["max_tokens"]),
+            cfg_scale=float(params["guidance"]),
+            log=print,
+        )
+        return latents
+
+    latents, _hit = cache.get_or_create("component_weights", key, sample)
+    duration = yue2_pipeline.audio_samples(latents.shape[0]) / yue2_pipeline.SAMPLE_RATE
+    return MlxLatentHandle(
+        kind="yue2_audio",
+        shape=tuple(latents.shape),
+        dtype=str(latents.dtype),
+        cache_key=key,
+        model=model_handle.model_type,
+        source="local",
+        path=model_handle.model_path,
+        precision=model_handle.precision,
+        quantize=model_handle.quantize,
+        model_cache_key=runtime.cache_key(model_handle),
+        duration=float(duration),
+        audio_num_rows=int(latents.shape[0]),
+        prompt_digest=runtime.cache_key(
+            {"style": params["style"], "lyrics": params["lyrics"], "cot": params["cot"]}
+        ),
+    )
+
+
+def prepare_yue2_vae(handle, cache):
+    """按 YuE2 VAE handle 延迟物化 Oobleck decoder。"""
+    if handle.role != "vae":
+        raise ValueError(f"YuE2 只有 role='vae'，收到 {handle.role!r}")
+    directory = yue2_variant_dir(handle.path, "vae")
+    key = yue2_component_cache_key("vae", directory)
+    vae, _hit = cache.get_or_create(
+        YUE2_MODULE_BUCKET,
+        key,
+        lambda: load_yue2_vae(directory),
+    )
+    return vae
+
+
+def release_yue2_vae(handle, cache) -> None:
+    directory = yue2_variant_dir(handle.path, "vae")
+    key = yue2_component_cache_key("vae", directory)
+    if cache.evict(YUE2_MODULE_BUCKET, key):
+        print("[YuE2 组件] 已释放 VAE（下次解码时重新懒加载）")
+
+
+def decode_yue2_latents(latents, vae_handle, cache, batch_index: int) -> MlxPilImage:
+    """声学 latent → AudioTrack；交给 MlxPilToTorch 包成 ComfyUI 原生 AUDIO。"""
+    import numpy as np
+
+    from .h3.video import AudioTrack
+
+    if batch_index not in (-1, 0):
+        print("[YuE2 VAE] 一次只有一首音乐，batch_index 已按 0 处理")
+    vae = prepare_yue2_vae(vae_handle, cache)
+    waveform = mx.clip(vae.decode_tiled(latents), -1, 1)
+    mx.eval(waveform)
+    # Oobleck 输出 [samples, 2]；AudioTrack / ComfyUI AUDIO 使用 [channels, samples]。
+    stereo = np.ascontiguousarray(np.array(waveform, dtype=np.float32).T)
+    track = AudioTrack(waveform=stereo, sample_rate=yue2_pipeline.SAMPLE_RATE)
+    return MlxPilImage(images=(), batch_index=-1, audio=track)
 
 
 def prepare_h3_components(

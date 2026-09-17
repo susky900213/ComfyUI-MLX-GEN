@@ -107,7 +107,7 @@ class MlxLatentHandle:
     取对应的行，`cache_key` 是同一个键（换提示词或换种子必然重新采样）。
     """
 
-    kind: str  # "noise" | "packed" | "h3_video"
+    kind: str  # "noise" | "packed" | "h3_video" | "yue2_audio"
     shape: tuple[int, ...]
     dtype: str
     cache_key: str  # 缓存在 cache.py 中的条目键（数组不放 handle 里）
@@ -205,7 +205,7 @@ class MlxPilImage:
     images: tuple[Any, ...] = ()  # tuple[PIL.Image.Image, ...]
     batch_index: int = -1  # -1 = 整批
     fps: float = 24.0  # 播放帧率（H3 固定 24；图片链路不看）
-    audio: Any = None  # H3 的 AudioTrack（图片链路恒为 None）
+    audio: Any = None  # H3 / YuE2 的 AudioTrack（图片链路恒为 None）
 
 
 # --- 模型配置（数据） ---
@@ -232,8 +232,8 @@ class MlxModelEntry:
     匹配不到才用 default_config 兜底。
 
     `media` 决定走哪条实现：图片链路走 mflux 的 prompt encoder / latent creator，
-    视频链路（MiniMax-H3）走 `h3/pipeline.py` 与 `h3/prompt.py`（绕开 mflux 的
-    ModelConfig 注册表与整体权重加载路径）。
+    视频链路（MiniMax-H3）走 `h3/`，音乐链路（YuE2）走 `yue2/`；后二者都绕开
+    mflux 的 ModelConfig 注册表与整体权重加载路径。
     """
 
     family: str  # 与 MODEL_DEFS 的键一致（"z_image" | "flux2" | "qwen_image" | …），即 model_type
@@ -249,7 +249,7 @@ class MlxModelEntry:
     latent_creator: str = ""  # "module:Class"
     supported: bool = True  # False = 尚未验证，选中时节点拒绝执行
     notes: str = ""
-    media: str = "image"  # "image" | "video"（"video" = MiniMax-H3 一族）
+    media: str = "image"  # "image" | "video" | "audio"
 
 
 def _components(
@@ -475,6 +475,34 @@ MINIMAX_H3 = MlxModelEntry(
     ),
 )
 
+
+# --- YuE2-3B（风格 + 歌词 → 48 kHz 立体声音乐）----------------------------------
+YUE2 = MlxModelEntry(
+    family="yue2",
+    # YuE2 的转换后 checkpoint 已包含配置和量化元数据，不走 mflux weight definition。
+    weight_def="",
+    components=_components(
+        transformer="comfyui_mlx_gen.yue2.model:Yue2Model",
+        vae="comfyui_mlx_gen.yue2.vae:OobleckDecoder",
+        # YuE2 没有独立 text encoder：这两个声明只用于保持现有 Loader / TextEncoder
+        # 节点的数据契约，真正 tokenizer 与主模型一起在采样器中按需加载。
+        text_encoder="comfyui_mlx_gen.yue2.pipeline:Tokenizer",
+        tokenizer_name="yue2",
+    ),
+    default_config="",
+    default_steps=32,
+    default_scheduler="yue2_midpoint",
+    default_guidance=1.0,
+    supports_compile=False,
+    supported=True,
+    media="audio",
+    notes=(
+        "已对接 YuE2-3B 本地音乐生成：正向条件写 style，负向条件写 lyrics；"
+        "采样器生成声学 latent，现有 VAE 解码器与 PIL→张量节点从 AUDIO 口输出 "
+        "48 kHz 立体声。全程在 ComfyUI 进程内运行 MLX，不调用 HTTP 服务。"
+    ),
+)
+
 # 键 = 模型大类（= model_type 下拉）；大类内用哪套配置由权重目录名决定
 MODEL_DEFS: dict[str, MlxModelEntry] = {
     "z_image": Z_IMAGE,
@@ -484,6 +512,7 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
     "ideogram4": IDEOGRAM4,
     # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
     "minimax_h3": MINIMAX_H3,
+    "yue2": YUE2,
 }
 
 

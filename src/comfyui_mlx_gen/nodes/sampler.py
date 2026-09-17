@@ -55,6 +55,8 @@ SCHEDULERS = [
     "ideogram4_default",
     "ideogram4_quality",
     "ideogram4_turbo",
+    "minimax_h3",
+    "yue2_midpoint",
 ]
 KV_CACHE_MODES = ["auto", "off"]
 # 画布档位：图片链路原有的几档 + MiniMax-H3 的推荐档位（H3 必须是 32 的倍数，
@@ -104,6 +106,13 @@ class MlxKSamplerMLX:
                 "ref_images": (ref_images, {}),
                 # 只有 kv 版权重（配置 supports_kv_cache=True）才会有实际作用
                 "kv_cache": (KV_CACHE_MODES, {"default": "auto"}),
+                # 仅 YuE2：off 直接生成 codec；melody/full 先生成 ABC 规划。
+                "cot": (["off", "melody", "full"], {"default": "full", "advanced": True}),
+                # 仅 YuE2：语义 codec token 上限；每帧约 40 ms，9000 上限约 6 分钟。
+                "max_tokens": (
+                    "INT",
+                    {"default": 9000, "min": 200, "max": 9000, "step": 100, "advanced": True},
+                ),
             },
         }
 
@@ -128,6 +137,8 @@ class MlxKSamplerMLX:
         audio_shift=3.0,
         ref_images=None,
         kv_cache="auto",
+        cot="full",
+        max_tokens=9000,
     ):
         if model is None:
             raise ValueError("必须连接 MlxTransformerLoader 的输出")
@@ -157,7 +168,7 @@ class MlxKSamplerMLX:
         # MiniMax-H3：一条打包序列里同时去噪视频与音频（guidance 蒸馏模型，每步只有
         # 一次前向），所以 scheduler / guidance / 负向条件三个 widget 都不看；
         # 画布必须是 32 的倍数、帧数必须是 17n+5（下拉里只给合法值）
-        if entry.media != "image":
+        if entry.media == "video":
             if ref_images is not None:
                 raise ValueError(f"{entry.family} 不支持参考图编辑，请把 ref_images 断开")
             if scheduler != entry.default_scheduler or float(guidance) != 1.0:
@@ -181,6 +192,38 @@ class MlxKSamplerMLX:
             # 潜变量已进 h3_latents 桶：transformer（q8 约 35 GB）用完就丢，
             # 别和解码要用的 VAE 一起占着（换 seed / 步数重跑时会重新懒加载）
             pipeline.release_h3_sampler_components(entry, model, CACHE)
+            return (handle,)
+
+        # YuE2：正向文本 = style，负向文本 = lyrics（空 lyrics = 纯音乐）。模型内部
+        # tokenizer 同时参与 ABC / codec AR，因此文本节点只透传原文，不提前编码。
+        if entry.media == "audio":
+            if ref_images is not None:
+                raise ValueError("YuE2 不支持参考图，请把 ref_images 断开")
+            if int(batch_size) != 1:
+                raise ValueError("YuE2 当前一次生成一首音乐，请把 batch_size 设为 1")
+            if scheduler != entry.default_scheduler:
+                print(
+                    f"[MlxKSamplerMLX] YuE2 固定使用 midpoint ODE，已忽略 scheduler={scheduler!r}"
+                )
+            params = {
+                "seed": int(seed),
+                "steps": int(steps),
+                "guidance": float(guidance),
+                "style": positive.text,
+                "lyrics": negative.text,
+                "cot": str(cot),
+                "max_tokens": int(max_tokens),
+            }
+            # ComfyUI 可能因下游变化而重跑本节点；相同参数的 latent 若仍在缓存，绝不
+            # 为构造同一个 handle 再加载一次 3B 主模型。
+            if pipeline.has_yue2_latents(model, params, CACHE):
+                return (pipeline.run_yue2_sampler(entry, model, None, params, CACHE),)
+            comps = pipeline.prepare_yue2_sampler_components(entry, model, CACHE)
+            try:
+                handle = pipeline.run_yue2_sampler(entry, model, comps, params, CACHE)
+            finally:
+                # 采样结束后声学 latent 已独立缓存；释放约 3B 主模型，给 VAE 解码腾空间。
+                pipeline.release_yue2_sampler_components(entry, model, CACHE)
             return (handle,)
 
         # 参考图（可选）：edit 分支。参考图由「MLX VAE 编码」产出（来源是 VAE handle，

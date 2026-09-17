@@ -29,6 +29,8 @@ _TYPE_CAPS: dict[str, int] = {
     "h3_prompt": 4,
     # 一次视频生成 = 一条（视频行 + 音频行 + 计划，几 GB 量级，只留最近的一份）
     "h3_latents": 1,
+    # --- YuE2（主模型与 VAE 分阶段物化，任一时刻通常只有一条）---
+    "yue2_module": 2,
 }
 
 

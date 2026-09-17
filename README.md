@@ -3,6 +3,97 @@
 面向 Apple Silicon 的 ComfyUI MLX 生成节点。模型组件通过纯数据 handle 在节点间传递，
 Transformer、文本编码器和 VAE 只在实际消费它们的节点中延迟加载。
 
+## YuE2-3B 本地音乐生成
+
+YuE2 通过已有的通用 MLX 节点链在 **ComfyUI 进程内**完成文本规划、语义 codec
+生成、NAR 声学 latent 合成和 VAE 解码；不启动服务，也不调用 HTTP API：
+
+```text
+MlxClipLoader
+  → MlxTextEncoder（positive = style / 风格描述）
+  → MlxTextEncoder（negative = lyrics / 歌词，不是负向提示词）
+  → MlxTransformerLoader + MlxKSamplerMLX
+  → MlxVAELoader + MlxVAEDecoder
+  → MlxPilToTorch（AUDIO 输出）
+  → SaveAudio / PreviewAudio
+```
+
+可直接导入示例工作流：
+
+```text
+workflows/yue2-3b.json
+```
+
+工作流使用 ComfyUI 内置的 `SaveAudio`（FLAC）与 `PreviewAudio`，默认将文件写到
+ComfyUI 输出目录的 `audio/` 子目录。当前上游已把旧 `SaveAudio` 标为 deprecated，
+但仍保留兼容；如果所用 ComfyUI 版本提供新的音频保存节点，也可以直接把
+`MlxPilToTorch.audio` 接过去。
+
+### YuE2 权重放置
+
+从 `npario/YuE2-3B-MLX` 下载转换后的 checkpoint。每个 `4bit/`、`8bit/` 或
+`bf16/` 精度变体目录都应完整保留以下文件：
+
+```text
+config.json
+model.safetensors
+qwen.tiktoken
+yue2_generation_config.json
+vae_config.json
+vae.safetensors
+```
+
+推荐把同一个完整变体目录分别软链接到 `transformer/` 与 `vae/`。示例工作流默认使用
+`YuE2-3B-MLX-4bit`：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/
+├── transformer/YuE2-3B-MLX-4bit -> <HF snapshot>/4bit
+└── vae/YuE2-3B-MLX-4bit         -> <HF snapshot>/4bit
+```
+
+也兼容单文件软链接，但链接必须直接指向变体目录内的 `model.safetensors` 或
+`vae.safetensors`，以便插件从目标文件的同级目录找回配置、tokenizer 和另一组权重。
+例如：
+
+```text
+transformer/YuE2-3B-MLX-4bit.safetensors -> <HF snapshot>/4bit/model.safetensors
+vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
+```
+
+使用单文件链接时，导入工作流后要在三个 Loader 中改选对应名称。三个 Loader 的
+`model_type` 必须全部为 `yue2`。YuE2 的真实精度由所选 checkpoint 变体决定；Loader
+里的 `precision` / `quantize` 值只参与句柄诊断和缓存键，不会把 checkpoint 再量化一次。
+
+### 提示词与采样参数
+
+- positive 文本是 **style**：填写曲风、乐器、速度、情绪、演唱风格等，例如
+  `cinematic synthwave, warm female vocal, 100 BPM, wide stereo`；不能为空。
+- negative 文本是 **lyrics**，并非需要排除的内容。可以使用 `[Verse]`、`[Chorus]`
+  等段落标记；留空表示纯音乐。
+- `cot=off` 跳过 ABC 规划并直接生成 codec，启动更快；`melody` 先规划不带和弦的
+  旋律 ABC；`full` 先规划带和弦的完整 ABC，规划时间也最长。
+- `max_tokens` 是语义 codec token 上限，每个 token 约对应 40 ms，所以 200 约为
+  8 秒、1500 约为 1 分钟、9000 理论上约为 6 分钟。模型可能提前生成结束标记，
+  因而这是上限而不是保证时长；建议先用 200 验证工作流。
+- `steps` 控制 NAR midpoint ODE 的步数（默认 32），影响声学 latent 的计算量与质量，
+  不控制时长。`scheduler` 固定为 `yue2_midpoint`。
+- `guidance=1.0` 不额外运行 CFG 分支；允许范围为 1.0–5.0。`batch_size` 必须为 1。
+  `width`、`height`、视频帧数/shift 和 `kv_cache` 是通用采样器为其他模型保留的 widget，
+  YuE2 不使用这些值。
+
+### 精度与内存
+
+- 首次使用优先选择 `4bit`；`8bit` 和 `bf16` 需要更多统一内存。
+- 长音频会增加自回归 KV cache、语义 token 和声学 latent 的内存与耗时；先从
+  `max_tokens=200` 开始，再逐步增加。
+- 采样结束后插件会主动释放 YuE2-3B 主模型，再加载 VAE；解码结束后也会释放 VAE，
+  避免二者同时常驻。声学 latent 保留在小型缓存中，因此参数完全相同的重复执行可直接
+  命中 latent，不会为了重建句柄再次加载 3B 主模型。修改 seed、style、lyrics、`cot`、
+  `max_tokens`、steps 或 guidance 都会产生新的缓存键。
+- 已验证 4-bit 端到端链路可将 `[200, 64]` latent 解码为 48 kHz 立体声；实际听感仍应
+  结合目标提示词和音频设备人工试听。
+
 ## Ideogram 4 FP8 本地文生图
 
 Ideogram 通过现有 ComfyUI MLX 节点链运行，**不调用 API**，也没有单独的 Ideogram
@@ -110,20 +201,35 @@ python -m pip install -r requirements.txt
 本项目的模型实现来自 `mflux==0.19.1`（发行包名见 `requirements.txt`），并依赖 Apple
 Silicon 上的 `mlx>=0.32.0,<0.33.0`。节点注册入口是仓库根目录的 `__init__.py`。
 
+**不要同时安装 `mflux` 与 `mlx-gen` 两个发行包。** 它们都会安装同名的 `mflux`
+Python 模块，但版本约束不同：本仓库固定的 `mflux==0.19.1` 需要 MLX 0.32.x，而
+`mlx-gen==0.36.0` 要求 `mlx<0.32.0`。从旧环境迁移时建议先移除两个
+发行包，再按本仓库依赖重新安装：
+
+```bash
+python -m pip uninstall -y mlx-gen mflux
+python -m pip install -r requirements.txt
+python -m pip show mlx mflux
+```
+
+最后一条应显示 `mlx 0.32.x` 与 `mflux 0.19.1`，且 `python -m pip show mlx-gen`
+应显示未安装。请务必在 **ComfyUI 实际使用的 Python 环境**中执行这些命令。
+
 ## 静态回归测试
 
-Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，覆盖模型登记、组件路径、官方预设、
+YuE2、Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，覆盖模型登记、组件路径、
 prompt/latent API、采样器边界，以及工作流节点、widget、socket 和 link 契约：
 
 ```bash
 /opt/anaconda3/envs/py313/bin/python tests/test_qwen_image.py
 /opt/anaconda3/envs/py313/bin/python tests/test_ideogram.py
+/opt/anaconda3/envs/py313/bin/python tests/test_yue2.py
 ```
 
 测试成功时退出状态为 0；任何检查失败都会汇总失败项并以状态 1 退出。
 
 ## 其他示例工作流
 
-`workflows/` 还包含 Z-Image、Flux.2 Klein、Qwen-Image-Edit、Ideogram 4 与 MiniMax-H3 示例。各工作流
-序列化了对应模型的推荐采样参数；切换模型家族时请同时修改 Transformer、CLIP 和 VAE
-加载器，避免混用不同权重集。
+`workflows/` 还包含 Z-Image、Flux.2 Klein、Qwen-Image-Edit、Ideogram 4、MiniMax-H3
+与 YuE2 示例。各工作流序列化了对应模型的推荐采样参数；切换模型家族时请同时修改
+Transformer、CLIP 和 VAE 加载器，避免混用不同权重集。

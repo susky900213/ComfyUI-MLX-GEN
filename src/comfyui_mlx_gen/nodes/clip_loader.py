@@ -25,7 +25,16 @@ NO_PATH = "<无可用权重>"
 
 def component_options(component: str) -> list[str]:
     """该组件目录下可选的权重集（扫盘；目录为空时给占位项，避免下拉为空）。"""
-    return paths.list_component_items(component) or [NO_PATH]
+    items = paths.list_component_items(component)
+    # YuE2 没有独立 text encoder；为了继续复用这个节点，让它也能选择 transformer/
+    # 里的 YuE2 变体（文本节点只保留原文，真正 tokenizer 在采样器中加载）。
+    if component in ("text_encoder", "tokenizer"):
+        items += [
+            name
+            for name in paths.list_component_items("transformer")
+            if "yue2" in name.lower()
+        ]
+    return list(dict.fromkeys(items)) or [NO_PATH]
 
 
 class MlxClipLoader:
