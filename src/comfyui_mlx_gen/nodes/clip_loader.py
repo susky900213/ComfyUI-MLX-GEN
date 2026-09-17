@@ -17,6 +17,9 @@ from ..types import CLIP, MlxClipHandle, entry_for, model_types
 
 COMPONENTS = ["text_encoder", "tokenizer"]
 PRECISIONS = ["bfloat16", "float16", "float32"]
+# 0 = 不量化（图片链路的现状）；MiniMax-H3 的 Qwen3-VL 编码器不量化要常驻约 50 GB，
+# 所以选 minimax_h3 时必须填 8 或 4（MlxTextEncoder 里会挡住 0）
+QUANTIZE_OPTIONS = [0, 4, 8]
 NO_PATH = "<无可用权重>"
 
 
@@ -39,6 +42,8 @@ class MlxClipLoader:
                 "path": (paths_for_comp, {"default": paths_for_comp[0]}),
                 "precision": (PRECISIONS, {"default": "bfloat16"}),
                 "max_length": ("INT", {"default": 512, "min": 1}),
+                # 0 = 不量化；MiniMax-H3 请选 8（选 0 时「MLX 文本编码器」会直接报错）
+                "quantize": (QUANTIZE_OPTIONS, {"default": 0}),
             }
         }
 
@@ -46,7 +51,7 @@ class MlxClipLoader:
     FUNCTION = "load"
     CATEGORY = "MLX/Gen"
 
-    def load(self, model_type, component, path, precision, max_length):
+    def load(self, model_type, component, path, precision, max_length, quantize):
         # 未知大类 → 直接报错；已知但未验证的大类提示还没实现
         entry = entry_for(model_type)
         if not entry.supported:
@@ -61,6 +66,7 @@ class MlxClipLoader:
             "path": path,
             "precision": precision,
             "max_length": int(max_length),
+            "quantize": int(quantize),
         }
         handle = MlxClipHandle(
             model_type=model_type,
@@ -70,6 +76,7 @@ class MlxClipLoader:
             precision=precision,
             max_length=int(max_length),
             extra_options={},
+            quantize=int(quantize) or None,
             cache_key=runtime.cache_key(config),
         )
         return (handle,)

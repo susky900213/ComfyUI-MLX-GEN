@@ -20,6 +20,13 @@ _TYPE_CAPS: dict[str, int] = {
     "ref_encoding": 2,
     # 参考图集（MlxRefImageSet 的有序 PIL 元组，uint8 ≈ 3MB/MP）：当前用的一份 + 刚换掉的一份
     "ref_source": 2,
+    # --- MiniMax-H3（不与图片链路共用桶：单条配置的组件就多、每条都几十 GB）---
+    # transformer / text_encoder / tokenizer / vae / audio_vae 五个 role 各一条
+    "h3_module": 5,
+    # 正 / 负条件各一条（H3 只用正向，但两个 MlxTextEncoder 会各存一条）
+    "h3_prompt": 4,
+    # 一次视频生成 = 一条（视频行 + 音频行 + 计划，几 GB 量级，只留最近的一份）
+    "h3_latents": 1,
 }
 
 
@@ -51,6 +58,15 @@ class Cache:
             return bucket[key], True
         print(f"[cache] 未命中 {type_} {key[:12]}…")
         return None, False
+
+    def evict(self, type_: str, key: str) -> bool:
+        """主动丢掉一条（H3 这类「用完即释放」的大组件用）；是否真丢到了。"""
+        bucket = self._data.get(type_, OrderedDict())
+        if key not in bucket:
+            return False
+        del bucket[key]
+        _flush_mlx()
+        return True
 
     def keys(self, type_: str) -> list[str]:
         return list(self._data.get(type_, OrderedDict()).keys())

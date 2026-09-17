@@ -61,6 +61,30 @@ class MlxTextEncoder:
         # 空提示词按空格编码（与 mflux 对 negative_prompt 的处理一致）
         prompt = text if text and text.strip() else " "
 
+        # 视频 / 音频家族（MiniMax-H3）：先组装成 H3 的三段式 presentation，再用
+        # Qwen3-VL 编码；条件编码器不量化要常驻约 50 GB，所以必须 q8 / q4
+        if entry.media != "image":
+            if int(clip.quantize or 0) not in (4, 8):
+                raise ValueError(
+                    f"{entry.family} 的条件编码器必须量化（在「MLX 条件加载器」里把 "
+                    f"quantize 改成 8 或 4；当前是 {clip.quantize}）"
+                )
+            composed = pipeline.compose_h3_prompt(prompt)
+            comps = pipeline.prepare_h3_encoder(
+                entry, clip, CACHE, runtime.cache_key({"kind": "module", "clip": clip})
+            )
+            encoding_key = pipeline.h3_prompt_encoding_key(clip, composed)
+            embeds, tags = pipeline.encode_h3_prompt(entry, comps, composed, CACHE, encoding_key)
+            print(
+                f"[MlxTextEncoder] {entry.family}: {int(tags.shape[0])} 个 token，"
+                f"条件张量 {tuple(embeds.shape)} {embeds.dtype}"
+            )
+            # 编码结果已进 h3_prompt 桶（采样器只按键取张量）：条件编码器约 30 GB，
+            # 用完立刻丢掉，别占着到采样阶段（换提示词重跑时会重新懒加载）
+            pipeline.release_h3_encoder(entry, clip, CACHE)
+            cond = MlxConditioning(clip=clip, text=composed, encoding_key=encoding_key)
+            return (cond,)
+
         # 1) 按需创建 text_encoder + tokenizer（同一 handle 第二次执行直接命中缓存）
         comps_key = runtime.cache_key({"kind": "module", "clip": clip})
         comps = pipeline.prepare_encoder(entry, clip, CACHE, comps_key)

@@ -51,6 +51,9 @@ class MlxClipHandle:
 
     用哪套 ModelConfig 不登记在这里：由 weights.config_for_path 按 path
     （目录名 / 文件名 / repo id）去 AVAILABLE_MODELS 里匹配。
+
+    `quantize` 是给视频家族（minimax_h3）用的：它的条件编码器不量化会常驻约
+    50 GB，所以必须 q8 / q4。图片链路的 loader 默认不量化（None = 现状）。
     """
 
     model_type: str  # 模型大类（MODEL_DEFS 的键，如 "z_image"），决定 class_import
@@ -61,7 +64,9 @@ class MlxClipHandle:
     max_length: int | None = None
     extra_options: dict[str, Any] = field(default_factory=dict)
     loras: tuple[LoraRef, ...] = ()  # 只登记，M1 不实际应用（与 MlxModelHandle 一致）
+    quantize: int | None = None  # None = 不量化（= 图片链路现状）；H3 必须 4 或 8
     cache_key: str = ""
+
 
 
 @dataclass(frozen=True)
@@ -95,7 +100,14 @@ class MlxModelHandle:
 
 @dataclass(frozen=True)
 class MlxLatentHandle:
-    kind: str  # "noise" | "packed"
+    """打包后的 latent 句柄（数组本体留在 cache.py，句柄只带键与几何信息）。
+
+    MiniMax-H3 用 `kind="h3_video"`，缓存值是 `H3State(packed, plan, tags, ...)`：
+    视频行与音频行都在那一条缓存里，所以解码节点按 VAE 的 role（vae / audio_vae）
+    取对应的行，`cache_key` 是同一个键（换提示词或换种子必然重新采样）。
+    """
+
+    kind: str  # "noise" | "packed" | "h3_video"
     shape: tuple[int, ...]
     dtype: str
     cache_key: str  # 缓存在 cache.py 中的条目键（数组不放 handle 里）
@@ -107,6 +119,16 @@ class MlxLatentHandle:
     model_cache_key: str = ""  # 用于复用 MlxModelHandle 的缓存
     height: int = 0  # 生成尺寸（解码时重建 latent 用）
     width: int = 0
+    # --- 仅 MiniMax-H3 用到（图片链路全是默认值）---
+    num_frames: int = 0  # 目标视频帧数（已按 17n+5 吸附）
+    duration: float = 0.0  # 对应时长（秒）
+    video_shift: float = 0.0  # 整流流 shift（视频 12.0）
+    audio_shift: float = 0.0  # 整流流 shift（音频 3.0）
+    num_latent_frames: int = 0  # 视频 latent 帧数（5n+2）
+    latent_height: int = 0  # 视频 latent 空间尺寸（画布 / 16）
+    latent_width: int = 0
+    audio_num_rows: int = 0  # 音频行数（latents × 2 声道）
+    prompt_digest: str = ""  # 提示词与关键帧摘要（进 latent 缓存键）
 
 
 @dataclass(frozen=True)
@@ -122,6 +144,9 @@ class MlxVaeHandle:
     path: str  # vae/ 目录下的权重集目录名（如 "flux.2-klein-9b-8bit"）
     precision: str  # "bfloat16" | "float16" | "float32"
     quantize: int  # 4 / 8 / 16
+    # 这套权重是哪个 VAE：图片链路只有 "vae"；MiniMax-H3 还要 "audio_vae"
+    # （音频 VAE 放在 vae/MiniMax-H3-audio，也可以放独立的 audio_vae/ 目录）
+    role: str = "vae"
     cache_key: str = ""  # 编码器与解码器共用的缓存键
 
 
@@ -169,8 +194,18 @@ class MlxReferenceImages:
 
 @dataclass(frozen=True)
 class MlxPilImage:
+    """图片 / 帧序列载荷（H3 用它同时携带帧率与音频轨）。
+
+    图片链路只用 `images` / `batch_index`（`fps` / `audio` 保持默认值）；
+    MiniMax-H3 会把一段视频的帧（`images`，按顺序）+ 帧率（`fps=24`）+
+    立体声波形（`audio`，`h3/video.py` 的 `AudioTrack`）一起装在这里，
+    交给 `MlxPilToTorch` 转成 ComfyUI 的 IMAGE / MASK / AUDIO。
+    """
+
     images: tuple[Any, ...] = ()  # tuple[PIL.Image.Image, ...]
     batch_index: int = -1  # -1 = 整批
+    fps: float = 24.0  # 播放帧率（H3 固定 24；图片链路不看）
+    audio: Any = None  # H3 的 AudioTrack（图片链路恒为 None）
 
 
 # --- 模型配置（数据） ---
@@ -195,6 +230,10 @@ class MlxModelEntry:
     不写具体权重路径（由节点 widget 选、扫盘得到），也不列「配置变体」：
     实际用哪套 ModelConfig 由 weights.config_for_path 按选中的目录名推断，
     匹配不到才用 default_config 兜底。
+
+    `media` 决定走哪条实现：图片链路走 mflux 的 prompt encoder / latent creator，
+    视频链路（MiniMax-H3）走 `h3/pipeline.py` 与 `h3/prompt.py`（绕开 mflux 的
+    ModelConfig 注册表与整体权重加载路径）。
     """
 
     family: str  # 与 MODEL_DEFS 的键一致（"z_image" | "flux2" | "qwen_edit"），即 model_type
@@ -210,6 +249,7 @@ class MlxModelEntry:
     latent_creator: str = ""  # "module:Class"
     supported: bool = True  # False = 尚未验证，选中时节点拒绝执行
     notes: str = ""
+    media: str = "image"  # "image" | "video"（"video" = MiniMax-H3 一族）
 
 
 def _components(
@@ -219,9 +259,10 @@ def _components(
     text_encoder: str,
     tokenizer_name: str,
     text_encoder_attach: str = "",
+    audio_vae: str = "",
 ) -> dict[str, ComponentDef]:
-    """构造四个 role 的组件定义（只写「用哪个类」，路径来自 widget）。"""
-    return {
+    """构造各 role 的组件定义（只写「用哪个类」，路径来自 widget）。"""
+    comps = {
         "transformer": ComponentDef("transformer", transformer, "local"),
         "vae": ComponentDef("vae", vae, "local"),
         "text_encoder": ComponentDef(
@@ -230,6 +271,9 @@ def _components(
         # tokenizer 没有 class_import，由 weight_def 的 TokenizerDefinition 决定
         "tokenizer": ComponentDef(tokenizer_name, "", "local"),
     }
+    if audio_vae:  # 只有 MiniMax-H3 有第二个 VAE（音频）
+        comps["audio_vae"] = ComponentDef("audio_vae", audio_vae, "local")
+    return comps
 
 
 Z_IMAGE = MlxModelEntry(
@@ -313,10 +357,43 @@ QWEN_EDIT = MlxModelEntry(
 )
 
 
+# --- MiniMax-H3（文生视频 + 立体声）：绕开 mflux 的注册表与整体加载路径 ---
+MINIMAX_H3 = MlxModelEntry(
+    family="minimax_h3",
+    weight_def="comfyui_mlx_gen.h3.weights.h3_weight_definition:MiniMaxH3WeightDefinition",
+    components=_components(
+        transformer="comfyui_mlx_gen.h3.model.h3_transformer.h3_transformer:MiniMaxH3Transformer",
+        vae="comfyui_mlx_gen.h3.model.h3_video_vae.h3_video_vae:H3VideoVAE",
+        audio_vae="comfyui_mlx_gen.h3.model.h3_audio_vae.h3_audio_vae:H3AudioVAE",
+        text_encoder="comfyui_mlx_gen.h3.model.h3_text_encoder.qwen3_vl_model:Qwen3VLModel",
+        tokenizer_name="minimax_h3",
+    ),
+    # 不查 mflux 的 ModelConfig 注册表（0.19.1 里根本没有 minimax-h3 这一项）：
+    # 构造参数全部从组件目录里的 config.json 现读（见 h3/config.py 与 h3/weights/loader.py）
+    default_config="",
+    default_steps=50,  # 没有 lightx2v 的 Turbo 8 步 LoRA，先用 baseline 50 步 flow
+    default_scheduler="minimax_h3",  # 见 h3/scheduler/minimax_h3_scheduler.py
+    supports_compile=False,  # transformer 入参含逐行 t 索引与 int 索引，不编译
+    prompt_encoder="comfyui_mlx_gen.h3.prompt:encode_presentation",
+    latent_creator="comfyui_mlx_gen.h3.latent_creator.h3_layout:build_packed_sequence",
+    supported=True,
+    media="video",
+    notes=(
+        "已对接文生视频 + 立体声（t2va）：四个组件都按目录名从磁盘加载"
+        "（transformer / text_encoder / vae / audio_vae + tokenizer，权重目录需自行放置），"
+        "采样走「打包序列 + 双整流流」，不看 negative / guidance / scheduler 三个 widget"
+        "（H3 是 guidance 蒸馏模型，每步只有一次前向）；帧数必须是 17n+5 且落在 124~345；"
+        "mp4 由 ComfyUI 自带的 CreateVideo + SaveVideo 落盘（帧率 24）。"
+    ),
+)
+
+# 键 = 模型大类（= model_type 下拉）；大类内用哪套配置由权重目录名决定
 MODEL_DEFS: dict[str, MlxModelEntry] = {
     "z_image": Z_IMAGE,
     "flux2": FLUX2_KLEIN,
     "qwen_edit": QWEN_EDIT,
+    # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
+    "minimax_h3": MINIMAX_H3,
 }
 
 

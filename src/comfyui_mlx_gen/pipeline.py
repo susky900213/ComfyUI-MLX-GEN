@@ -28,8 +28,10 @@ from typing import Any, Sequence
 
 import mlx.core as mx
 
-from . import components, paths, runtime, weights
-from .types import MlxLatentHandle, MlxModelEntry, entry_for
+from . import components, image, paths, runtime, weights
+from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
+from .h3.weights import loader as h3_loader
+from .types import MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
 
 # 各节点负责的组件 role（采样器不加载文本编码 / VAE，编码与解码节点各自按 handle 物化）。
 # 采样阶段只需要 transformer —— 这里是采样器的「声明式」role 清单，
@@ -105,7 +107,10 @@ def prepare_encoder(entry, clip, cache, cache_key: str) -> dict[str, Any]:
     因此 Qwen 编辑的正/负两个条件节点只会驻留一份文本编码器。
     qwen_edit 还要在 bundle 上挂 VL tokenizer × 2 与 VL 编码器包装（`_attach_vl`）：
     它们是「对象包装」，不含新权重，随 bundle 一起缓存，不额外占 module 桶位。
+
+    MiniMax-H3（media="video"）不走这里，用 prepare_h3_encoder。
     """
+    _ensure_image_family(entry, "MLX 文本编码器")
     # 两个 role 都用 handle 里的那个权重集名（各组件目录下同名）
     selections = {role: clip.path for role in ENCODER_ROLES}
     comps = prepare_components(
@@ -163,8 +168,11 @@ def vae_component(handle, cache) -> Any:
     handle.cache_key 由 MlxVAELoader 算好（内容为
     `{"kind":"vae","model_type","path","precision","quantize"}`），因此「谁先跑谁物化、
     另一个命中同一条缓存」。采样阶段不使用 VAE，所以这里不参与采样器。
+
+    MiniMax-H3 的两个 VAE 由 prepare_h3_vae 物化（媒体守卫会在这里挡住它）。
     """
     entry = entry_for(handle.model_type)
+    _ensure_image_family(entry, "MLX VAE 编码 / 解码")
     kind, resolved = paths.resolve("local", handle.path, "vae")
     if kind == "missing":
         raise FileNotFoundError(f"未找到 vae 权重: {resolved}")
@@ -184,7 +192,11 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
 
     VAE 交给 MlxVAEEncoder / MlxVAEDecoder 按 MlxVaeHandle 的键物化；
     这里顺带加载 VAE 属于白加载（采样循环从来没用过它）。
+
+    MiniMax-H3（media="video"）走 prepare_h3_sampler_components，不查 mflux 的
+    ModelConfig 注册表（0.19.1 里没有 minimax-h3，兜底配置也是图片模型的那套）。
     """
+    _ensure_image_family(entry, "MLX 采样器")
     model_config = weights.config_for_path(model_handle.model_path, entry.default_config)
 
     def build_transformer():
@@ -1085,4 +1097,333 @@ def decode_latents(defn, comps, latents, height, width):
     unpacked = latent_creator.unpack_latents(latents, height, width)
     vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")
     return vae_util.decode(vae=vae, latent=unpacked, tiling_config=None)
+
+
+# === MiniMax-H3（文生视频 + 立体声）================================================
+# H3 绕开 mflux 的两条基础设施：① 构造参数不查 ModelConfig 注册表（0.19.1 里
+# 没有 minimax-h3），从组件目录的 config.json 现读；② 权重不「一次读全量再
+# 量化」，按 shard 流式加载（否则 128 GB 机器上光加载就 OOM）。因此全部走
+# h3/weights/loader.py，缓存也另起桶，不与图片链路互相挤占。
+
+H3_MODULE_BUCKET = "h3_module"
+H3_PROMPT_BUCKET = "h3_prompt"
+H3_LATENT_BUCKET = "h3_latents"
+
+
+def _ensure_image_family(entry, node: str) -> None:
+    """图片侧入口的媒体守卫：视频 / 音频家族（minimax_h3）在这里被明确挡住。
+
+    句柄类型名是通用的（model / CLIP / mlx_vae），连线期挡不住错接，所以放在
+    每个图片侧入口的最前面 —— 必须早于 `weights.config_for_path`，否则只会拿到
+    一份对不上 H3 权重的图片配置，报错也很难懂。
+    """
+    if entry.media != "image":
+        raise ValueError(
+            f"{entry.family} 是视频 / 音频家族，不能在「{node}」里使用；"
+            "它的条件编码 / 采样 / 解码走 MlxTextEncoder / MlxKSamplerMLX / "
+            "MlxVAEDecodeRawPIL 的 H3 分支"
+        )
+
+
+def prepare_h3_components(
+    entry,
+    roles: tuple[str, ...],
+    cache,
+    selections: dict[str, str],
+    quantize: int | None = None,
+    precision: str = "bfloat16",
+) -> dict[str, Any]:
+    """只装 roles 里列出的组件；同一「role + 目录 + 精度 + 量化档位」复用同一份。
+
+    每个 role 单独一条缓存（都在 h3_module 桶里，上限 4）：MlxTextEncoder 只要
+    text_encoder + tokenizer，MlxKSamplerMLX 只要 transformer，解码节点要 VAE。
+    """
+
+    def build(role: str, kind: str, path: str) -> Any:
+        if role == "tokenizer":
+            if kind == "missing":
+                raise FileNotFoundError(
+                    f"没有 {role}：{path}"
+                    "（请在 <模型根>/tokenizer/ 下补一个与权重集同名的目录或软链）"
+                )
+            return h3_prompt.load_tokenizer(path)
+        if kind == "missing":
+            raise FileNotFoundError(f"未找到 {role} 权重：{path}")
+        comp = h3_loader.load(role, kind, path, quantize, precision)
+        bits = f"q{comp.bits}" if comp.bits else "不量化"
+        print(
+            f"[H3 组件] {role}: 常驻参数约 {comp.parameter_bytes() / 1e9:.1f} GB"
+            f"（{comp.dtype}, {bits}）"
+        )
+        return comp
+
+    comps: dict[str, Any] = {}
+    for role in roles:
+        selection = selections.get(role, "")
+        kind, resolved = component_path(entry, role, selection)
+        if role == "audio_vae" and kind == "missing":
+            # 音频 VAE 既可以放 audio_vae/，也可以继续放 vae/（本仓库的软链就在 vae/）
+            kind, resolved = paths.resolve("local", selection, "vae")
+        key = h3_component_cache_key(entry, role, resolved, quantize, precision)
+        comps[role], _hit = cache.get_or_create(
+            H3_MODULE_BUCKET, key, lambda role=role, kind=kind, path=resolved: build(role, kind, path)
+        )
+    return comps
+
+
+def prepare_h3_encoder(entry, clip, cache, cache_key: str) -> dict[str, Any]:
+    """加载 H3 的条件编码器 + tokenizer（都在 handle 里的那个权重集名下解析）。"""
+    selections = {role: clip.path for role in ENCODER_ROLES}
+    return prepare_h3_components(
+        entry,
+        ENCODER_ROLES,
+        cache,
+        selections,
+        quantize=clip.quantize,
+        precision=clip.precision,
+    )
+
+
+def prepare_h3_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
+    """只物化 transformer（H3 的采样阶段不需要 VAE，也不需要用条件编码器）。"""
+    return prepare_h3_components(
+        entry,
+        SAMPLER_ROLES,
+        cache,
+        {"transformer": model_handle.model_path},
+        quantize=int(model_handle.quantize) or None,
+        precision=model_handle.precision,
+    )
+
+
+def prepare_h3_vae(handle, cache) -> Any:
+    """按 MlxVaeHandle 物化某个 VAE（role = "vae" 视频 / "audio_vae" 音频）。"""
+    entry = entry_for(handle.model_type)
+    comps = prepare_h3_components(
+        entry,
+        (handle.role,),
+        cache,
+        {handle.role: handle.path},
+        quantize=int(handle.quantize) or None,
+        precision=handle.precision,
+    )
+    # 同上：解码用的 decode_video / decode_audio 直接调 vae.decode() 与
+    # vae.latent_channels，因此交出去的是包装器里的模块而不是 LoadedH3Component
+    return comps[handle.role].module
+
+
+def h3_component_dir(entry, role: str, selection: str) -> str:
+    """role 实际解析到的目录（audio_vae 缺失时回落到 vae/，与 prepare_h3_components 一致）。"""
+    kind, path = component_path(entry, role, selection)
+    if kind == "missing" and role == "audio_vae":
+        _kind, path = paths.resolve("local", selection, "vae")
+    return path
+
+
+def h3_component_cache_key(entry, role: str, path: str, quantize, precision) -> str:
+    """组件在 h3_module 桶里的键：prepare / release 两边共用，保证键完全对得上。"""
+    return runtime.cache_key(
+        {
+            "kind": "h3_module",
+            "role": role,
+            "path": path,
+            "quantize": quantize,
+            "precision": precision,
+        }
+    )
+
+
+def release_h3_components(
+    entry,
+    roles: tuple[str, ...],
+    cache,
+    selections: dict[str, str],
+    quantize: int | None = None,
+    precision: str = "bfloat16",
+) -> None:
+    """「用完即释放」：把这一段刚用过的组件从 h3_module 桶里丢掉，下次需要时再懒加载。
+
+    键与 prepare_h3_components 共用 h3_component_cache_key，所以丢掉的就是那一段
+    刚加载的那份；键不在桶里（没加载过 / 已换配置）就静默跳过。
+    """
+    for role in roles:
+        path = h3_component_dir(entry, role, selections.get(role, ""))
+        key = h3_component_cache_key(entry, role, path, quantize, precision)
+        if cache.evict(H3_MODULE_BUCKET, key):
+            print(f"[H3 组件] 已释放 {role}（下次需要时重新懒加载）")
+
+
+def release_h3_encoder(entry, clip, cache) -> None:
+    """编码用完就丢条件编码器 + tokenizer（q8 约 30 GB，采样阶段用不到）。"""
+    release_h3_components(
+        entry,
+        ENCODER_ROLES,
+        cache,
+        {role: clip.path for role in ENCODER_ROLES},
+        quantize=clip.quantize,
+        precision=clip.precision,
+    )
+
+
+def release_h3_sampler_components(entry, model_handle, cache) -> None:
+    """采样用完就丢 transformer（q8 约 35 GB，解码阶段用不到）。"""
+    release_h3_components(
+        entry,
+        SAMPLER_ROLES,
+        cache,
+        {"transformer": model_handle.model_path},
+        quantize=int(model_handle.quantize) or None,
+        precision=model_handle.precision,
+    )
+
+
+def release_h3_vae(handle, cache) -> None:
+    """解码用完就丢这个 VAE（视频约 5.2 GB / 音频约 0.6 GB，与 prepare_h3_vae 对称）。"""
+    entry = entry_for(handle.model_type)
+    release_h3_components(
+        entry,
+        (handle.role,),
+        cache,
+        {handle.role: handle.path},
+        quantize=int(handle.quantize) or None,
+        precision=handle.precision,
+    )
+
+
+# --- H3 提示词（MlxTextEncoder 负责；数组只进 h3_prompt 桶）---------------------
+def compose_h3_prompt(text: str) -> str:
+    """把提示词组装成 H3 的三段式；已经自带标签的提示词原样透传。"""
+    return h3_prompt.compose_prompt(text)
+
+
+def h3_prompt_encoding_key(clip, prompt: str) -> str:
+    """H3 条件的编码键（换大类 / 换目录 / 换精度 / 换量化 / 换文本都会换键）。"""
+    return runtime.cache_key({"kind": "h3_prompt", "clip": clip, "text": prompt})
+
+
+def encode_h3_prompt(entry, comps, prompt: str, cache, cache_key: str) -> tuple[Any, Any]:
+    """编码 presentation → `(embeds (1,L,hidden), tags (L,) int32)`（存进缓存）。"""
+
+    def build() -> tuple[Any, Any]:
+        encode = runtime.import_object(entry.prompt_encoder)
+        # comps 里是 LoadedH3Component（模块 + 量化档位 + 生效精度），而
+        # encode_presentation 要的是里面那个 nn.Module（它调 text_encoder.encode(...)）
+        return encode(comps["text_encoder"].module, comps["tokenizer"], prompt)
+
+    return cache.get_or_create(H3_PROMPT_BUCKET, cache_key, build)[0]
+
+
+def cached_h3_prompt(cache, key: str, label: str = "H3") -> tuple[Any, Any]:
+    """取 H3 的 presentation 编码；不在缓存里就提示重跑「MLX 文本编码器」。"""
+    if not key:
+        raise RuntimeError(f"未连接{label} 条件（MlxTextEncoder 的输出）")
+    encoding, hit = cache.get(H3_PROMPT_BUCKET, key)
+    if not hit or encoding is None:
+        raise RuntimeError(f"{label} 条件的编码已失效，请重新运行「MLX 文本编码器」节点")
+    return encoding
+
+
+# --- H3 联合采样（MlxKSamplerMLX 负责；latent 行只进 h3_latents 桶）------------
+def _mlx_memory_bytes() -> int:
+    """MLX 当前占用（活跃 + 缓存）字节数；取不到就算 0（不让预检把能跑的任务挡掉）。"""
+    total = 0
+    for name in ("get_active_memory", "get_cache_memory"):
+        fn = getattr(mx, name, None)
+        if fn is None:
+            continue
+        try:
+            total += int(fn())
+        except Exception:  # noqa: BLE001
+            pass
+    return total
+
+
+def h3_latent_cache_key(params: dict[str, Any], model_handle) -> str:
+    """H3 latent 的缓存键（几何 / 调度 / 提示词任一项变化都会换键）。"""
+    return runtime.cache_key({"kind": "h3_latents", "params": params, "model": model_handle})
+
+
+def run_h3_sampler(entry, model_handle, comps, params: dict[str, Any], cache) -> MlxLatentHandle:
+    """规划 → 内存预检 → 联合去噪 → 把 `(视频行, 音频行, 计划)` 存进 h3_latents 桶。"""
+    plan = h3_pipeline.make_plan(
+        int(params["width"]),
+        int(params["height"]),
+        int(params["num_frames"]),
+        int(params["steps"]),
+        float(params["video_shift"]),
+        float(params["audio_shift"]),
+        log=print,
+    )
+    print(f"[H3 采样] {plan.summary()}")
+
+    def sample() -> tuple[Any, Any, Any]:
+        embeds, tags = cached_h3_prompt(cache, params["positive_encoding_key"])
+        loaded = comps["transformer"]
+        # 预检按「已物化组件 + MLX 缓存 + 每行标定值」估（参考机实测口径，见 h3/pipeline）
+        h3_pipeline.preflight(
+            plan,
+            int(loaded.parameter_bytes()),
+            int(runtime.system_total_memory()),
+            text_tokens=int(tags.shape[0]),
+            cache_bytes=_mlx_memory_bytes(),
+            log=print,
+        )
+        video_rows, audio_rows, _layout = h3_pipeline.sample(
+            loaded.module, embeds, tags, plan, int(params["seed"]), log=print
+        )
+        return video_rows, audio_rows, plan
+
+    key = h3_latent_cache_key(params, model_handle)
+    (video_rows, audio_rows, plan), _hit = cache.get_or_create(H3_LATENT_BUCKET, key, sample)
+    return MlxLatentHandle(
+        kind="h3_video",
+        shape=tuple(video_rows.shape),
+        dtype=str(video_rows.dtype),
+        cache_key=key,
+        model=model_handle.model_type,
+        source="local",
+        path=model_handle.model_path,
+        precision=model_handle.precision,
+        quantize=model_handle.quantize,
+        model_cache_key=runtime.cache_key(model_handle),
+        height=plan.height,
+        width=plan.width,
+        num_frames=plan.num_frames,
+        duration=plan.duration_seconds,
+        video_shift=plan.video_shift,
+        audio_shift=plan.audio_shift,
+        num_latent_frames=plan.num_latent_frames,
+        latent_height=plan.latent_height,
+        latent_width=plan.latent_width,
+        audio_num_rows=int(audio_rows.shape[0]),
+        prompt_digest=str(params.get("prompt_digest", "")),
+    )
+
+
+# --- H3 解码（MlxVAEDecodeRawPIL / MlxVAEDecoder 负责）-------------------------
+def h3_state(cache, key: str) -> tuple[Any, Any, Any]:
+    """取「视频行 + 音频行 + 计划」；不在缓存里就提示重跑采样器。"""
+    state, hit = cache.get(H3_LATENT_BUCKET, key)
+    if not hit or state is None:
+        raise RuntimeError("H3 的 latent 不在缓存里，请重新运行「MLX 采样器」")
+    return state
+
+
+def decode_h3_latents(latents, vae_handle, cache, batch_index: int) -> MlxPilImage:
+    """按 VAE 的 role 解 H3 latent：vae → 帧序列，audio_vae → 音频轨。
+
+    帧序列是「一段视频」而不是「一批图片」，所以 `batch_index` 只用来取其中一帧
+    （-1 = 全部）；音频给整段 `AudioTrack`，由 MlxPilToTorch 转成 ComfyUI 的
+    AUDIO，再接核心的 CreateVideo / SaveAudio 落盘。
+    """
+    video_rows, audio_rows, plan = h3_state(cache, latents.cache_key)
+    vae = prepare_h3_vae(vae_handle, cache)
+    if vae_handle.role == "vae":
+        frames = h3_pipeline.decode_video(video_rows, plan, vae)
+        pils = image.to_pil_uint8(frames, batch_index=batch_index)
+        return MlxPilImage(images=pils, batch_index=batch_index, fps=float(plan.fps), audio=None)
+    if vae_handle.role == "audio_vae":
+        track = h3_pipeline.decode_audio(audio_rows, plan, vae)
+        return MlxPilImage(images=(), batch_index=batch_index, fps=float(plan.fps), audio=track)
+    raise ValueError(f"未知 VAE role：{vae_handle.role}")
 

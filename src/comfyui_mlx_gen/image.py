@@ -82,6 +82,25 @@ def to_pil_batch(images: Any) -> tuple[Image.Image, ...]:
     return tuple(out)
 
 
+def to_pil_uint8(frames: Any, batch_index: int = -1) -> tuple[Image.Image, ...]:
+    """H3 的帧序列（uint8 `[N,H,W,3]`，值域已经是 0..255）→ PIL 元组。
+
+    与 `to_pil` 的区别：那条处理 VAE 解码出来的 float（值域 [-1,1]，会先做
+    `x/2+0.5`）；MiniMax-H3 的 `decode_video` 已经自己做过 ImageNet 反归一化并
+    裁成 uint8，直接建 PIL 即可（走 `to_pil` 会把画面整体压暗一半）。
+    """
+    data = np.asarray(frames)
+    if data.ndim == 3:
+        data = data[None, ...]
+    if data.ndim != 4 or data.shape[-1] != 3:
+        raise ValueError(f"帧序列应是 [N,H,W,3]，收到 {data.shape}")
+    if batch_index >= 0:
+        data = data[[batch_index % data.shape[0]]]
+    return tuple(
+        Image.fromarray(np.ascontiguousarray(frame, dtype=np.uint8), mode="RGB") for frame in data
+    )
+
+
 def digest(items: Any) -> str:
     """IMAGE 张量 / PIL 批次的稳定摘要（做缓存键，保证换图必换键）。
 

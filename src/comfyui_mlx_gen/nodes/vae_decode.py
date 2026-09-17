@@ -19,13 +19,16 @@ from ..types import MlxPilImage, MlxVaeHandle, entry_for, model_types, vae
 NO_PATH = "<无可用权重>"
 
 
-def vae_handle_from_widgets(model_type, model_path, precision, quantize) -> MlxVaeHandle:
-    """把 widget 里的四个取值包成 MlxVaeHandle（键与 MlxVAELoader 完全一致）。"""
+def vae_handle_from_widgets(
+    model_type, model_path, precision, quantize, role: str = "vae"
+) -> MlxVaeHandle:
+    """把 widget 里的取值包成 MlxVaeHandle（键与 MlxVAELoader 完全一致）。"""
     return MlxVaeHandle(
         model_type=model_type,
         path=model_path,
         precision=precision,
         quantize=int(quantize),
+        role=role,
         cache_key=runtime.cache_key(
             {
                 "kind": "vae",
@@ -33,6 +36,7 @@ def vae_handle_from_widgets(model_type, model_path, precision, quantize) -> MlxV
                 "path": model_path,
                 "precision": precision,
                 "quantize": int(quantize),
+                "role": role,
             }
         ),
     )
@@ -59,12 +63,48 @@ def _decode_with_vae(entry, vae_module, latents, arr, batch_index) -> MlxPilImag
     return MlxPilImage(images=tuple(pils), batch_index=batch_index)
 
 
+def _decode_h3(latents, vae_handle, audio_handle, batch_index: int) -> MlxPilImage:
+    """H3：按 VAE 的 role 解 latent（视频行与音频行存在同一条 latent 状态里）。
+
+    主 handle 是 `role="vae"` → 出帧序列；只有把第二个 MlxVAELoader
+    （`role="audio_vae"`）接到 `audio_vae` 入口，才会同时带上音轨。
+    """
+    main = pipeline.decode_h3_latents(latents, vae_handle, CACHE, batch_index)
+    if vae_handle.role == "audio_vae":
+        pipeline.release_h3_vae(vae_handle, CACHE)  # 只解音频（帧给不了，MlxPilToTorch 会占位一张 1×1 黑图）
+        return main
+    if audio_handle is None:
+        print(
+            "[MlxVAEDecodeRawPIL] 没接 audio_vae（再放一个「MLX VAE 加载器」，"
+            "model_path 选 MiniMax-H3、role 选 audio_vae，接到本节点的 audio_vae 入口）："
+            "只出画面，没有声音"
+        )
+        pipeline.release_h3_vae(vae_handle, CACHE)
+        return main
+    if audio_handle.role != "audio_vae":
+        raise ValueError(
+            f"audio_vae 入口接到的 handle role 是 {audio_handle.role!r}，"
+            "那样只会把视频 VAE 再解一遍、拿不到音轨："
+            "请在第二个「MLX VAE 加载器」里把 role 选成 audio_vae（model_path 选 MiniMax-H3）"
+        )
+    audio = pipeline.decode_h3_latents(latents, audio_handle, CACHE, -1)
+    # 帧与音轨都拿到了：两个 VAE 都从缓存里丢掉（后面接的 MlxPilToTorch 只用现成数据）
+    pipeline.release_h3_vae(vae_handle, CACHE)
+    pipeline.release_h3_vae(audio_handle, CACHE)
+    return MlxPilImage(
+        images=main.images, batch_index=batch_index, fps=main.fps, audio=audio.audio
+    )
+
+
 class MlxVAEDecodeRawPIL:
     @classmethod
     def INPUT_TYPES(cls):
         types = model_types()
         default_type = types[0]
-        vae_paths = cls._paths("vae")
+        # 候选取 vae/ + audio_vae/ 的并集（H3 的音频 VAE 两个目录都可能放）
+        vae_paths = list(
+            dict.fromkeys(cls._paths("vae") + cls._paths("audio_vae"))
+        ) or [NO_PATH]
         return {
             "required": {
                 "latents": ("latents", {}),
@@ -73,7 +113,9 @@ class MlxVAEDecodeRawPIL:
                 "precision": (["bfloat16", "float16", "float32"], {"default": "bfloat16"}),
                 "quantize": ([4, 8, 16], {"default": 8}),
                 "batch_index": ("INT", {"default": -1, "min": -1, "max": 3}),
-            }
+            },
+            # 只有 MiniMax-H3 用得上：接第二个 MlxVAELoader（role=audio_vae）才出声音
+            "optional": {"audio_vae": (vae, {})},
         }
 
     @staticmethod
@@ -85,10 +127,15 @@ class MlxVAEDecodeRawPIL:
     FUNCTION = "decode"
     CATEGORY = "MLX/Gen"
 
-    def decode(self, latents, model_type, model_path, precision, quantize, batch_index):
+    def decode(self, latents, model_type, model_path, precision, quantize, batch_index,
+               audio_vae=None):
         entry = entry_for(model_type)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
+        if latents.kind == "h3_video":
+            # 视频行与音频行在同一条 latent 状态里，按 handle 的 role 决定解哪一边
+            handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
+            return (_decode_h3(latents, handle, audio_vae, batch_index),)
         arr = _cached_latents(latents)
         # 按同款 handle 走共享键 → 与 MlxVAELoader / MlxVAEDecoder 命中同一份 VAE
         handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
@@ -110,14 +157,16 @@ class MlxVAEDecoder:
                 "vae": (vae, {}),
                 "latents": ("latents", {}),
                 "batch_index": ("INT", {"default": -1, "min": -1, "max": 3}),
-            }
+            },
+            # 只有 MiniMax-H3 用得上：接第二个 MlxVAELoader（role=audio_vae）才出声音
+            "optional": {"audio_vae": (vae, {})},
         }
 
     RETURN_TYPES = ("images",)
     FUNCTION = "decode"
     CATEGORY = "MLX/Gen"
 
-    def decode(self, vae, latents, batch_index):
+    def decode(self, vae, latents, batch_index, audio_vae=None):
         if vae is None or not isinstance(vae, MlxVaeHandle):
             raise ValueError(
                 "必须连接「MLX VAE 加载器」的输出；"
@@ -132,6 +181,9 @@ class MlxVAEDecoder:
                 f"latents 是 {latents.model} 产出的，而 VAE 选的是 {vae.model_type}，"
                 "请让解码器与采样器的 model_type 一致"
             )
+        if latents.kind == "h3_video":
+            # 一份 latent 状态里有视频行 + 音频行，按 handle 的 role 取对应那一边
+            return (_decode_h3(latents, vae, audio_vae, batch_index),)
         arr = _cached_latents(latents)
         # 与 MlxVAEEncoder / MlxVAEDecodeRawPIL 共用同一个键 → 全流程只驻留一份 VAE
         vae_module = pipeline.vae_component(vae, CACHE)

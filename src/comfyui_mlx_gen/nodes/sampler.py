@@ -34,10 +34,17 @@ from __future__ import annotations
 
 from .. import pipeline
 from ..cache import CACHE
+from ..h3.latent_creator.h3_layout import valid_frame_counts
 from ..types import condition, entry_for, model, model_types, ref_images
 
 SCHEDULERS = ["linear", "flow_match_euler_discrete", "seedvr2_euler"]
 KV_CACHE_MODES = ["auto", "off"]
+# 画布档位：图片链路原有的几档 + MiniMax-H3 的推荐档位（H3 必须是 32 的倍数，
+# 且宽高比要在 [1/4, 4] 之内；见 h3/pipeline.make_plan）
+WIDTH_OPTIONS = [256, 352, 384, 512, 544, 640, 768, 960, 1024, 1280, 1344, 1536, 2048]
+HEIGHT_OPTIONS = [256, 352, 384, 512, 544, 640, 768, 960, 1024, 1280, 1344, 1536]
+# MiniMax-H3 只接受 17n+5 的帧数（124 ~ 345，其余值直接不在下拉里）
+FRAME_OPTIONS = list(valid_frame_counts())
 
 
 class MlxKSamplerMLX:
@@ -51,8 +58,8 @@ class MlxKSamplerMLX:
                 "negative": (condition, {}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**63 - 1}),
                 "steps": ("INT", {"default": entry.default_steps, "min": 1, "max": 100}),
-                "width": ([256, 512, 768, 1024, 1536, 2048], {"default": 512}),
-                "height": ([256, 512, 768, 1024, 1536, 2048], {"default": 512}),
+                "width": (WIDTH_OPTIONS, {"default": 512}),
+                "height": (HEIGHT_OPTIONS, {"default": 512}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4}),
                 # 初值取「第一个大类」的 default_guidance（本机是 z_image 的 1.0）；
                 # Qwen 编辑请在 2.5~4.0（该大类登记的是 2.5，工作流里显式写 2.5）
@@ -61,6 +68,17 @@ class MlxKSamplerMLX:
                     {"default": entry.default_guidance, "min": 0.0, "max": 20.0},
                 ),
                 "scheduler": (SCHEDULERS, {"default": entry.default_scheduler}),
+                # --- 仅 MiniMax-H3 用到（图片链路默认收在「extras」里，不影响既有工作流）---
+                # 帧数只给 17n+5 的合法值；两条整流流的 shift（视频 12.0 / 音频 3.0）
+                "num_frames": (FRAME_OPTIONS, {"default": FRAME_OPTIONS[0], "advanced": True}),
+                "video_shift": (
+                    "FLOAT",
+                    {"default": 12.0, "min": 0.0, "max": 30.0, "step": 0.5, "advanced": True},
+                ),
+                "audio_shift": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.5, "advanced": True},
+                ),
             },
             "optional": {
                 # 连上 → 编辑（flux2 单图编辑 / qwen_edit 多图编辑）；不连 → 文生图
@@ -87,6 +105,9 @@ class MlxKSamplerMLX:
         batch_size,
         guidance,
         scheduler,
+        num_frames=FRAME_OPTIONS[0],
+        video_shift=12.0,
+        audio_shift=3.0,
         ref_images=None,
         kv_cache="auto",
     ):
@@ -114,6 +135,35 @@ class MlxKSamplerMLX:
         entry = entry_for(model.model_type)
         if not entry.supported:
             raise NotImplementedError(f"{model.model_type} 尚未实现：{entry.notes}")
+
+        # MiniMax-H3：一条打包序列里同时去噪视频与音频（guidance 蒸馏模型，每步只有
+        # 一次前向），所以 scheduler / guidance / 负向条件三个 widget 都不看；
+        # 画布必须是 32 的倍数、帧数必须是 17n+5（下拉里只给合法值）
+        if entry.media != "image":
+            if ref_images is not None:
+                raise ValueError(f"{entry.family} 不支持参考图编辑，请把 ref_images 断开")
+            if scheduler != entry.default_scheduler or float(guidance) != 1.0:
+                print(
+                    f"[MlxKSamplerMLX] {entry.family} 不看 scheduler / guidance / 负向条件"
+                    "（guidance 蒸馏模型，每步一次前向），已忽略这三项"
+                )
+            params = {
+                "seed": int(seed),
+                "steps": int(steps),
+                "height": int(height),
+                "width": int(width),
+                "num_frames": int(num_frames),
+                "video_shift": float(video_shift),
+                "audio_shift": float(audio_shift),
+                "positive_encoding_key": positive.encoding_key,
+                "prompt_digest": positive.text,
+            }
+            comps = pipeline.prepare_h3_sampler_components(entry, model, CACHE)
+            handle = pipeline.run_h3_sampler(entry, model, comps, params, CACHE)
+            # 潜变量已进 h3_latents 桶：transformer（q8 约 35 GB）用完就丢，
+            # 别和解码要用的 VAE 一起占着（换 seed / 步数重跑时会重新懒加载）
+            pipeline.release_h3_sampler_components(entry, model, CACHE)
+            return (handle,)
 
         # 参考图（可选）：edit 分支。参考图由「MLX VAE 编码」产出（来源是 VAE handle，
         # 与 transformer 权重无关），所以这里只校验大类一致 + 本大类确实支持参考图编辑

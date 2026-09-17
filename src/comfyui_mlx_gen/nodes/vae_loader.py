@@ -18,19 +18,28 @@ from ..types import MlxVaeHandle, entry_for, model_types, vae
 NO_WEIGHTS = "<无可用权重>"
 PRECISIONS = ["bfloat16", "float16", "float32"]
 QUANTIZE_OPTIONS = [4, 8, 16]
+# 图片链路只有 "vae"；MiniMax-H3 还有 "audio_vae"（权重通常也放在 vae/ 下，
+# 因此 MlxVAELoader 的候选取两个目录的并集，解析时 audio_vae 缺失会退回 vae/）
+ROLES = ["vae", "audio_vae"]
 
 
 class MlxVAELoader:
     @classmethod
     def INPUT_TYPES(cls):
         types = model_types()
-        vae_paths = paths.list_component_items("vae") or [NO_WEIGHTS]
+        # 两个候选目录取并集：H3 的音频 VAE 既可以放 audio_vae/，也可以放 vae/
+        vae_paths = list(
+            dict.fromkeys(
+                paths.list_component_items("vae") + paths.list_component_items("audio_vae")
+            )
+        ) or [NO_WEIGHTS]
         return {
             "required": {
                 "model_type": (types, {"default": types[0]}),
                 "model_path": (vae_paths, {"default": vae_paths[0]}),
                 "precision": (PRECISIONS, {"default": "bfloat16"}),
                 "quantize": (QUANTIZE_OPTIONS, {"default": 8}),
+                "role": (ROLES, {"default": "vae"}),
             }
         }
 
@@ -39,28 +48,32 @@ class MlxVAELoader:
     FUNCTION = "load"
     CATEGORY = "MLX/Gen"
 
-    def load(self, model_type, model_path, precision, quantize):
+    def load(self, model_type, model_path, precision, quantize, role="vae"):
         # 未知大类 → 直接报错；已知但未验证的大类提示还没实现（与 MlxTransformerLoader 一致）
         entry = entry_for(model_type)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
         if precision not in PRECISIONS:
             raise ValueError(f"未知精度: {precision}")
-        kind, resolved = paths.resolve("local", model_path, "vae")
+        if role not in entry.components:
+            raise ValueError(f"{model_type} 没有 {role} 组件（只有 {list(entry.components)}）")
+        kind, resolved = paths.resolve("local", model_path, role)
         if kind == "missing":
-            raise FileNotFoundError(f"未找到 vae 权重: {resolved}")
+            raise FileNotFoundError(f"未找到 {role} 权重: {resolved}")
         config = {
             "kind": "vae",
             "model_type": model_type,
             "path": model_path,
             "precision": precision,
             "quantize": int(quantize),
+            "role": role,
         }
         handle = MlxVaeHandle(
             model_type=model_type,
             path=model_path,
             precision=precision,
             quantize=int(quantize),
+            role=role,
             cache_key=runtime.cache_key(config),
         )
         return (handle,)
