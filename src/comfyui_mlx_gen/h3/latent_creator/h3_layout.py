@@ -79,7 +79,7 @@ MAX_DURATION_SECONDS = 15.0
 # The duration a request generates is the one of the *aligned* count, so the ceiling holds for that:
 # 346 frames would pass a check on the request and then round up to 362, i.e. 15.083 s. The largest
 # `17 * n + 5` inside the window is therefore 345 (14.375 s), not 360 or 362.
-MIN_NUM_FRAMES = 124
+MIN_NUM_FRAMES = 5
 MAX_NUM_FRAMES = 345
 
 
