@@ -236,7 +236,7 @@ class MlxModelEntry:
     ModelConfig 注册表与整体权重加载路径）。
     """
 
-    family: str  # 与 MODEL_DEFS 的键一致（"z_image" | "flux2" | "qwen_edit"），即 model_type
+    family: str  # 与 MODEL_DEFS 的键一致（"z_image" | "flux2" | "qwen_image" | …），即 model_type
     weight_def: str  # 权重定义类（含 components()/tokenizers()，同大类内共用）
     components: dict[str, ComponentDef]  # role -> 定义；role 见 paths.COMPONENT_DIRS
     default_config: str  # 目录名匹配不到配置时用的兜底（ModelConfig 工厂方法名）
@@ -357,6 +357,43 @@ QWEN_EDIT = MlxModelEntry(
 )
 
 
+# --- Qwen-Image 文生图（2512 这一族：没有视觉塔，只有 t2i 一条路）----------------
+QWEN_IMAGE = MlxModelEntry(
+    family="qwen_image",
+    weight_def="mflux.models.qwen.weights.qwen_weight_definition:QwenWeightDefinition",
+    components=_components(
+        transformer="mflux.models.qwen.model.qwen_transformer.qwen_transformer:QwenTransformer",
+        vae="mflux.models.qwen.model.qwen_vae.qwen_vae:QwenVAE",
+        text_encoder=(
+            "mflux.models.qwen.model.qwen_text_encoder.qwen_text_encoder:QwenTextEncoder"
+        ),
+        tokenizer_name="qwen",
+        # 没有 text_encoder_attach：mflux 的 QwenImageInitializer 对 generic「qwen-image」
+        # 配置返回 {}（不挂视觉塔），而且 qwen-image-2512-8bit 的文本编码器权重里
+        # 根本没有 encoder.visual.*（挂上去只会在 update(strict=False) 下静默丢权重）
+        # → 条件只走语言塔，正/负提示词都用「MLX 文本编码器」；
+        #   要拿参考图编辑请用 qwen_edit 大类 + qwen-image-edit-2511-8bit。
+    ),
+    default_config="qwen_image",
+    default_steps=20,  # = mflux 的 MODEL_INFERENCE_STEPS["qwen-image"]
+    default_scheduler="flow_match_euler_discrete",
+    default_guidance=4.0,  # = QwenImage.generate_image 的默认 guidance
+    supports_compile=False,  # transformer 的 t 是 int 步号，入参还含 Config 对象
+    prompt_encoder=(
+        "mflux.models.qwen.model.qwen_text_encoder.qwen_prompt_encoder:QwenPromptEncoder"
+    ),
+    prompt_encoder_args={},  # 编码入口不需要额外参数（prompt_cache 由 cache.py 取代）
+    latent_creator="mflux.models.qwen.latent_creator.qwen_latent_creator:QwenLatentCreator",
+    supported=True,
+    notes=(
+        "已对接文生图（txt2img）：条件用「MLX 文本编码器」（纯文本，不带参考图），"
+        "默认 20 步 + flow_match_euler_discrete + guidance 4.0，latent 由 create_noise 起；"
+        "本大类的权重（qwen-image-2512-8bit）没有视觉塔，接不了参考图编辑 —— "
+        "edit 请用 qwen_edit 大类 + qwen-image-edit-2511-8bit。"
+    ),
+)
+
+
 # --- MiniMax-H3（文生视频 + 立体声）：绕开 mflux 的注册表与整体加载路径 ---
 MINIMAX_H3 = MlxModelEntry(
     family="minimax_h3",
@@ -392,6 +429,7 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
     "z_image": Z_IMAGE,
     "flux2": FLUX2_KLEIN,
     "qwen_edit": QWEN_EDIT,
+    "qwen_image": QWEN_IMAGE,
     # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
     "minimax_h3": MINIMAX_H3,
 }

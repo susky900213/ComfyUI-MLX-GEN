@@ -14,7 +14,14 @@ encoder、scheduler、vae 等），采样循环与权重加载由我们自己实
   `prepare_encoder` + `encode_edit_conditioning`），参考图 latent 按**目标尺寸**编码后
   拼在目标 latent 之后；CFG 用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定），
   transformer 的 `t` 传步号 int（内部取 `config.scheduler.sigmas[t]`），不编译
-  （见 `_sample_qwen_edit` / `decode_latents`）。
+  （见 `_sample_qwen_edit` / `decode_latents`）；
+- qwen_image 文生图（txt2img）：条件由「MLX 文本编码器」编成 `(embeds, mask)`
+  （`encode_text` 走 `QwenPromptEncoder`，签名是
+  `encode_prompt(prompt, negative_prompt, prompt_cache, qwen_tokenizer,
+  qwen_text_encoder)`，prompt_cache 在本项目用不上 → 给空 dict），latent 由
+  `QwenLatentCreator.create_noise` 纯噪声起（`[1, seq, 64]`，**不接参考图**），
+  默认 20 步 + flow_match_euler_discrete + guidance 4.0（见 `_sample_qwen_image`；
+  latent 形状与 edit 一致，因此解码仍走同一个 `decode_latents`）。
 
 组件分工（延迟装配）：采样器只加载 transformer；text_encoder + tokenizer 由
 MlxTextEncoder 自己加载并编码，VAE 由 MlxVAEEncoder / MlxVAEDecoder 按
@@ -24,6 +31,7 @@ MlxVaeHandle 物化（编码与解码共用同一份实例）。采样器按 han
 
 from __future__ import annotations
 
+from inspect import signature
 from typing import Any, Sequence
 
 import mlx.core as mx
@@ -51,6 +59,40 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
     if not selection:
         raise ValueError(f"没有为 {role} 指定权重目录（请在节点上重新选择）")
     return paths.resolve(comp.source, selection, role)
+
+
+def resolve_class_kwargs(entry, kind: str, model_config) -> dict[str, Any]:
+    """该组件构造参数（只保留构造函数真正接受的键，全部按目录名现算的配置里取）。
+
+    ModelConfig 的 `{kind}_overrides` 里混着两类东西：① 真正的构造参数
+    （`num_layers` / `in_channels` / `supports_kv_cache` / `use_src_mask` …，
+    少了就会建出维度对不上的实例）；② 只在**采样期**生效的开关（flux2 的
+    `finetune_ratio`、Qwen 的 `qwen_edit_plus` / `qwen_edit_2509`）—— 后者在
+    mflux 里由 variant 类（`QwenEditPlus` / `QwenEdit2509`）自己判断，
+    从来不是 `X(**overrides)` 的入参，原样透传会得到
+    `TypeError: ... unexpected keyword argument 'qwen_edit_plus'`
+    （qwen-image-edit-2511-8bit 之前就是这样挂的）。
+
+    另外 `qwen_image`（2512）这一族 `transformer_overrides` 是空的
+    （mflux 的 `QwenImageInitializer` 对 generic「qwen-image」配置返回 `{}`），
+    所以过滤后仍然是 `{}` → `QwenTransformer(**{})`，与参考实现一致。
+    """
+    overrides = dict(getattr(model_config, f"{kind}_overrides", {}) or {})
+    comp = entry.components.get(kind, {})
+    import_str = getattr(comp, "class_import", "")
+    if not import_str:
+        return overrides
+
+    params = signature(runtime.import_object(import_str)).parameters
+    class_kwargs = {k: v for k, v in overrides.items() if k in params}
+    dropped = sorted(set(overrides) - set(class_kwargs))
+    if dropped:
+        print(
+            f"[resolve_class_kwargs] {kind} 的构造函数不接受 {dropped}，已跳过"
+            "（这些是运行时开关，不是 __init__ 入参；采样语义由我们自己按"
+            "权重集实现，见 `_sample_qwen_edit` 的 zero_cond_t）"
+        )
+    return class_kwargs
 
 
 def prepare_components(
@@ -81,14 +123,10 @@ def prepare_components(
             else:
                 # 构造组件需要的 class_kwargs（如 flux2 的 transformer/text_encoder
                 # 必须按 ModelConfig 的 overrides 建，否则用默认构造参数会建出
-                # 错误维度、加载权重对不上）；按当前 role 的目录名现算 config。
+                # 错误维度、加载权重对不上）；按当前 role 的目录名现算 config，
+                # 再只留构造函数接受的键（overrides 里混着运行时开关）。
                 model_config = weights.config_for_path(selection, entry.default_config)
-                if role == "transformer":
-                    class_kwargs = dict(model_config.transformer_overrides)
-                elif role == "text_encoder":
-                    class_kwargs = dict(model_config.text_encoder_overrides)
-                else:  # vae：构造参数不依赖 overrides（Flux2VAE()/VAE() 无参）
-                    class_kwargs = {}
+                class_kwargs = resolve_class_kwargs(entry, role, model_config)
                 # quantize=None → 用权重自带的档位（QuantizationResolution.resolve）
                 instance, _bits = components.create_and_load(
                     entry, role, kind, path, quantize, raw, class_kwargs=class_kwargs
@@ -203,14 +241,15 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
         kind, path = component_path(entry, "transformer", model_handle.model_path)
         if kind == "missing":
             raise FileNotFoundError(f"未找到 transformer 权重: {path}")
-        # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例）
+        # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例），
+        # 但 overrides 里还混着运行时开关（qwen_edit_plus 之类）→ 要按签名过滤
         instance, _bits = components.create_and_load(
             entry,
             "transformer",
             kind,
             path,
             model_handle.quantize,
-            class_kwargs=dict(model_config.transformer_overrides),
+            class_kwargs=resolve_class_kwargs(entry, "transformer", model_config),
         )
         return instance
 
@@ -227,7 +266,11 @@ def create_latents(defn, seed, height, width, batch_size) -> list[Any]:
     - z_image：每项 `[16, 1, h/8, w/8]`，采样用 `transformer(timestep, x, cap_feats, sigmas)`；
     - flux2：每项 `(latents[1, seq, C], latent_ids[1, seq, 4], latent_h, latent_w)`，
       采样用打包 latent + grid ids，`Flux2LatentCreator` 没有 `create_noise`，
-      只有 `prepare_packed_latents`。
+      只有 `prepare_packed_latents`；
+    - qwen_image / qwen_edit：每项 `[1, (h/16)*(w/16), 64]`（`QwenLatentCreator`
+      直接借 `FluxLatentCreator.create_noise`，给的就是打包好的纯噪声 latent，
+      与「是否接参考图」无关 —— edit 那边另外还要参考图 latent，见
+      `_sample_qwen_edit`）。
     """
     latent_creator = runtime.import_object(defn.latent_creator)
     if defn.family == "flux2":
@@ -251,7 +294,11 @@ def encode_text(defn, comps, text: str, cache, cache_key: str) -> Any:
     - z_image：`encode_prompt` 返回单个 `cap_feats` 数组；
     - flux2：`encode_prompt` 返回 `(prompt_embeds, text_ids)` 二元组，且需要
       `num_images_per_prompt / max_sequence_length / text_encoder_out_layers`
-      （取自 entry.prompt_encoder_args，`cache` 这个键 M1 不支持，跳过）。
+      （取自 entry.prompt_encoder_args，`cache` 这个键 M1 不支持，跳过）；
+    - qwen_image：`QwenPromptEncoder.encode_prompt` 是另一套签名（正/负一起编，
+      还要显式给 `prompt_cache` 字典），本项目只要正向外，因此取返回值的
+      `[0] / [1]` 存成 `(embeds, mask)`；`prompt_cache` 用不上（缓存由
+      cache.py 的 prompt_encoding 桶负责）→ 给空 dict。
     缓存里就存返回值原样（数组或二元组），采样端按大类取用。
     """
 
@@ -265,6 +312,17 @@ def encode_text(defn, comps, text: str, cache, cache_key: str) -> Any:
                 text_encoder=comps["text_encoder"],
                 **args,
             )
+        if defn.family in ("qwen_image", "qwen_edit"):
+            # 两条 Qwen 链路共用这套签名：negative 由另一个 MlxTextEncoder 单独编，
+            # 因此这里只取正向外（第 3/4 个返回值恒为 None）
+            embeds, mask, _neg_embeds, _neg_mask = prompt_encoder.encode_prompt(
+                prompt=text,
+                negative_prompt=None,
+                prompt_cache={},
+                qwen_tokenizer=comps["tokenizer"],
+                qwen_text_encoder=comps["text_encoder"],
+            )
+            return (embeds, mask)
         return prompt_encoder.encode_prompt(
             prompt=text,
             tokenizer=comps["tokenizer"],
@@ -1021,6 +1079,88 @@ def _sample_qwen_edit(defn, comps, params, cache, model_config, guidance):
     return stacked
 
 
+def _predict_qwen(transformer, latents, step, config, encodings, negative, guidance, use_compile):
+    """Qwen 单步预测（含 CFG；与 mflux `QwenImage._predict` 一致）。
+
+    latents 是打包形式 `[1, seq, 64]`，条件 `encodings` 是 `(embeds, mask)`；
+    `step` 是**步号 int**（transformer 内部按 `config.scheduler.sigmas[step]`
+    反查 sigma，与 mflux 的 `for t in config.time_steps` 一致），因此
+    CFG 组合用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定）。
+    """
+    pos_embeds, pos_mask = encodings
+    if negative is not None:
+        neg_embeds, neg_mask = negative
+    else:
+        neg_embeds, neg_mask = None, None
+
+    def predict(x, t, p_embeds, p_mask, n_embeds, n_mask, scale):
+        noise = transformer(
+            t=t,
+            config=config,
+            hidden_states=x,
+            encoder_hidden_states=p_embeds,
+            encoder_hidden_states_mask=p_mask,
+        )
+        if n_embeds is None:
+            return noise
+        negative_noise = transformer(
+            t=t,
+            config=config,
+            hidden_states=x,
+            encoder_hidden_states=n_embeds,
+            encoder_hidden_states_mask=n_mask,
+        )
+        return qwen_guided_noise(noise, negative_noise, scale)
+
+    fn = mx.compile(predict) if use_compile else predict
+    return fn(latents, step, pos_embeds, pos_mask, neg_embeds, neg_mask, guidance)
+
+
+def _sample_qwen_image(defn, comps, params, cache, model_config, guidance):
+    """Qwen-Image 文生图（与 mflux `QwenImage.generate_image` 的 t2i 分支一致）。
+
+    与 `_sample_qwen_edit` 的三点差别：
+
+    - latent 由 `create_noise` 纯噪声起，**不接参考图**，也就没有
+      `zero_cond_t` / `cond_image_grid` 这两个 edit 专用入参；
+    - 条件是「MLX 文本编码器」算好的 `(embeds, mask)`（`encode_text` 的 Qwen 分支），
+      不是带图片 token 的编辑条件；
+    - 默认调度器是 `flow_match_euler_discrete`、guidance 4.0（mflux 的
+      `ModelConfig.qwen_image` 与 `QwenImage.generate_image` 的默认值）。
+
+    其余与 edit 相同：`t` 传步号 int、`scale_model_input` 恒等、CFG 走
+    `qwen_guided_noise`、每个 batch 项单独采样后沿 batch 拼接 →
+    latent 形状同样是 `[B, seq, 64]`，因此 `decode_latents` 与下游不用改。
+    """
+    config = make_sampler_config(defn, model_config, params)
+    scheduler = build_scheduler(params["scheduler_name"], config)
+    per_seed = create_latents(
+        defn, params["seed"], params["height"], params["width"], params["batch_size"]
+    )
+    encodings = cached_encoding(cache, params["positive_encoding_key"], "正")
+    negative = (
+        cached_encoding(cache, params["negative_encoding_key"], "负") if guidance > 1.0 else None
+    )
+    use_compile = bool(params.get("compile_model", True))
+    transformer = comps["transformer"]
+    final = []
+    for latents in per_seed:
+        current = latents  # [1, (h/16)(w/16), 64]
+        for t in range(params["steps"]):
+            # 与参考实现一致地过一遍 scale_model_input（Qwen 用的两个调度器都继承
+            # BaseScheduler 的恒等实现，因此这里等价于直接用 current）
+            scaled = scheduler.scale_model_input(current, t)
+            noise = _predict_qwen(
+                transformer, scaled, t, config, encodings, negative, guidance, use_compile
+            )
+            current = scheduler.step(noise=noise, timestep=t, latents=scaled)
+            mx.eval(current)
+        final.append(current)
+    stacked = mx.concatenate(final, axis=0)  # [B, seq, 64]
+    mx.eval(stacked)
+    return stacked
+
+
 def run_sampler(defn, model_handle, comps, params, cache):
     """跑完整采样，返回带缓存数组的 latent 句柄。
 
@@ -1042,6 +1182,7 @@ def run_sampler(defn, model_handle, comps, params, cache):
 
     def sample():
         # 接了参考图 → 编辑（edit）分支；按大类分派，不静默降级
+        # （qwen_image 是文生图大类，接参考图在「MLX KSampler」里就被挡掉了）
         if params.get("ref_cache_key"):
             if defn.family == "flux2":
                 return _sample_flux2_edit(defn, comps, params, cache, model_config, guidance)
@@ -1052,6 +1193,8 @@ def run_sampler(defn, model_handle, comps, params, cache):
             )
         if defn.family == "flux2":
             return _sample_flux2(defn, comps, params, cache, model_config, guidance)
+        if defn.family == "qwen_image":
+            return _sample_qwen_image(defn, comps, params, cache, model_config, guidance)
         return _sample_z_image(defn, comps, params, cache, model_config, guidance)
 
     key = runtime.cache_key(
@@ -1083,7 +1226,8 @@ def decode_latents(defn, comps, latents, height, width):
       `Flux2LatentCreator.unpack_latents` 还原成 `[1, C, latent_h, latent_w]`，
       最后交给 `Flux2VAE.decode_packed_latents`（内部含 bn 反归一化与 unpatchify）；
     - qwen_edit：同样先 unpack 成 `[1, 16, h/8, w/8]` 再走 `VAEUtil.decode`
-      （QwenVAE 内部处理 mean/std 与 5D 维度）。
+      （QwenVAE 内部处理 mean/std 与 5D 维度）；两条 Qwen 链路的 latent 都是
+      打包形式，因此 unpack 分支共用；
     """
     latent_creator = runtime.import_object(defn.latent_creator)
     vae = comps["vae"]
@@ -1092,7 +1236,7 @@ def decode_latents(defn, comps, latents, height, width):
             latents = latents[None, ...]  # [seq, C] → [1, seq, C]
         unpacked = latent_creator.unpack_latents(latents, height, width)
         return vae.decode_packed_latents(unpacked)
-    if defn.family == "qwen_edit" and latents.ndim == 2:
+    if defn.family in ("qwen_edit", "qwen_image") and latents.ndim == 2:
         latents = latents[None, ...]  # [seq, C] → [1, seq, C]
     unpacked = latent_creator.unpack_latents(latents, height, width)
     vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")

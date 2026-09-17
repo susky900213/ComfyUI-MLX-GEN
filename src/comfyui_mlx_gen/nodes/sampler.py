@@ -13,6 +13,12 @@ Flux.2 参考图编辑（edit）：把「MLX VAE 编码」的输出接到可选�
 latent 之后一起过 transformer，并只取回目标段；不接 `ref_images` 时行为与
 文生图完全一致。
 
+Qwen-Image 文生图（txt2img）：选 `qwen_image` 大类 + `qwen-image-2512-8bit`
+权重，条件用「MLX 文本编码器」（纯文本；**不要**接 ref_images —— 那套权重里
+没有视觉塔，本大类也没有 edit 分支，接了会直接报错），默认 20 步 +
+flow_match_euler_discrete + guidance 4.0（与 mflux `QwenImage.generate_image`
+的默认值一致；`supports_compile=False` 会强制关掉编译）。
+
 Qwen-Image-Edit 多图编辑（edit）：同样接 `ref_images`，但条件必须由
 `MlxQwenEditEncoder`（带参考图）产出，且参考图 latent 是按**目标尺寸**编码的，
 因此本节点会校验「参考图宽高 == 采样器 width/height」，不一致直接报错
@@ -175,6 +181,13 @@ class MlxKSamplerMLX:
                 "并把它接到本节点的 ref_images 入口（条件也要用「MLX Qwen 编辑条件」节点）"
             )
         if ref_images is not None:
+            if entry.family == "qwen_image":
+                raise ValueError(
+                    "qwen_image 是文生图大类，本大类不接参考图（qwen-image-2512 这类"
+                    "权重里没有视觉塔，参考图 latent 与带图的编辑条件都编不出来）；"
+                    "要用参考图编辑，请把三个加载器都改成 qwen_edit 大类 + "
+                    "qwen-image-edit-2511-8bit 权重"
+                )
             if ref_images.model_type != model.model_type:
                 raise ValueError(
                     f"参考图是用 {ref_images.model_type} 编码的，"

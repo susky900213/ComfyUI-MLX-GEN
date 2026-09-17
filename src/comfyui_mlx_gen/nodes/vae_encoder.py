@@ -238,4 +238,8 @@ class MlxVAEEncoder:
             )
             return (handle, use_w, use_h)
 
-        raise NotImplementedError(f"{entry.family} 暂不支持参考图编辑")
+        raise NotImplementedError(
+            f"{entry.family} 暂不支持参考图编辑（本节点只接 flux2 / qwen_edit 两类；"
+            "qwen_image 是文生图大类，要用参考图请改选 qwen_edit 大类 + "
+            "qwen-image-edit-2511-8bit 权重）"
+        )

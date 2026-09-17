@@ -3,8 +3,13 @@
 只选「模型大类」（family，如 z_image / flux2）与「权重目录」，**没有配置变体
 可选**：用哪套 ModelConfig 由 weights.config_for_path 按选中的目录名去 mflux 的
 ModelConfig 注册表里匹配（z-image-turbo-* 命中 z_image_turbo、z-image-8bit 命中
-z_image，匹配不到则用该大类的兜底配置 default_config）。因此新增一份权重（如
-z-image-turbo-4bit）放进 transformer/ 目录后即可直接选用，不必改代码。
+z_image、qwen-image-2512-* 命中纯文生图的 qwen_image，匹配不到则用该大类的
+兜底配置 default_config）。因此新增一份权重（如 z-image-turbo-4bit）放进
+transformer/ 目录后即可直接选用，不必改代码。
+
+Qwen-Image 2512 文生图时，三个加载器的 model_type 都选 `qwen_image`、权重目录
+都选 `qwen-image-2512-8bit`；这是没有视觉塔的纯文本链路，不要连接采样器的
+`ref_images`。需要参考图编辑时改用 `qwen_edit` + `qwen-image-edit-2511-8bit`。
 LoRA 请单独连接 MlxModelLoraApply，不要在本节点上配置。
 """
 
