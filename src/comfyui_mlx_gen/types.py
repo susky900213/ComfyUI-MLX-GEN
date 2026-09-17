@@ -31,6 +31,7 @@ images = "images"
 condition = "condition"  # 单条提示词 + 编码它所用的组件配置
 vae = "mlx_vae"  # MLX VAE handle（MlxVAELoader → MlxVAEEncoder / MlxVAEDecoder）
 ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 latent + grid ids）
+ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留原尺寸；MlxRefImageSet → MlxVAEEncoder）
 
 
 # --- 纯数据 handle ---
@@ -125,23 +126,45 @@ class MlxVaeHandle:
 
 
 @dataclass(frozen=True)
-class MlxReferenceImages:
-    """参考图条件（Flux.2 edit）：只带缓存键，数组留在 cache.py 的 "ref_encoding" 桶里。
+class MlxRefImageSource:
+    """有序参考图源（多图，各自尺寸）：只带键与元信息，图片本体留在 cache.py 的 "ref_source" 桶。
 
-    由 MlxVAEEncoder 产出（预处理 → VAE encode → patchify → bn 归一化 →
-    pack → grid ids），接到 MlxKSamplerMLX 的可选入口 ref_images；采样器按
-    cache_key 取数组，把它 concat 在目标 latent 之后（每个 step 只取回目标段）。
+    由 MlxRefImageSet 产出、只接 MlxVAEEncoder 的可选入口 ref_source。
+    顺序 = 编码顺序 = 参考图 grid ids 的 t 坐标顺序（第 i 张 → t = 10 + 10 * i），
+    因此 sizes / digest 都是**有序**的：换图、换顺序、换张数都会换键。
     """
 
-    model_type: str  # 产出它的模型大类（只有 "flux2" 支持）
+    count: int  # 张数
+    sizes: tuple[tuple[int, int], ...]  # 每张图的原始 (宽, 高)
+    digest: str  # 有序图片摘要（image_mod.digest 对 PIL 序列）
+    cache_key: str = ""  # "ref_source" 桶里的 PIL 元组键
+
+
+@dataclass(frozen=True)
+class MlxReferenceImages:
+    """参考图条件：只带缓存键，数组留在 cache.py 的 "ref_encoding" 桶里。
+
+    - flux2（单图编辑）：`(packed, ids, width, height)` —— packed 与 grid ids，
+      拼在目标 latent 之后（每个 step 只取回目标段）；
+    - qwen_edit（多图编辑）：`(packed, ids, cond_h_patches, cond_w_patches)` —— 参考图
+      latent（按目标尺寸编码）+ 官方 ids（当前 mflux 的 transformer 不读它）+
+      `cond_image_grid` 的 patch 尺寸。
+
+    采样器按 `edit_kind` 分派取用方式，两个大类的缓存键互不干扰。
+    """
+
+    model_type: str  # 产出它的模型大类（"flux2" | "qwen_edit"）
     vae_path: str  # 编码它的 VAE 权重集目录名（信息性）
     count: int  # 实际参与编码的参考图张数
-    height: int  # 建议生成高度（首张参考图预处理后的高度，16 的倍数）
-    width: int  # 建议生成宽度
+    height: int  # qwen_edit：目标编辑高度（= 采样器该用的高度）；flux2：建议生成高度
+    width: int  # 同上（宽度）
     cache_key: str  # 打包数组的缓存键
     vae_cache_key: str = ""  # 与 MlxVaeHandle.cache_key 同源（诊断用）
     precision: str = ""
     quantize: int = 0
+    edit_kind: str = "flux2"  # "flux2" | "qwen_edit"
+    cond_grid: tuple[int, int, int] | None = None  # qwen_edit：(1, height//16, width//16)
+    seq_len: int = 0  # 参考图 token 数（诊断/打印用）
 
 
 @dataclass(frozen=True)
@@ -159,6 +182,10 @@ class ComponentDef:
     class_import: str  # "module:Class"；"" = 由 weight_def 的 tokenizers() 决定
     source: str  # "local" | "hf_repo" | "model_card"
     kind: str = "dir"  # "dir" | "file" | "repo"
+    # 实例化之后、写权重之前要执行的挂钩（"module:func"，func(instance)->None）：
+    # Qwen 编辑的文本编码器必须先把视觉塔挂到 encoder.visual 上，否则
+    # Module.update(strict=False) 会把 encoder.visual.* 的权重静默丢掉。
+    attach_import: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,15 +197,17 @@ class MlxModelEntry:
     匹配不到才用 default_config 兜底。
     """
 
-    family: str  # 与 MODEL_DEFS 的键一致（"z_image" | "flux2"），即 model_type
+    family: str  # 与 MODEL_DEFS 的键一致（"z_image" | "flux2" | "qwen_edit"），即 model_type
     weight_def: str  # 权重定义类（含 components()/tokenizers()，同大类内共用）
     components: dict[str, ComponentDef]  # role -> 定义；role 见 paths.COMPONENT_DIRS
     default_config: str  # 目录名匹配不到配置时用的兜底（ModelConfig 工厂方法名）
     default_steps: int  # 节点 widget 的默认步数（工作流里可改）
     default_scheduler: str  # 节点 widget 的默认调度器（工作流里可改）
-    prompt_encoder: str  # 提示编码入口（"module:Class.method"）
-    prompt_encoder_args: dict[str, Any]  # 编码入口的额外参数（flux2 会用；"cache" 暂不支持）
-    latent_creator: str  # "module:Class"
+    default_guidance: float = 1.0  # 节点 guidance widget 的初始值（qwen_edit = 2.5）
+    supports_compile: bool = True  # False = 采样循环不使用 mx.compile（qwen_edit 的入参含 Config/int）
+    prompt_encoder: str = ""  # 提示编码入口（"module:Class.method"）
+    prompt_encoder_args: dict[str, Any] = field(default_factory=dict)  # 编码入口的额外参数
+    latent_creator: str = ""  # "module:Class"
     supported: bool = True  # False = 尚未验证，选中时节点拒绝执行
     notes: str = ""
 
@@ -189,12 +218,15 @@ def _components(
     vae: str,
     text_encoder: str,
     tokenizer_name: str,
+    text_encoder_attach: str = "",
 ) -> dict[str, ComponentDef]:
     """构造四个 role 的组件定义（只写「用哪个类」，路径来自 widget）。"""
     return {
         "transformer": ComponentDef("transformer", transformer, "local"),
         "vae": ComponentDef("vae", vae, "local"),
-        "text_encoder": ComponentDef("text_encoder", text_encoder, "local"),
+        "text_encoder": ComponentDef(
+            "text_encoder", text_encoder, "local", attach_import=text_encoder_attach
+        ),
         # tokenizer 没有 class_import，由 weight_def 的 TokenizerDefinition 决定
         "tokenizer": ComponentDef(tokenizer_name, "", "local"),
     }
@@ -248,15 +280,49 @@ FLUX2_KLEIN = MlxModelEntry(
 )
 
 # 键 = 模型大类（= model_type 下拉）；大类内用哪套配置由权重目录名决定
+QWEN_EDIT = MlxModelEntry(
+    family="qwen_edit",
+    weight_def="mflux.models.qwen.weights.qwen_weight_definition:QwenWeightDefinition",
+    components=_components(
+        transformer="mflux.models.qwen.model.qwen_transformer.qwen_transformer:QwenTransformer",
+        vae="mflux.models.qwen.model.qwen_vae.qwen_vae:QwenVAE",
+        text_encoder=(
+            "mflux.models.qwen.model.qwen_text_encoder.qwen_text_encoder:QwenTextEncoder"
+        ),
+        tokenizer_name="qwen",
+        # 视觉塔：Qwen 编辑的条件编码要用 encoder.visual（权重名 encoder.visual.*）
+        text_encoder_attach="comfyui_mlx_gen.qwen_edit:attach_vision_tower",
+    ),
+    # 目录名匹配不到时的兜底（qwen-image-edit-2511-8bit 会命中 qwen-image-edit）
+    default_config="qwen_image_edit",
+    default_steps=20,
+    default_scheduler="linear",
+    default_guidance=2.5,
+    supports_compile=False,  # transformer 入参含 Config 对象与 int 步号，不编译
+    prompt_encoder=(
+        "mflux.models.qwen.model.qwen_text_encoder.qwen_prompt_encoder:QwenPromptEncoder"
+    ),
+    prompt_encoder_args={},  # edit 路径不用它（走 MlxQwenEditEncoder）
+    latent_creator="mflux.models.qwen.latent_creator.qwen_latent_creator:QwenLatentCreator",
+    supported=True,
+    notes=(
+        "已对接多图编辑（edit）：条件必须用「MLX Qwen 编辑条件」节点（带参考图），"
+        "采样用 linear + guidance 2.5~4.0（负向条件参与 CFG），"
+        "参考图 latent 按目标尺寸编码；文生图（qwen-image）未对接。"
+    ),
+)
+
+
 MODEL_DEFS: dict[str, MlxModelEntry] = {
     "z_image": Z_IMAGE,
     "flux2": FLUX2_KLEIN,
+    "qwen_edit": QWEN_EDIT,
 }
 
 
 # --- 供节点使用的查询入口（只依赖大类，不依赖具体模型名 / 配置名） ---
 def model_types() -> list[str]:
-    """所有模型大类（= MODEL_DEFS 的键，如 "z_image"、"flux2"）。"""
+    """所有模型大类（= MODEL_DEFS 的键，如 "z_image"、"flux2"、"qwen_edit"）。"""
     return list(MODEL_DEFS)
 
 

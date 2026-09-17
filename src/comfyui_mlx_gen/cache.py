@@ -7,14 +7,19 @@ from typing import Any, Callable
 
 # 各类型缓存条目上限（超出即删最早项，并释放 MLX 缓存）
 _TYPE_CAPS: dict[str, int] = {
-    # text_encoder bundle + vae + transformer 三份都要同时驻留（flux2 edit 全链路）
+    # text_encoder bundle（qwen 编辑时里面还挂着 VL tokenizer × 2 与 VL 编码器）+ vae +
+    # transformer 三份都要同时驻留（edit 全链路）
     "module": 3,
     # 正/负条件各占一条，再多留几档给换提示词的情况
+    # （flux2/z_image 存编码数组；qwen_edit 存 (embeds, mask)，1.5 MB 量级）
     "prompt_encoding": 6,
     "component_weights": 2,
     "image": 6,
-    # 参考图条件（packed latents + grid ids），换图才会有第二条
+    # 参考图条件（flux2：packed + grid ids + 宽高；qwen_edit：packed + ids + patch 尺寸），
+    # 换图 / 换尺寸才会有第二条
     "ref_encoding": 2,
+    # 参考图集（MlxRefImageSet 的有序 PIL 元组，uint8 ≈ 3MB/MP）：当前用的一份 + 刚换掉的一份
+    "ref_source": 2,
 }
 
 

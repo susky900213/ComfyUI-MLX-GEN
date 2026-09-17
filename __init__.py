@@ -13,6 +13,8 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     loader,
     lora,
     pil_to_torch,
+    qwen_edit,
+    ref_image_set,
     sampler,
     save,
     text_encoder,
@@ -24,6 +26,8 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
 NODE_CLASS_MAPPINGS = {
     "MlxClipLoader": clip_loader.MlxClipLoader,
     "MlxTextEncoder": text_encoder.MlxTextEncoder,
+    "MlxQwenEditEncoder": qwen_edit.MlxQwenEditEncoder,
+    "MlxRefImageSet": ref_image_set.MlxRefImageSet,
     "MlxTransformerLoader": loader.MlxTransformerLoader,
     "MlxModelLoraApply": lora.MlxModelLoraApply,
     "MlxClipLoraApply": lora.MlxClipLoraApply,
@@ -39,6 +43,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxClipLoader": "MLX CLIP 加载",
     "MlxTextEncoder": "MLX 文本编码器",
+    "MlxQwenEditEncoder": "MLX Qwen 编辑条件（带参考图）",
+    "MlxRefImageSet": "MLX 参考图集（多图）",
     "MlxTransformerLoader": "MLX 模型加载",
     "MlxModelLoraApply": "MLX 模型 LoRA",
     "MlxClipLoraApply": "MLX CLIP LoRA",

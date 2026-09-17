@@ -13,8 +13,15 @@ Flux.2 参考图编辑（edit）：把「MLX VAE 编码」的输出接到可选�
 latent 之后一起过 transformer，并只取回目标段；不接 `ref_images` 时行为与
 文生图完全一致。
 
+Qwen-Image-Edit 多图编辑（edit）：同样接 `ref_images`，但条件必须由
+`MlxQwenEditEncoder`（带参考图）产出，且参考图 latent 是按**目标尺寸**编码的，
+因此本节点会校验「参考图宽高 == 采样器 width/height」，不一致直接报错
+（把「MLX VAE 编码」的 width/height 输出接到这里即可跟随）。Qwen 的 transformer
+入参含 Config 对象与步号 int，不支持 `mx.compile`（`entry.supports_compile=False`
+会强制关掉编译开关），CFG 用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定）。
+
 widget 里的 steps / scheduler / guidance 只是工作流自己填的值（初始默认取
-「第一个大类」登记的 default_steps / default_scheduler）；真正用哪套
+「第一个大类」登记的 default_steps / default_scheduler / default_guidance）；真正用哪套
 ModelConfig 由连进来的 handle 的权重目录名现算，因此新增权重目录不用改这里。
 
 注意（选 flux2 时）：默认值取自第一个大类（z_image）的 `linear`，而 Flux2 走
@@ -47,11 +54,17 @@ class MlxKSamplerMLX:
                 "width": ([256, 512, 768, 1024, 1536, 2048], {"default": 512}),
                 "height": ([256, 512, 768, 1024, 1536, 2048], {"default": 512}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4}),
-                "guidance": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0}),
+                # 初值取「第一个大类」的 default_guidance（本机是 z_image 的 1.0）；
+                # Qwen 编辑请在 2.5~4.0（该大类登记的是 2.5，工作流里显式写 2.5）
+                "guidance": (
+                    "FLOAT",
+                    {"default": entry.default_guidance, "min": 0.0, "max": 20.0},
+                ),
                 "scheduler": (SCHEDULERS, {"default": entry.default_scheduler}),
             },
             "optional": {
-                # 连上 → Flux.2 参考图编辑（edit）；不连 → 文生图（行为与以前一致）
+                # 连上 → 编辑（flux2 单图编辑 / qwen_edit 多图编辑）；不连 → 文生图
+                # （z_image / flux2；qwen_edit 必须有参考图，不连会直接报错）
                 "ref_images": (ref_images, {}),
                 # 只有 kv 版权重（配置 supports_kv_cache=True）才会有实际作用
                 "kv_cache": (KV_CACHE_MODES, {"default": "auto"}),
@@ -106,16 +119,36 @@ class MlxKSamplerMLX:
         # 与 transformer 权重无关），所以这里只校验大类一致 + 本大类确实支持参考图编辑
         ref_key = ""
         ref_count = 0
+        if ref_images is None and entry.family == "qwen_edit":
+            raise ValueError(
+                "qwen_edit 必须有参考图：请用「MLX VAE 编码」产出 ref_images，"
+                "并把它接到本节点的 ref_images 入口（条件也要用「MLX Qwen 编辑条件」节点）"
+            )
         if ref_images is not None:
             if ref_images.model_type != model.model_type:
                 raise ValueError(
                     f"参考图是用 {ref_images.model_type} 编码的，"
                     f"与采样器的 {model.model_type} 不匹配"
                 )
-            if entry.family != "flux2":
+            if entry.family == "qwen_edit":
+                if ref_images.edit_kind != "qwen_edit":
+                    raise ValueError(
+                        "参考图不是按 qwen_edit 语义编码的（请把「MLX VAE 编码」的 model_type "
+                        "也选成 qwen_edit 的那套权重）"
+                    )
+                if (int(ref_images.width), int(ref_images.height)) != (int(width), int(height)):
+                    raise ValueError(
+                        f"qwen_edit 的参考图 latent 是按目标尺寸编码的："
+                        f"参考图 {ref_images.width}×{ref_images.height} 与采样器 "
+                        f"{int(width)}×{int(height)} 不一致；"
+                        "请把「MLX VAE 编码」的 width/height 输出接到采样器的 width/height"
+                    )
+            elif entry.family != "flux2":
                 raise NotImplementedError(
-                    f"{model.model_type} 暂不支持参考图编辑（目前只有 flux2 的 edit 路径）"
+                    f"{model.model_type} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit）"
                 )
+            elif ref_images.edit_kind != "flux2":
+                raise ValueError("参考图不是按 flux2 语义编码的")
             ref_key = ref_images.cache_key
             ref_count = int(ref_images.count)
 
@@ -129,7 +162,8 @@ class MlxKSamplerMLX:
             "negative_encoding_key": negative.encoding_key,
             "guidance": float(guidance),
             "scheduler_name": scheduler,
-            "compile_model": bool(model.compile),
+            # qwen_edit 的 transformer 入参含 Config 对象与 int 步号 → 不支持 mx.compile
+            "compile_model": bool(model.compile) and entry.supports_compile,
             # edit 用：进 latent 缓存键 → 换参考图必然重新采样
             "ref_cache_key": ref_key,
             "ref_count": ref_count,

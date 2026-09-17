@@ -52,6 +52,12 @@ class MlxTextEncoder:
         entry = entry_for(clip.model_type)
         if not entry.supported:
             raise NotImplementedError(f"{clip.model_type} 尚未实现：{entry.notes}")
+        if entry.family == "qwen_edit":
+            raise ValueError(
+                "Qwen-Image-Edit 的条件必须带参考图，请用「MLX Qwen 编辑条件」"
+                "（MlxQwenEditEncoder）节点，而不是本节点 —— 否则会得到一条"
+                "没有任何视觉信息的条件"
+            )
         # 空提示词按空格编码（与 mflux 对 negative_prompt 的处理一致）
         prompt = text if text and text.strip() else " "
 

@@ -9,7 +9,12 @@ encoder、scheduler、vae 等），采样循环与权重加载由我们自己实
   encoder_hidden_states, timestep, img_ids, txt_ids)` → `scheduler.step(..., sigmas)`
   → `unpack_latents` + `Flux2VAE.decode_packed_latents`；
 - flux2 参考图编辑（edit）：参考图 latent 拼在目标 latent 之后一起过 transformer，
-  每个 step 只取回目标段（见 `_sample_flux2_edit`），目标 latent 形状与 txt2img 相同。
+  每个 step 只取回目标段（见 `_sample_flux2_edit`），目标 latent 形状与 txt2img 相同；
+- qwen_edit 多图编辑（edit）：条件必须带参考图（`MlxQwenEditEncoder` 走
+  `prepare_encoder` + `encode_edit_conditioning`），参考图 latent 按**目标尺寸**编码后
+  拼在目标 latent 之后；CFG 用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定），
+  transformer 的 `t` 传步号 int（内部取 `config.scheduler.sigmas[t]`），不编译
+  （见 `_sample_qwen_edit` / `decode_latents`）。
 
 组件分工（延迟装配）：采样器只加载 transformer；text_encoder + tokenizer 由
 MlxTextEncoder 自己加载并编码，VAE 由 MlxVAEEncoder / MlxVAEDecoder 按
@@ -94,12 +99,57 @@ def prepare_components(
 
 
 def prepare_encoder(entry, clip, cache, cache_key: str) -> dict[str, Any]:
-    """加载 text_encoder + tokenizer（由 MlxTextEncoder 负责，M1 不额外量化）。"""
+    """加载 text_encoder + tokenizer（由 MlxTextEncoder / MlxQwenEditEncoder 负责）。
+
+    同一 handle 第二次执行命中同一条 module 缓存（两个节点共用这个键），
+    因此 Qwen 编辑的正/负两个条件节点只会驻留一份文本编码器。
+    qwen_edit 还要在 bundle 上挂 VL tokenizer × 2 与 VL 编码器包装（`_attach_vl`）：
+    它们是「对象包装」，不含新权重，随 bundle 一起缓存，不额外占 module 桶位。
+    """
     # 两个 role 都用 handle 里的那个权重集名（各组件目录下同名）
     selections = {role: clip.path for role in ENCODER_ROLES}
-    return prepare_components(
+    comps = prepare_components(
         entry, ENCODER_ROLES, cache, cache_key, selections, max_length=clip.max_length
     )
+    # qwen_edit 的条件编码还要 VL 那两层；命中缓存时 bundle 里已经有了（幂等）
+    if entry.family == "qwen_edit" and "vl_encoder" not in comps:
+        _attach_vl(comps)
+    return comps
+
+
+# --- Qwen-Image-Edit（多图编辑） ---
+QWEN_EDIT_VL_MAX_LENGTH = 1024  # 与 mflux QwenImageInitializer.init_edit 一致
+QWEN_EDIT_TARGET_MULTIPLE = 16  # 参考图 latent 的目标尺寸必须是 16 的倍数
+QWEN_EDIT_RESIZE_MODES = ("stretch", "aspect_fit_pad")
+
+
+def _attach_vl(comps: dict[str, Any]) -> None:
+    """给 Qwen 编辑的编码器 bundle 挂上 VL tokenizer 与 VL 编码器包装（都是对象，不含新权重）。
+
+    - `vl_encoder = QwenVisionLanguageEncoder(encoder=bundle 里那个 encoder)`：
+      与 text_encoder 共用同一份权重（视觉塔已在 attach_import 里挂到 `encoder.visual`）；
+    - 两个 VL tokenizer 只是模板不同：单图用官方 plain 模板（= mflux 现在的行为），
+      多图用官方 `Picture N:` 模板（mflux 默认的 plain 在多图时会丢图，见文档 §2.4）；
+    - 挂进 bundle 后随 bundle 一起缓存，不额外占 module 桶位。
+    """
+    proc_cls = runtime.import_object(
+        "mflux.models.qwen.tokenizer.qwen_vision_language_processor:QwenVisionLanguageProcessor"
+    )
+    tok_cls = runtime.import_object(
+        "mflux.models.qwen.tokenizer.qwen_vision_language_tokenizer:QwenVisionLanguageTokenizer"
+    )
+    enc_cls = runtime.import_object(
+        "mflux.models.qwen.model.qwen_text_encoder.qwen_vision_language_encoder"
+        ":QwenVisionLanguageEncoder"
+    )
+    processor = proc_cls(tokenizer=comps["tokenizer"].tokenizer)
+    comps["vl_tokenizer_single"] = tok_cls(
+        processor=processor, max_length=QWEN_EDIT_VL_MAX_LENGTH, use_picture_prefix=False
+    )
+    comps["vl_tokenizer_multi"] = tok_cls(
+        processor=processor, max_length=QWEN_EDIT_VL_MAX_LENGTH, use_picture_prefix=True
+    )
+    comps["vl_encoder"] = enc_cls(encoder=comps["text_encoder"].encoder)
 
 
 def transformer_cache_key(model_handle) -> str:
@@ -214,16 +264,90 @@ def encode_text(defn, comps, text: str, cache, cache_key: str) -> Any:
 
 
 def cached_encoding(cache, key: str, label: str) -> Any:
-    """按缓存键取出 MlxTextEncoder 算好的编码；缺失就提示重新运行该节点。"""
+    """按缓存键取出 MlxTextEncoder / MlxQwenEditEncoder 算好的编码；缺失就提示重新运行。"""
     if not key:
-        raise RuntimeError(f"未连接{label}向条件（MlxTextEncoder 的输出）")
+        raise RuntimeError(f"未连接{label}向条件（MlxTextEncoder / MlxQwenEditEncoder 的输出）")
     encoding, hit = cache.get("prompt_encoding", key)
     if not hit or encoding is None:
         raise RuntimeError(f"{label}向条件的编码已失效，请重新运行「MLX 文本编码器」节点")
     return encoding
 
 
+def edit_prompt_encoding_key(clip, text: str, image_digest: str, count: int) -> str:
+    """Qwen 编辑条件的缓存键：handle + 文本 + **图片摘要** + 张数（换图必换键）。"""
+    return runtime.cache_key(
+        {
+            "kind": "qwen_edit_prompt",
+            "clip": clip,
+            "text": text,
+            "image": image_digest,
+            "count": int(count),
+        }
+    )
+
+
+def encode_edit_conditioning(entry, comps, text: str, images: Sequence[Any], cache, cache_key: str):
+    """Qwen 编辑的文本条件（带参考图）→ `(embeds, mask)`，数组存 prompt_encoding 桶。
+
+    等价 mflux `QwenImageEdit._encode_prompts_with_images` 的**一半**（正/负各调一次本函数）：
+    VL tokenizer（按张数选模板）→ `tokenize_with_image` → 视觉塔 + 语言塔 →
+    最后按 mflux 的约定转 fp16（`final_prompt_embeds.astype(mx.float16)`）。
+    """
+    if entry.family != "qwen_edit":
+        raise NotImplementedError(f"{entry.family} 不支持带参考图的文本编码（目前只有 qwen_edit）")
+
+    def build():
+        tokenizer = comps["vl_tokenizer_multi"] if len(images) > 1 else comps["vl_tokenizer_single"]
+        prompt = text if text and text.strip() else " "  # 空提示词按空格（与 MlxTextEncoder 一致）
+        input_ids, attention_mask, pixel_values, grid_thw = tokenizer.tokenize_with_image(
+            prompt, list(images)
+        )
+        embeds, embeds_mask = comps["vl_encoder"](
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=grid_thw,
+        )
+        embeds = embeds.astype(mx.float16)
+        embeds_mask = embeds_mask.astype(mx.float16)
+        mx.eval(embeds, embeds_mask)
+        print(
+            f"[Qwen 编辑条件] {len(images)} 张参考图 | embeds {tuple(embeds.shape)} "
+            f"{embeds.dtype} | mask {int(mx.sum(embeds_mask).item())}"
+        )
+        return (embeds, embeds_mask)
+
+    value, _hit = cache.get_or_create("prompt_encoding", cache_key, build)
+    return value
+
+
 # --- Flux.2 参考图（edit） ---
+
+# --- 多图参考图源（MlxRefImageSet → MlxVAEEncoder 的 ref_source 入口） ---
+def ref_source_key(digest: str, sizes: Sequence[tuple[int, int]]) -> str:
+    """参考图集的缓存键：有序摘要 + 每张尺寸（换图 / 换顺序 / 换张数都会换键）。"""
+    return runtime.cache_key(
+        {"kind": "ref_source", "image": digest, "sizes": [list(s) for s in sizes]}
+    )
+
+
+def store_ref_source(pils: Sequence[Any], cache, cache_key: str) -> tuple[Any, ...]:
+    """把有序 PIL 元组存进 "ref_source" 桶（图片本体不进 handle）。"""
+    value, _hit = cache.get_or_create("ref_source", cache_key, lambda: tuple(pils))
+    return value
+
+
+def load_ref_source(cache, cache_key: str) -> tuple[Any, ...]:
+    """取出参考图集；桶里没有说明它已被淘汰（提示重跑图集节点，而不是静默少几张图）。"""
+    if not cache_key:
+        raise RuntimeError("ref_source 没有缓存键（MlxRefImageSet 的输出不完整）")
+    value, hit = cache.get("ref_source", cache_key)
+    if not hit or value is None:
+        raise RuntimeError("参考图集已失效，请重新运行「MLX 参考图集」节点")
+    return value
+
+
+# --- Flux.2 参考图（edit）：编码与预处理（每张各自尺寸） ---
 REFERENCE_MIN_DIM = 16  # 参考图每条边必须是 16 的倍数（vae scale 8 × patch 2）
 REFERENCE_T_COORD_BASE = 10  # 第 i 张参考图的 grid ids t 坐标 = 10 + 10 * i（目标图是 0）
 REFERENCE_T_COORD_STEP = 10
@@ -328,13 +452,118 @@ def encode_reference_images(
 
 
 def cached_reference(cache, key: str):
-    """取出参考图条件 `(packed, ids, width, height)`；缺失时提示重跑编码节点。"""
+    """取出参考图条件；缺失时提示重跑编码节点。
+
+    - flux2：`(packed, ids, width, height)`；
+    - qwen_edit：`(packed, ids, cond_h_patches, cond_w_patches)`（`cond_image_grid` 由
+      调用方按参考图张数拼出）。
+    """
     if not key:
         raise RuntimeError("未连接参考图（MlxVAEEncoder 的输出）")
     value, hit = cache.get("ref_encoding", key)
     if not hit or value is None:
         raise RuntimeError("参考图条件已失效，请重新运行「MLX VAE 编码」节点")
     return value
+
+
+# --- Qwen-Image-Edit 参考图（edit：按目标尺寸编码，拼在目标 latent 之后） ---
+def _qwen_target_dims(width: int, height: int, pil) -> tuple[int, int]:
+    """Qwen 编辑的目标尺寸：显式给就用给的，否则用首张参考图尺寸（都向下取到 16 的倍数）。"""
+    use_w = int(width) or int(pil.width)
+    use_h = int(height) or int(pil.height)
+    use_w -= use_w % QWEN_EDIT_TARGET_MULTIPLE
+    use_h -= use_h % QWEN_EDIT_TARGET_MULTIPLE
+    if use_w <= 0 or use_h <= 0:
+        raise ValueError(
+            f"目标尺寸非法（每边至少 {QWEN_EDIT_TARGET_MULTIPLE} 像素）: {use_w}x{use_h}"
+        )
+    return use_w, use_h
+
+
+def prepare_qwen_edit_reference_image(pil, width: int, height: int, resize_mode: str):
+    """参考图 → 精确目标尺寸。
+
+    - `stretch`（默认）：LANCZOS 直接拉伸，等价 mflux `ImageUtil.scale_to_dimensions`
+      —— 与目标长宽比不同时主体会变形，但这是参考实现的既有行为；
+    - `aspect_fit_pad`：等比缩放后居中 pad 黑边（不拉伸主体，多出来的边交给模型当背景）。
+    """
+    if resize_mode == "stretch":
+        image_util = runtime.import_object("mflux.utils.image_util:ImageUtil")
+        return image_util.scale_to_dimensions(pil, target_width=width, target_height=height)
+    if resize_mode != "aspect_fit_pad":
+        raise ValueError(f"未知的 resize_mode: {resize_mode}")
+    from PIL import Image as PILImage  # 局部 import（pipeline 其余部分不依赖 PIL）
+
+    ratio = min(width / pil.width, height / pil.height)
+    new_w = max(1, int(round(pil.width * ratio)))
+    new_h = max(1, int(round(pil.height * ratio)))
+    resized = pil if (new_w, new_h) == pil.size else pil.resize((new_w, new_h), PILImage.LANCZOS)
+    canvas = PILImage.new("RGB", (width, height), (0, 0, 0))
+    canvas.paste(resized, ((width - new_w) // 2, (height - new_h) // 2))
+    return canvas
+
+
+def encode_edit_reference_latents(
+    entry,
+    vae,
+    images: Sequence[Any],
+    cache,
+    cache_key: str,
+    max_images: int,
+    width: int,
+    height: int,
+    resize_mode: str,
+):
+    """qwen_edit 参考图条件 → `(packed, ids, cond_grid, use_w, use_h)`，数组存 ref_encoding 桶。
+
+    与 mflux `QwenEditUtil.create_image_conditioning_latents` 逐步一致：每张图都缩放到
+    **目标编辑尺寸**（不是各自原始尺寸）→ `VAEUtil.encode` → `QwenLatentCreator.pack_latents`
+    → 沿 seq 维 concat。桶里存的是 `(packed, ids, cond_h_patches, cond_w_patches)`，
+    `cond_grid` 由调用方按张数拼（多图是**列表**、单图是**元组**：transformer 内部按
+    `isinstance(list)` 分支，单图给列表会把目标段算两遍）。
+    """
+    if entry.family != "qwen_edit":
+        raise NotImplementedError(f"{entry.family} 不用这条参考图编码路径（只有 qwen_edit）")
+    latent_creator = runtime.import_object(entry.latent_creator)
+    image_util = runtime.import_object("mflux.utils.image_util:ImageUtil")
+    vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")
+    selected = list(images)[: max(1, int(max_images))]
+    if not selected:
+        raise ValueError("参考图为空")
+    use_w, use_h = _qwen_target_dims(width, height, selected[0])
+
+    def build():
+        packed = []
+        for image in selected:
+            prepared = prepare_qwen_edit_reference_image(image, use_w, use_h, resize_mode)
+            encoded = vae_util.encode(
+                vae=vae, image=image_util.to_array(prepared), tiling_config=None
+            )
+            packed.append(
+                latent_creator.pack_latents(encoded, use_h, use_w, num_channels_latents=16)
+            )
+        latents = mx.concatenate(packed, axis=1)
+        # 官方 ids：本机 mflux 的 transformer 不读它，仍按参考实现算出并缓存
+        ids_util = runtime.import_object(
+            "mflux.models.qwen.variants.edit.qwen_edit_util:QwenEditUtil"
+        )
+        ids = mx.concatenate(
+            [ids_util._create_image_ids(height=use_h, width=use_w) for _ in selected], axis=1
+        )
+        mx.eval(latents, ids)
+        print(
+            f"[Qwen 参考图] {len(selected)} 张 → {use_w}x{use_h} | packed {tuple(latents.shape)} "
+            f"{latents.dtype} | ids {tuple(ids.shape)}"
+        )
+        return latents, ids, use_h // 16, use_w // 16
+
+    (latents, ids, h_patches, w_patches), _hit = cache.get_or_create(
+        "ref_encoding", cache_key, build
+    )
+    cond_grid: Any = [(1, h_patches, w_patches)] * len(selected)
+    if len(selected) == 1:
+        cond_grid = (1, h_patches, w_patches)
+    return latents, ids, cond_grid, use_w, use_h
 
 
 def make_sampler_config(entry, model_config, params) -> Any:
@@ -705,11 +934,87 @@ def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance):
     return stacked
 
 
+QWEN_EDIT_EPS = 1e-12
+
+
+def qwen_guided_noise(noise: Any, noise_negative: Any, guidance: float) -> Any:
+    """与 `QwenImage.compute_guided_noise` 逐行一致：CFG 之后再按条件范数重标定。
+
+    普通写法 `neg + g·(pos - neg)` 在 Qwen 上偏差明显（这就是它单独实现的原因）。
+    """
+    combined = noise_negative + guidance * (noise - noise_negative)
+    cond_norm = mx.sqrt(mx.sum(noise * noise, axis=-1, keepdims=True) + QWEN_EDIT_EPS)
+    noise_norm = mx.sqrt(mx.sum(combined * combined, axis=-1, keepdims=True) + QWEN_EDIT_EPS)
+    return combined * (cond_norm / noise_norm)
+
+
+def _sample_qwen_edit(defn, comps, params, cache, model_config, guidance):
+    """Qwen-Image-Edit 采样：目标 latent 与参考 latent 拼 seq，每个 step 只取回目标段。
+
+    与 mflux `QwenImageEdit.generate_image` 的循环逐步一致：
+    - 参考图条件从 `ref_encoding` 桶按 `ref_cache_key` 取（`(packed, ids, cond_h, cond_w)`），
+      `cond_image_grid` 按参考图张数拼（多图列表 / 单图元组，与 mflux 一致）；
+    - transformer 的 `t` 传**步号 int**（内部取 `config.scheduler.sigmas[t]`）；
+    - CFG 用 `qwen_guided_noise`；`guidance<=1.0` 时跳过负向分支；
+    - 不做 `mx.compile`（入参含 Config 对象与 int，`entry.supports_compile=False`）；
+    - 每个 batch 项单独采样（batch=1），最后沿 batch 维拼接，形状与 txt2img 一致
+      → 下游 `MlxVAEDecoder` / `MlxSaveImage` 不用改。
+    """
+    config = make_sampler_config(defn, model_config, params)
+    scheduler = build_scheduler(params["scheduler_name"], config)
+    ref_latents, ref_ids, h_patches, w_patches = cached_reference(cache, params["ref_cache_key"])
+    ref_count = max(1, int(params.get("ref_count") or 1))
+    cond_grid: Any = [(1, h_patches, w_patches)] * ref_count
+    if ref_count == 1:
+        cond_grid = (1, h_patches, w_patches)
+    encodings = cached_encoding(cache, params["positive_encoding_key"], "正")
+    negative = (
+        cached_encoding(cache, params["negative_encoding_key"], "负") if guidance > 1.0 else None
+    )
+    latent_creator = runtime.import_object(defn.latent_creator)
+    transformer = comps["transformer"]
+    final = []
+    for i in range(params["batch_size"]):
+        latents = latent_creator.create_noise(
+            params["seed"] + i, params["height"], params["width"]
+        )  # [1, (h/16)(w/16), 64]
+        for t in range(params["steps"]):
+            target_len = latents.shape[1]
+            hidden = mx.concatenate([latents, ref_latents], axis=1)  # 目标段在前，参考段在后
+            noise = transformer(
+                t=t,
+                config=config,
+                hidden_states=hidden,
+                encoder_hidden_states=encodings[0],
+                encoder_hidden_states_mask=encodings[1],
+                qwen_image_ids=ref_ids,  # 当前 mflux 不读它，按参考实现传入
+                cond_image_grid=cond_grid,
+            )[:, :target_len]
+            if negative is not None:
+                negative_noise = transformer(
+                    t=t,
+                    config=config,
+                    hidden_states=hidden,
+                    encoder_hidden_states=negative[0],
+                    encoder_hidden_states_mask=negative[1],
+                    qwen_image_ids=ref_ids,
+                    cond_image_grid=cond_grid,
+                )[:, :target_len]
+                noise = qwen_guided_noise(noise, negative_noise, guidance)
+            latents = scheduler.step(noise=noise, timestep=t, latents=latents)
+            mx.eval(latents)
+        final.append(latents)
+    stacked = mx.concatenate(final, axis=0)  # [B, seq, C]
+    mx.eval(stacked)
+    return stacked
+
+
 def run_sampler(defn, model_handle, comps, params, cache):
     """跑完整采样，返回带缓存数组的 latent 句柄。
 
-    正/负条件的编码由 MlxTextEncoder 提前存进 cache 的 "prompt_encoding" 桶，
-    params 里只有编码键；按键取不到就报错（说明编码已换掉，需要重新运行）。
+    正/负条件的编码由 MlxTextEncoder / MlxQwenEditEncoder 提前存进 cache 的
+    "prompt_encoding" 桶，params 里只有编码键；按键取不到就报错（说明编码已换掉，
+    需要重新运行）。
 
     配置按「权重集目录名」在 mflux 的 ModelConfig 注册表里现取（不依赖预先
     登记的模型名）：z-image-turbo-8bit / z-image-turbo-4bit 都会命中
@@ -719,17 +1024,20 @@ def run_sampler(defn, model_handle, comps, params, cache):
     if not defn.supported:
         raise NotImplementedError(f"{defn.family} 尚未实现：{defn.notes}")
     model_config = weights.config_for_path(model_handle.model_path, defn.default_config)
-    # 配置说这套模型没有 CFG（如 z-image-turbo）就强制关掉，与 mflux 行为一致
-    guidance = float(params["guidance"]) if model_config.supports_guidance else 0.0
+    # 只有**明确声明**不支持 CFG（False，如 z-image-turbo）才清零；
+    # None（qwen-image-edit）表示「未声明」，保留 widget 上的值 —— Qwen 编辑必须有 CFG。
+    guidance = float(params["guidance"]) if model_config.supports_guidance is not False else 0.0
 
     def sample():
-        # 接了参考图 → Flux.2 参考图编辑（edit）分支
+        # 接了参考图 → 编辑（edit）分支；按大类分派，不静默降级
         if params.get("ref_cache_key"):
-            if defn.family != "flux2":
-                raise NotImplementedError(
-                    f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 的 edit 路径）"
-                )
-            return _sample_flux2_edit(defn, comps, params, cache, model_config, guidance)
+            if defn.family == "flux2":
+                return _sample_flux2_edit(defn, comps, params, cache, model_config, guidance)
+            if defn.family == "qwen_edit":
+                return _sample_qwen_edit(defn, comps, params, cache, model_config, guidance)
+            raise NotImplementedError(
+                f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit 的 edit 路径）"
+            )
         if defn.family == "flux2":
             return _sample_flux2(defn, comps, params, cache, model_config, guidance)
         return _sample_z_image(defn, comps, params, cache, model_config, guidance)
@@ -761,7 +1069,9 @@ def decode_latents(defn, comps, latents, height, width):
     - z_image：`unpack_latents([16,1,h/8,w/8])` → `[1,16,h/8,w/8]`，走 `VAEUtil.decode`；
     - flux2：latent 是打包形式 `[seq, C]`（或 `[1, seq, C]`），先补 batch 维再用
       `Flux2LatentCreator.unpack_latents` 还原成 `[1, C, latent_h, latent_w]`，
-      最后交给 `Flux2VAE.decode_packed_latents`（内部含 bn 反归一化与 unpatchify）。
+      最后交给 `Flux2VAE.decode_packed_latents`（内部含 bn 反归一化与 unpatchify）；
+    - qwen_edit：同样先 unpack 成 `[1, 16, h/8, w/8]` 再走 `VAEUtil.decode`
+      （QwenVAE 内部处理 mean/std 与 5D 维度）。
     """
     latent_creator = runtime.import_object(defn.latent_creator)
     vae = comps["vae"]
@@ -770,6 +1080,8 @@ def decode_latents(defn, comps, latents, height, width):
             latents = latents[None, ...]  # [seq, C] → [1, seq, C]
         unpacked = latent_creator.unpack_latents(latents, height, width)
         return vae.decode_packed_latents(unpacked)
+    if defn.family == "qwen_edit" and latents.ndim == 2:
+        latents = latents[None, ...]  # [seq, C] → [1, seq, C]
     unpacked = latent_creator.unpack_latents(latents, height, width)
     vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")
     return vae_util.decode(vae=vae, latent=unpacked, tiling_config=None)
