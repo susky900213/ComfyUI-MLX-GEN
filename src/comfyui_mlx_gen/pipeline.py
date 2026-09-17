@@ -7,24 +7,30 @@ encoder、scheduler、vae 等），采样循环与权重加载由我们自己实
   → `scheduler.step(noise, t, latents)` → `unpack_latents` + `VAEUtil.decode`；
 - flux2：`prepare_packed_latents` → 条件为 `(embeds, ids)` → `transformer(hidden_states,
   encoder_hidden_states, timestep, img_ids, txt_ids)` → `scheduler.step(..., sigmas)`
-  → `unpack_latents` + `Flux2VAE.decode_packed_latents`。
+  → `unpack_latents` + `Flux2VAE.decode_packed_latents`；
+- flux2 参考图编辑（edit）：参考图 latent 拼在目标 latent 之后一起过 transformer，
+  每个 step 只取回目标段（见 `_sample_flux2_edit`），目标 latent 形状与 txt2img 相同。
 
-组件分工（延迟装配）：采样器只加载 transformer + vae，text_encoder +
-tokenizer 由 MlxTextEncoder 节点自己加载并编码；采样器按 handle 里的缓存键
+组件分工（延迟装配）：采样器只加载 transformer；text_encoder + tokenizer 由
+MlxTextEncoder 自己加载并编码，VAE 由 MlxVAEEncoder / MlxVAEDecoder 按
+MlxVaeHandle 物化（编码与解码共用同一份实例）。采样器按 handle 里的缓存键
 直接取编码结果，不再碰文本编码器。
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import mlx.core as mx
 
 from . import components, paths, runtime, weights
-from .types import MlxLatentHandle, MlxModelEntry
+from .types import MlxLatentHandle, MlxModelEntry, entry_for
 
-# 各节点负责的组件 role（采样器不加载文本编码相关组件，反之亦然）
-SAMPLER_ROLES: tuple[str, ...] = ("transformer", "vae")
+# 各节点负责的组件 role（采样器不加载文本编码 / VAE，编码与解码节点各自按 handle 物化）。
+# 采样阶段只需要 transformer —— 这里是采样器的「声明式」role 清单，
+# prepare_sampler_components 只装配其中的 transformer；将来若采样阶段真的要用 VAE，
+# 改这一处 + 那个函数即可。
+SAMPLER_ROLES: tuple[str, ...] = ("transformer",)
 ENCODER_ROLES: tuple[str, ...] = ("text_encoder", "tokenizer")
 
 
@@ -96,16 +102,61 @@ def prepare_encoder(entry, clip, cache, cache_key: str) -> dict[str, Any]:
     )
 
 
-def prepare_sampler_components(entry, model_handle, cache, cache_key: str) -> dict[str, Any]:
-    """加载 transformer + vae（文本编码已在 MlxTextEncoder 里做完，这里不碰）。"""
-    return prepare_components(
-        entry,
-        SAMPLER_ROLES,
-        cache,
-        cache_key,
-        {role: model_handle.model_path for role in SAMPLER_ROLES},
-        quantize=model_handle.quantize,
-    )
+def transformer_cache_key(model_handle) -> str:
+    """transformer 单独一项（不再与 VAE 绑成一个 bundle）。"""
+    return runtime.cache_key({"kind": "transformer", "model": model_handle})
+
+
+def vae_component(handle, cache) -> Any:
+    """按 MlxVaeHandle 的键物化 VAE（编码器 / 解码器 / RawPIL 三处共用同一份实例）。
+
+    handle.cache_key 由 MlxVAELoader 算好（内容为
+    `{"kind":"vae","model_type","path","precision","quantize"}`），因此「谁先跑谁物化、
+    另一个命中同一条缓存」。采样阶段不使用 VAE，所以这里不参与采样器。
+    """
+    entry = entry_for(handle.model_type)
+    kind, resolved = paths.resolve("local", handle.path, "vae")
+    if kind == "missing":
+        raise FileNotFoundError(f"未找到 vae 权重: {resolved}")
+
+    def build():
+        instance, _bits = components.create_and_load(
+            entry, "vae", kind, resolved, int(handle.quantize)
+        )
+        return instance
+
+    instance, _hit = cache.get_or_create("module", handle.cache_key, build)
+    return instance
+
+
+def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
+    """只物化 transformer（采样阶段根本不需要 VAE）。
+
+    VAE 交给 MlxVAEEncoder / MlxVAEDecoder 按 MlxVaeHandle 的键物化；
+    这里顺带加载 VAE 属于白加载（采样循环从来没用过它）。
+    """
+    model_config = weights.config_for_path(model_handle.model_path, entry.default_config)
+
+    def build_transformer():
+        kind, path = component_path(entry, "transformer", model_handle.model_path)
+        if kind == "missing":
+            raise FileNotFoundError(f"未找到 transformer 权重: {path}")
+        # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例）
+        instance, _bits = components.create_and_load(
+            entry,
+            "transformer",
+            kind,
+            path,
+            model_handle.quantize,
+            class_kwargs=dict(model_config.transformer_overrides),
+        )
+        return instance
+
+    return {
+        "transformer": cache.get_or_create(
+            "module", transformer_cache_key(model_handle), build_transformer
+        )[0]
+    }
 
 
 def create_latents(defn, seed, height, width, batch_size) -> list[Any]:
@@ -170,6 +221,120 @@ def cached_encoding(cache, key: str, label: str) -> Any:
     if not hit or encoding is None:
         raise RuntimeError(f"{label}向条件的编码已失效，请重新运行「MLX 文本编码器」节点")
     return encoding
+
+
+# --- Flux.2 参考图（edit） ---
+REFERENCE_MIN_DIM = 16  # 参考图每条边必须是 16 的倍数（vae scale 8 × patch 2）
+REFERENCE_T_COORD_BASE = 10  # 第 i 张参考图的 grid ids t 坐标 = 10 + 10 * i（目标图是 0）
+REFERENCE_T_COORD_STEP = 10
+RESIZE_MODES = ("aspect_area_crop", "keep_resolution")
+
+
+def reference_image_cache_key(vae_handle, image_digest: str, params: dict[str, Any]) -> str:
+    """参考图条件的缓存键（换图 / 换预处理参数 / 换 VAE 都会换键）。"""
+    return runtime.cache_key(
+        {
+            "kind": "reference_image",
+            "vae": vae_handle,
+            "image": image_digest,
+            "params": params,
+        }
+    )
+
+
+def _reference_dims(pil) -> tuple[int, int]:
+    """把宽高向下取整到 16 的倍数（越界时会在调用处中心裁剪）。"""
+    width = pil.width - pil.width % REFERENCE_MIN_DIM
+    height = pil.height - pil.height % REFERENCE_MIN_DIM
+    if width == 0 or height == 0:
+        raise ValueError(f"参考图太小（每边至少 {REFERENCE_MIN_DIM} 像素）: {pil.size}")
+    return width, height
+
+
+def prepare_reference_image(pil, resize_mode: str):
+    """参考图预处理。
+
+    - `aspect_area_crop`（默认）：等价 mflux `_Flux2KleinEditHelpers.prepare_reference_image`
+      —— 等比缩放到面积 ≤ 1024×1024，再中心裁剪到 16 的倍数（不拉伸）；
+    - `keep_resolution`：保留原分辨率，只把宽高裁到 16 的倍数（更慢、更吃内存，慎用大图）。
+    """
+    if resize_mode == "aspect_area_crop":
+        helpers = runtime.import_object(
+            "mflux.models.flux2.variants.edit.flux2_klein_edit_helpers:_Flux2KleinEditHelpers"
+        )
+        return helpers.prepare_reference_image(pil)
+    width, height = _reference_dims(pil)
+    if (pil.width, pil.height) == (width, height):
+        return pil
+    left = (pil.width - width) // 2
+    top = (pil.height - height) // 2
+    return pil.crop((left, top, left + width, top + height))
+
+
+def encode_reference_images(
+    entry,
+    vae,
+    images: Sequence[Any],
+    cache,
+    cache_key: str,
+    max_reference_images: int,
+    resize_mode: str,
+):
+    """参考图批次 → `(packed [1, seq, 128], ids [1, seq, 4], width, height)`。
+
+    与 mflux `_Flux2KleinEditHelpers.prepare_reference_image_conditioning` 逐步一致：
+    预处理 → `VAEUtil.encode`（PIL 先经 `ImageUtil.to_array` 变成 [-1,1] 的 CHW）
+    → `ensure_4d_latents` / `crop_to_even_spatial` → `patchify_latents`
+    → `bn_normalize_vae_encoded_latents`（用 `vae.bn` 的统计量，漏掉会得到噪声图）
+    → `pack_latents` → `prepare_grid_ids(t_coord=10 + 10 * i)`；多张沿 seq 维 concat。
+    返回的 width/height 是首张参考图预处理后的尺寸（作为「建议生成尺寸」）。
+    """
+    helpers = runtime.import_object(
+        "mflux.models.flux2.variants.edit.flux2_klein_edit_helpers:_Flux2KleinEditHelpers"
+    )
+    image_util = runtime.import_object("mflux.utils.image_util:ImageUtil")
+    vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")
+    latent_creator = runtime.import_object(entry.latent_creator)
+    selected = list(images)[: max(1, int(max_reference_images))]
+    if not selected:
+        raise ValueError("参考图为空")
+
+    def build():
+        packed: list[Any] = []
+        ids: list[Any] = []
+        width = height = 0
+        for i, pil in enumerate(selected):
+            prepared = prepare_reference_image(pil, resize_mode)
+            if i == 0:
+                width, height = prepared.width, prepared.height
+            encoded = vae_util.encode(
+                vae=vae, image=image_util.to_array(prepared), tiling_config=None
+            )
+            encoded = helpers.ensure_4d_latents(encoded)
+            encoded = helpers.crop_to_even_spatial(encoded)
+            encoded = latent_creator.patchify_latents(encoded)
+            encoded = helpers.bn_normalize_vae_encoded_latents(encoded, vae=vae)
+            packed.append(latent_creator.pack_latents(encoded))
+            ids.append(
+                latent_creator.prepare_grid_ids(
+                    encoded,
+                    t_coord=REFERENCE_T_COORD_BASE + REFERENCE_T_COORD_STEP * i,
+                )
+            )
+        return mx.concatenate(packed, axis=1), mx.concatenate(ids, axis=1), width, height
+
+    value, _hit = cache.get_or_create("ref_encoding", cache_key, build)
+    return value
+
+
+def cached_reference(cache, key: str):
+    """取出参考图条件 `(packed, ids, width, height)`；缺失时提示重跑编码节点。"""
+    if not key:
+        raise RuntimeError("未连接参考图（MlxVAEEncoder 的输出）")
+    value, hit = cache.get("ref_encoding", key)
+    if not hit or value is None:
+        raise RuntimeError("参考图条件已失效，请重新运行「MLX VAE 编码」节点")
+    return value
 
 
 def make_sampler_config(entry, model_config, params) -> Any:
@@ -330,6 +495,216 @@ def _sample_flux2(defn, comps, params, cache, model_config, guidance):
     return stacked
 
 
+def _is_m1_or_m2() -> bool:
+    """与 mflux 一致：M1/M2 上不编译 edit 的预测函数（取不到就当 False）。"""
+    try:
+        util = runtime.import_object("mflux.utils.apple_silicon:AppleSiliconUtil")
+        return bool(util.is_m1_or_m2())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _new_kv_cache(transformer):
+    """与 mflux `Flux2KleinEdit._new_kv_cache` 一致（层数从 transformer 现取）。"""
+    kv_cls = runtime.import_object(
+        "mflux.models.flux2.model.flux2_transformer.flux2_kv_cache:Flux2KVCache"
+    )
+    return kv_cls(
+        num_double_layers=len(transformer.transformer_blocks),
+        num_single_layers=len(transformer.single_transformer_blocks),
+    )
+
+
+def _predict_flux2_edit(
+    transformer,
+    latents,
+    ref_latents,
+    latent_ids,
+    ref_ids,
+    timestep,
+    encodings,
+    negative,
+    guidance,
+    use_compile,
+    kv_cache=None,
+    negative_kv_cache=None,
+):
+    """Flux2 edit 单步预测（含 CFG；与 mflux `Flux2KleinEdit._predict` 一致）。
+
+    目标 token 在前、参考图 token 在后；`noise` 只取回目标段
+    `[:, :latents.shape[1]]`；CFG 组合顺序同样是 `neg + scale * (pos - neg)`。
+    kv 缓存只在第 1 步（`extract`）走这里 —— 之后由 `_predict_flux2_edit_cached`
+    只送目标 token，因此本函数在 kv 启用时始终收到 `use_compile=False`（与 mflux 一致：
+    缓存对象要在步之间改状态，不编译）。
+    """
+    pos_embeds, pos_ids = encodings
+    neg_embeds, neg_ids = negative if negative is not None else (None, None)
+
+    def predict(x, refs, ids, rids, p_embeds, p_ids, n_embeds, n_ids, scale, t, kvc, nkvc):
+        hidden = mx.concatenate([x, refs], axis=1)
+        img_ids = mx.concatenate([ids, rids], axis=1)
+        noise = transformer(
+            hidden_states=hidden,
+            encoder_hidden_states=p_embeds,
+            timestep=t,
+            img_ids=img_ids,
+            txt_ids=p_ids,
+            guidance=None,
+            kv_cache=kvc,
+        )
+        noise = noise[:, : x.shape[1]]
+        if n_embeds is None:
+            return noise
+        negative_noise = transformer(
+            hidden_states=hidden,
+            encoder_hidden_states=n_embeds,
+            timestep=t,
+            img_ids=img_ids,
+            txt_ids=n_ids,
+            guidance=None,
+            kv_cache=nkvc or kvc,
+        )
+        negative_noise = negative_noise[:, : x.shape[1]]
+        return negative_noise + scale * (noise - negative_noise)
+
+    fn = mx.compile(predict) if use_compile else predict
+    return fn(
+        latents,
+        ref_latents,
+        latent_ids,
+        ref_ids,
+        pos_embeds,
+        pos_ids,
+        neg_embeds,
+        neg_ids,
+        guidance,
+        timestep,
+        kv_cache,
+        negative_kv_cache,
+    )
+
+
+def _predict_flux2_edit_cached(
+    transformer,
+    latents,
+    latent_ids,
+    timestep,
+    encodings,
+    negative,
+    guidance,
+    kv_cache,
+    negative_kv_cache=None,
+):
+    """kv 缓存命中（`mode="cached"`）时的 edit 单步预测：只送目标 token。
+
+    与 mflux `Flux2KleinEdit._cached_predict` 一致：参考图 token 的 K/V 已在第 1 步
+    抽进 kv 缓存，这里不再 concat 参考图；与 mflux 一样**不编译**。
+    """
+    pos_embeds, pos_ids = encodings
+    neg_embeds, neg_ids = negative if negative is not None else (None, None)
+    noise = transformer(
+        hidden_states=latents,
+        encoder_hidden_states=pos_embeds,
+        timestep=timestep,
+        img_ids=latent_ids,
+        txt_ids=pos_ids,
+        guidance=None,
+        kv_cache=kv_cache,
+    )
+    noise = noise[:, : latents.shape[1]]
+    if neg_embeds is None:
+        return noise
+    negative_noise = transformer(
+        hidden_states=latents,
+        encoder_hidden_states=neg_embeds,
+        timestep=timestep,
+        img_ids=latent_ids,
+        txt_ids=neg_ids,
+        guidance=None,
+        kv_cache=negative_kv_cache or kv_cache,
+    )
+    negative_noise = negative_noise[:, : latents.shape[1]]
+    return negative_noise + guidance * (noise - negative_noise)
+
+
+def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance):
+    """Flux.2 参考图编辑采样：循环与 `_sample_flux2` 相同，只换单步预测为 edit 版。
+
+    - 参考图 latent 按缓存键从 cache.py 的 `ref_encoding` 桶取（编码节点已算好）；
+    - kv 缓存只在 `model_config.supports_kv_cache`（kv 版权重才有）且没有关掉时启用：
+      第 1 步 `extract`（拼参考图）、之后 `cached`（只送目标 token），此时不走
+      `mx.compile`（与 mflux 一致）；negative 有独立 cache；
+    - 目标 latent 每个 seed 单独采（batch=1），参考图也是 batch 1，直接 concat；
+    - 目标 latent 形状与 txt2img 完全相同 → 下游解码/保存链路无需改动。
+    """
+    config = make_sampler_config(defn, model_config, params)
+    scheduler = build_scheduler(params["scheduler_name"], config)
+    ref_latents, ref_ids, _ref_w, _ref_h = cached_reference(cache, params["ref_cache_key"])
+    per_seed = create_latents(
+        defn, params["seed"], params["height"], params["width"], params["batch_size"]
+    )
+    encodings = cached_encoding(cache, params["positive_encoding_key"], "正")
+    negative = (
+        cached_encoding(cache, params["negative_encoding_key"], "负") if guidance > 1.0 else None
+    )
+    kv_enabled = (
+        params.get("kv_cache", "auto") == "auto"
+        and bool(model_config.supports_kv_cache)
+        and ref_latents.shape[1] > 0
+    )
+    use_compile = bool(params.get("compile_model", True)) and not kv_enabled and not _is_m1_or_m2()
+    transformer = comps["transformer"]
+    final = []
+    for latents, latent_ids, _latent_h, _latent_w in per_seed:
+        current = latents  # [1, seq, C]
+        kv_cache = _new_kv_cache(transformer) if kv_enabled else None
+        negative_kv_cache = (
+            _new_kv_cache(transformer) if (kv_enabled and negative is not None) else None
+        )
+        for t in range(params["steps"]):
+            if kv_cache is not None:
+                mode = "extract" if t == 0 else "cached"
+                kv_cache.configure(mode=mode, num_ref_tokens=ref_latents.shape[1])
+                if negative_kv_cache is not None:
+                    negative_kv_cache.configure(mode=mode, num_ref_tokens=ref_latents.shape[1])
+            timestep = scheduler.timesteps[t]
+            if kv_cache is not None and t > 0:
+                noise = _predict_flux2_edit_cached(
+                    transformer,
+                    current,
+                    latent_ids,
+                    timestep,
+                    encodings,
+                    negative,
+                    guidance,
+                    kv_cache,
+                    negative_kv_cache,
+                )
+            else:
+                noise = _predict_flux2_edit(
+                    transformer,
+                    current,
+                    ref_latents,
+                    latent_ids,
+                    ref_ids,
+                    timestep,
+                    encodings,
+                    negative,
+                    guidance,
+                    use_compile,
+                    kv_cache,
+                    negative_kv_cache,
+                )
+            current = scheduler.step(
+                noise=noise, timestep=t, latents=current, sigmas=scheduler.sigmas
+            )
+            mx.eval(current)
+        final.append(current)
+    stacked = mx.concatenate(final, axis=0)  # [B, seq, C]
+    mx.eval(stacked)
+    return stacked
+
+
 def run_sampler(defn, model_handle, comps, params, cache):
     """跑完整采样，返回带缓存数组的 latent 句柄。
 
@@ -348,6 +723,13 @@ def run_sampler(defn, model_handle, comps, params, cache):
     guidance = float(params["guidance"]) if model_config.supports_guidance else 0.0
 
     def sample():
+        # 接了参考图 → Flux.2 参考图编辑（edit）分支
+        if params.get("ref_cache_key"):
+            if defn.family != "flux2":
+                raise NotImplementedError(
+                    f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 的 edit 路径）"
+                )
+            return _sample_flux2_edit(defn, comps, params, cache, model_config, guidance)
         if defn.family == "flux2":
             return _sample_flux2(defn, comps, params, cache, model_config, guidance)
         return _sample_z_image(defn, comps, params, cache, model_config, guidance)

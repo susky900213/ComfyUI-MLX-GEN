@@ -17,6 +17,8 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     save,
     text_encoder,
     vae_decode,
+    vae_encoder,
+    vae_loader,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -26,6 +28,9 @@ NODE_CLASS_MAPPINGS = {
     "MlxModelLoraApply": lora.MlxModelLoraApply,
     "MlxClipLoraApply": lora.MlxClipLoraApply,
     "MlxKSamplerMLX": sampler.MlxKSamplerMLX,
+    "MlxVAELoader": vae_loader.MlxVAELoader,
+    "MlxVAEEncoder": vae_encoder.MlxVAEEncoder,
+    "MlxVAEDecoder": vae_decode.MlxVAEDecoder,
     "MlxVAEDecodeRawPIL": vae_decode.MlxVAEDecodeRawPIL,
     "MlxSaveImage": save.MlxSaveImage,
     "MlxPilToTorch": pil_to_torch.MlxPilToTorch,
@@ -38,6 +43,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxModelLoraApply": "MLX 模型 LoRA",
     "MlxClipLoraApply": "MLX CLIP LoRA",
     "MlxKSamplerMLX": "MLX 采样器",
+    "MlxVAELoader": "MLX VAE 加载",
+    "MlxVAEEncoder": "MLX VAE 编码",
+    "MlxVAEDecoder": "MLX VAE 解码",
     "MlxVAEDecodeRawPIL": "MLX VAE 解码（PIL）",
     "MlxSaveImage": "MLX 保存图片",
     "MlxPilToTorch": "MLX PIL → 张量",

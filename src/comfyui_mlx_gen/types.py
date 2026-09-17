@@ -29,6 +29,8 @@ model = "model"
 latents = "latents"
 images = "images"
 condition = "condition"  # 单条提示词 + 编码它所用的组件配置
+vae = "mlx_vae"  # MLX VAE handle（MlxVAELoader → MlxVAEEncoder / MlxVAEDecoder）
+ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 latent + grid ids）
 
 
 # --- 纯数据 handle ---
@@ -104,6 +106,42 @@ class MlxLatentHandle:
     model_cache_key: str = ""  # 用于复用 MlxModelHandle 的缓存
     height: int = 0  # 生成尺寸（解码时重建 latent 用）
     width: int = 0
+
+
+@dataclass(frozen=True)
+class MlxVaeHandle:
+    """只存「用哪套 VAE + 精度 + 量化档位」；同一 cache_key → 同一份 VAE 实例。
+
+    由 MlxVAELoader 产出（不加载权重），MlxVAEEncoder / MlxVAEDecoder（以及
+    兼容的 MlxVAEDecodeRawPIL）按 cache_key 物化它，因此编码器与解码器必然
+    共用同一份 VAE —— 编码用的统计量与解码用的权重必须是同一套。
+    """
+
+    model_type: str  # 模型大类（MODEL_DEFS 的键，如 "flux2"）
+    path: str  # vae/ 目录下的权重集目录名（如 "flux.2-klein-9b-8bit"）
+    precision: str  # "bfloat16" | "float16" | "float32"
+    quantize: int  # 4 / 8 / 16
+    cache_key: str = ""  # 编码器与解码器共用的缓存键
+
+
+@dataclass(frozen=True)
+class MlxReferenceImages:
+    """参考图条件（Flux.2 edit）：只带缓存键，数组留在 cache.py 的 "ref_encoding" 桶里。
+
+    由 MlxVAEEncoder 产出（预处理 → VAE encode → patchify → bn 归一化 →
+    pack → grid ids），接到 MlxKSamplerMLX 的可选入口 ref_images；采样器按
+    cache_key 取数组，把它 concat 在目标 latent 之后（每个 step 只取回目标段）。
+    """
+
+    model_type: str  # 产出它的模型大类（只有 "flux2" 支持）
+    vae_path: str  # 编码它的 VAE 权重集目录名（信息性）
+    count: int  # 实际参与编码的参考图张数
+    height: int  # 建议生成高度（首张参考图预处理后的高度，16 的倍数）
+    width: int  # 建议生成宽度
+    cache_key: str  # 打包数组的缓存键
+    vae_cache_key: str = ""  # 与 MlxVaeHandle.cache_key 同源（诊断用）
+    precision: str = ""
+    quantize: int = 0
 
 
 @dataclass(frozen=True)

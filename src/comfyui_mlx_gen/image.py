@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Sequence
 
 import numpy as np
@@ -60,3 +61,40 @@ def to_mask_batch(images: Sequence[Image.Image]) -> torch.Tensor:
             raise ValueError(f"图片尺寸不一致: {img.size} 与 {ref}")
         stack.append(np.asarray(img.convert("L"), dtype=np.float32) / 255.0)
     return torch.from_numpy(np.stack(stack, axis=0))
+
+
+def to_pil_batch(images: Any) -> tuple[Image.Image, ...]:
+    """ComfyUI IMAGE（torch [B,H,W,C] float32 0..1）→ PIL 元组（参考图编码用）。"""
+    data = images
+    if hasattr(data, "detach"):
+        data = data.detach().to("cpu").float().numpy()
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim == 3:
+        data = data[None, ...]
+    if data.shape[-1] == 4:
+        data = data[..., :3]
+    if data.shape[-1] != 3:
+        raise ValueError(f"IMAGE 通道数不是 3/4: {data.shape}")
+    out: list[Image.Image] = []
+    for i in range(data.shape[0]):
+        arr8 = np.rint(np.clip(data[i], 0.0, 1.0) * 255.0).astype(np.uint8)
+        out.append(Image.fromarray(arr8, mode="RGB"))
+    return tuple(out)
+
+
+def digest(items: Any) -> str:
+    """IMAGE 张量 / PIL 批次的稳定摘要（做缓存键，保证换图必换键）。
+
+    用未预处理的原始输入算：1MP float32 ≈ 12MB，毫秒级，相比 VAE 前向可忽略。
+    """
+    h = hashlib.sha256()
+    if hasattr(items, "detach"):
+        arr = items.detach().to("cpu").float().numpy()
+        h.update(str(tuple(arr.shape)).encode())
+        h.update(np.ascontiguousarray(arr).tobytes())
+        return h.hexdigest()
+    for img in items:
+        rgb = img.convert("RGB")
+        h.update(str(rgb.size).encode())
+        h.update(np.asarray(rgb, dtype=np.uint8).tobytes())
+    return h.hexdigest()

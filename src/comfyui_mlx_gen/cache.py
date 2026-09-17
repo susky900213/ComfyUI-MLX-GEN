@@ -7,11 +7,14 @@ from typing import Any, Callable
 
 # 各类型缓存条目上限（超出即删最早项，并释放 MLX 缓存）
 _TYPE_CAPS: dict[str, int] = {
-    "module": 1,
+    # text_encoder bundle + vae + transformer 三份都要同时驻留（flux2 edit 全链路）
+    "module": 3,
     # 正/负条件各占一条，再多留几档给换提示词的情况
     "prompt_encoding": 6,
     "component_weights": 2,
     "image": 6,
+    # 参考图条件（packed latents + grid ids），换图才会有第二条
+    "ref_encoding": 2,
 }
 
 
