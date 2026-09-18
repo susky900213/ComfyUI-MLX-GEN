@@ -107,7 +107,7 @@ class MlxLatentHandle:
     取对应的行，`cache_key` 是同一个键（换提示词或换种子必然重新采样）。
     """
 
-    kind: str  # "noise" | "packed" | "h3_video" | "yue2_audio"
+    kind: str  # "noise" | "packed" | "h3_video" | "yue2_audio" | "breeze_audio"
     shape: tuple[int, ...]
     dtype: str
     cache_key: str  # 缓存在 cache.py 中的条目键（数组不放 handle 里）
@@ -128,6 +128,7 @@ class MlxLatentHandle:
     latent_height: int = 0  # 视频 latent 空间尺寸（画布 / 16）
     latent_width: int = 0
     audio_num_rows: int = 0  # 音频行数（latents × 2 声道）
+    sample_rate: int = 0  # 音频 latent 的原生采样率（Breeze-TTS-2 为 24000）
     prompt_digest: str = ""  # 提示词与关键帧摘要（进 latent 缓存键）
 
 
@@ -503,6 +504,33 @@ YUE2 = MlxModelEntry(
     ),
 )
 
+
+# --- Breeze-TTS-2（目标文本 / 克隆 / 音色设计 → 24 kHz 单声道语音）-------------
+BREEZE_TTS2 = MlxModelEntry(
+    family="breeze_tts2",
+    # checkpoint 已含主干、T5Gemma2 文本编码器和 audio tokenizer；三个 role 只用于
+    # 保持现有 Loader 节点的数据契约，真正加载统一走 mlx_audio.tts.utils.load_model。
+    weight_def="",
+    components=_components(
+        transformer="mlx_audio.tts.models.breeze_tts.breeze_tts:Model",
+        vae="mlx_audio.tts.models.breeze_tts.breeze_tts:Model",
+        text_encoder="mlx_audio.tts.models.breeze_tts.breeze_tts:Model",
+        tokenizer_name="breeze_tts2",
+    ),
+    default_config="",
+    default_steps=1,
+    default_scheduler="breeze_tts",
+    default_guidance=1.0,
+    supports_compile=False,
+    supported=True,
+    media="audio",
+    notes=(
+        "Breeze-TTS-2 本地语音生成：支持 S0–S9 内置说话人、ComfyUI AUDIO 参考音频"
+        "克隆和 instruction 音色设计；完整 checkpoint 只在采样器加载一次，最终通过"
+        "现有 VAE Decode / PIL→Torch 链输出 24 kHz 原生 AUDIO。"
+    ),
+)
+
 # 键 = 模型大类（= model_type 下拉）；大类内用哪套配置由权重目录名决定
 MODEL_DEFS: dict[str, MlxModelEntry] = {
     "z_image": Z_IMAGE,
@@ -513,6 +541,7 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
     # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
     "minimax_h3": MINIMAX_H3,
     "yue2": YUE2,
+    "breeze_tts2": BREEZE_TTS2,
 }
 
 

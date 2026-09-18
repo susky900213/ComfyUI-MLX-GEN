@@ -1,5 +1,6 @@
 """节点实现集合。"""
 
+from .breeze_sampler import MlxBreezeSampler
 from .clip_loader import MlxClipLoader
 from .loader import MlxTransformerLoader
 from .lora import MlxClipLoraApply, MlxModelLoraApply
@@ -12,8 +13,10 @@ from .vae_encoder import MlxVAEEncoder
 from .vae_loader import MlxVAELoader
 from .save import MlxSaveImage
 from .pil_to_torch import MlxPilToTorch
+from .whisper_transcribe import MlxWhisperTranscribe
 
 __all__ = [
+    "MlxBreezeSampler",
     "MlxClipLoader",
     "MlxTextEncoder",
     "MlxQwenEditEncoder",
@@ -28,4 +31,5 @@ __all__ = [
     "MlxVAEDecodeRawPIL",
     "MlxSaveImage",
     "MlxPilToTorch",
+    "MlxWhisperTranscribe",
 ]

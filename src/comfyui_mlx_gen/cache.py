@@ -31,6 +31,9 @@ _TYPE_CAPS: dict[str, int] = {
     "h3_latents": 1,
     # --- YuE2（主模型与 VAE 分阶段物化，任一时刻通常只有一条）---
     "yue2_module": 2,
+    # --- Breeze-TTS-2（完整 checkpoint 一次加载；生成后只保留最终 24 kHz 波形）---
+    "breeze_module": 1,
+    "breeze_waveform": 2,
 }
 
 

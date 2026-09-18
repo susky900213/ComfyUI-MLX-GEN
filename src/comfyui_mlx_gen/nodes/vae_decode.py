@@ -50,6 +50,14 @@ def _cached_latents(latents):
     return arr
 
 
+def _decode_breeze(latents, batch_index: int) -> MlxPilImage:
+    """Breeze：缓存中的最终一维 waveform → 24 kHz AUDIO 载荷（不再加载模型）。"""
+    cached, hit = CACHE.get("breeze_waveform", latents.cache_key)
+    if not hit:
+        raise RuntimeError("Breeze waveform 不在缓存里，请重新运行 MlxKSamplerMLX")
+    return pipeline.decode_breeze_waveform(cached, batch_index)
+
+
 def _decode_with_vae(entry, vae_module, latents, arr, batch_index) -> MlxPilImage:
     """按 batch 逐张解码（latent 形状由 `pipeline.decode_latents` 按大类还原）。"""
     if batch_index >= 0:
@@ -112,7 +120,14 @@ class MlxVAEDecodeRawPIL:
         default_type = types[0]
         # 候选取 vae/ + audio_vae/ 的并集（H3 的音频 VAE 两个目录都可能放）
         vae_paths = list(
-            dict.fromkeys(cls._paths("vae") + cls._paths("audio_vae"))
+            dict.fromkeys(
+                cls._paths("vae") + cls._paths("audio_vae")
+                + [
+                    name
+                    for name in paths.list_component_items("transformer")
+                    if "breeze" in name.lower()
+                ]
+            )
         ) or [NO_PATH]
         return {
             "required": {
@@ -153,6 +168,8 @@ class MlxVAEDecodeRawPIL:
         if latents.kind == "yue2_audio":
             handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
             return (_decode_yue2(latents, handle, batch_index),)
+        if latents.kind == "breeze_audio":
+            return (_decode_breeze(latents, batch_index),)
         arr = _cached_latents(latents)
         # 按同款 handle 走共享键 → 与 MlxVAELoader / MlxVAEDecoder 命中同一份 VAE
         handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
@@ -203,6 +220,8 @@ class MlxVAEDecoder:
             return (_decode_h3(latents, vae, audio_vae, batch_index),)
         if latents.kind == "yue2_audio":
             return (_decode_yue2(latents, vae, batch_index),)
+        if latents.kind == "breeze_audio":
+            return (_decode_breeze(latents, batch_index),)
         arr = _cached_latents(latents)
         # 与 MlxVAEEncoder / MlxVAEDecodeRawPIL 共用同一个键 → 全流程只驻留一份 VAE
         vae_module = pipeline.vae_component(vae, CACHE)

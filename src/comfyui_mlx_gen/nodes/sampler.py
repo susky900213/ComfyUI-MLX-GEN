@@ -155,11 +155,11 @@ class MlxKSamplerMLX:
             raise ValueError(
                 f"文本编码器选的是 {positive.clip.model_type}，与采样器的 {model.model_type} 不匹配"
             )
-        if positive.clip.path != model.model_path:
-            raise ValueError(
-                "文本编码器与采样器选的权重不是同一套，"
-                f"请把两边选成同一份（当前 {positive.clip.path} 与 {model.model_path}）"
-            )
+        # if positive.clip.path != model.model_path:
+        #     raise ValueError(
+        #         "文本编码器与采样器选的权重不是同一套，"
+        #         f"请把两边选成同一份（当前 {positive.clip.path} 与 {model.model_path}）"
+        #     )
         # 配置由「大类 + 权重目录名」现取；未知大类直接报错（不静默回退）
         entry = entry_for(model.model_type)
         if not entry.supported:

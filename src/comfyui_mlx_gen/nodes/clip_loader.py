@@ -26,13 +26,13 @@ NO_PATH = "<无可用权重>"
 def component_options(component: str) -> list[str]:
     """该组件目录下可选的权重集（扫盘；目录为空时给占位项，避免下拉为空）。"""
     items = paths.list_component_items(component)
-    # YuE2 没有独立 text encoder；为了继续复用这个节点，让它也能选择 transformer/
-    # 里的 YuE2 变体（文本节点只保留原文，真正 tokenizer 在采样器中加载）。
+    # YuE2 没有独立 text encoder，Breeze 的文本编码器也封装在完整 checkpoint 内；
+    # 为了继续复用这个节点，让两者都能选择 transformer/ 里的完整权重目录。
     if component in ("text_encoder", "tokenizer"):
         items += [
             name
             for name in paths.list_component_items("transformer")
-            if "yue2" in name.lower()
+            if "yue2" in name.lower() or "breeze" in name.lower()
         ]
     return list(dict.fromkeys(items)) or [NO_PATH]
 

@@ -1,0 +1,209 @@
+{
+  "id": "mlx-breeze-tts2-voice-clone-asr",
+  "revision": 0,
+  "last_node_id": 10,
+  "last_link_id": 10,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 270],
+      "size": [440, 210],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "value", "type": "STRING", "widget": {"name": "value"}}
+      ],
+      "outputs": [
+        {"name": "STRING", "type": "STRING", "links": [1], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PrimitiveStringMultiline"},
+      "title": "要生成的目标台词",
+      "widgets_values": ["這是使用參考音色生成的新台詞。"]
+    },
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "pos": [40, 540],
+      "size": [440, 280],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "COMBO", "widget": {"name": "audio"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "AUDIO", "type": "AUDIO", "links": [2, 4], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "LoadAudio"},
+      "title": "选择参考音频（建议 3–10 秒干净人声）",
+      "widgets_values": [""]
+    },
+    {
+      "id": 3,
+      "type": "MlxWhisperTranscribe",
+      "pos": [530, 700],
+      "size": [430, 350],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 2, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "text", "type": "STRING", "links": [3], "slot_index": 0},
+        {"name": "language", "type": "STRING", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "MlxWhisperTranscribe"},
+      "title": "Whisper 自动生成参考音频逐字稿",
+      "widgets_values": ["whisper-large-v3-mlx", "zh", 0.0, false, ""]
+    },
+    {
+      "id": 4,
+      "type": "MlxTransformerLoader",
+      "pos": [40, 40],
+      "size": [440, 180],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "model", "type": "model", "links": [5], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTransformerLoader"},
+      "title": "Breeze-TTS-2 完整 checkpoint",
+      "widgets_values": ["breeze_tts2", "Breeze-TTS-2-mlx", 0, "bfloat16", false, 0]
+    },
+    {
+      "id": 5,
+      "type": "MlxVAELoader",
+      "pos": [1010, 790],
+      "size": [430, 220],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "vae", "type": "mlx_vae", "links": [7], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAELoader"},
+      "title": "Breeze decode 兼容句柄（不会重复加载）",
+      "widgets_values": ["breeze_tts2", "Breeze-TTS-2-mlx", "bfloat16", 0, "vae"]
+    },
+    {
+      "id": 6,
+      "type": "MlxBreezeSampler",
+      "pos": [1010, 80],
+      "size": [430, 610],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "model", "link": 5, "slot_index": 0},
+        {"name": "text", "type": "STRING", "link": 1, "slot_index": 1},
+        {"name": "ref_text", "type": "STRING", "link": 3, "slot_index": 2},
+        {"name": "instruction", "type": "STRING", "link": null, "slot_index": 3},
+        {"name": "ref_audio", "type": "AUDIO", "link": 4, "slot_index": 4}
+      ],
+      "outputs": [
+        {"name": "latents", "type": "latents", "links": [6], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxBreezeSampler"},
+      "title": "Breeze 声音克隆（使用 Whisper 逐字稿）",
+      "widgets_values": [42, "voice_clone", "S0", 0.9, 1.0, 50, 1.0, 750, 1.0]
+    },
+    {
+      "id": 7,
+      "type": "MlxVAEDecoder",
+      "pos": [1510, 270],
+      "size": [370, 260],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 7, "slot_index": 0},
+        {"name": "latents", "type": "latents", "link": 6, "slot_index": 1}
+      ],
+      "outputs": [
+        {"name": "images", "type": "images", "links": [8], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAEDecoder"},
+      "title": "waveform → 24 kHz 单声道 AudioTrack",
+      "widgets_values": [-1]
+    },
+    {
+      "id": 8,
+      "type": "MlxPilToTorch",
+      "pos": [1930, 270],
+      "size": [350, 180],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "images", "link": 8, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "images", "type": "IMAGE", "links": null, "slot_index": 0},
+        {"name": "masks", "type": "MASK", "links": null, "slot_index": 1},
+        {"name": "audio", "type": "AUDIO", "links": [9, 10], "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxPilToTorch"},
+      "title": "取 AUDIO 输出（IMAGE / MASK 是占位）",
+      "widgets_values": []
+    },
+    {
+      "id": 9,
+      "type": "SaveAudio",
+      "pos": [2330, 160],
+      "size": [390, 260],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 9, "slot_index": 0},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "SaveAudio"},
+      "title": "保存克隆语音 FLAC（ComfyUI 内置）",
+      "widgets_values": ["audio/ComfyUI-MLX-GEN-breeze-voice-clone-asr"]
+    },
+    {
+      "id": 10,
+      "type": "PreviewAudio",
+      "pos": [2330, 480],
+      "size": [390, 220],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 10, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PreviewAudio"},
+      "title": "试听克隆语音（ComfyUI 内置）",
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 1, 0, 6, 1, "STRING"],
+    [2, 2, 0, 3, 0, "AUDIO"],
+    [3, 3, 0, 6, 2, "STRING"],
+    [4, 2, 0, 6, 4, "AUDIO"],
+    [5, 4, 0, 6, 0, "model"],
+    [6, 6, 0, 7, 1, "latents"],
+    [7, 5, 0, 7, 0, "mlx_vae"],
+    [8, 7, 0, 8, 0, "images"],
+    [9, 8, 2, 9, 0, "AUDIO"],
+    [10, 8, 2, 10, 0, "AUDIO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

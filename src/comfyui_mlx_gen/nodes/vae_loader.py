@@ -31,6 +31,11 @@ class MlxVAELoader:
         vae_paths = list(
             dict.fromkeys(
                 paths.list_component_items("vae") + paths.list_component_items("audio_vae")
+                + [
+                    name
+                    for name in paths.list_component_items("transformer")
+                    if "breeze" in name.lower()
+                ]
             )
         ) or [NO_WEIGHTS]
         return {
@@ -57,7 +62,11 @@ class MlxVAELoader:
             raise ValueError(f"未知精度: {precision}")
         if role not in entry.components:
             raise ValueError(f"{model_type} 没有 {role} 组件（只有 {list(entry.components)}）")
+        # Breeze 的 audio tokenizer 已封装在完整 checkpoint 内，VAE Loader 只是兼容
+        # 句柄，不应要求用户复制权重到 vae/；优先同名 vae/，不存在则回退 transformer/。
         kind, resolved = paths.resolve("local", model_path, role)
+        if kind == "missing" and entry.family == "breeze_tts2":
+            kind, resolved = paths.resolve("local", model_path, "transformer")
         if kind == "missing":
             raise FileNotFoundError(f"未找到 {role} 权重: {resolved}")
         config = {

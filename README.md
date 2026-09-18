@@ -3,6 +3,118 @@
 面向 Apple Silicon 的 ComfyUI MLX 生成节点。模型组件通过纯数据 handle 在节点间传递，
 Transformer、文本编码器和 VAE 只在实际消费它们的节点中延迟加载。
 
+## Breeze-TTS-2 本地语音生成
+
+Breeze-TTS-2 通过专用采样器在 **ComfyUI 进程内**完成文本编码、语音 token 生成与
+audio tokenizer 解码，不启动服务、不调用 HTTP API。目标文本来自独立的 `STRING`
+节点；`MlxBreezeSampler` 只暴露输入 socket，不在采样器内显示文本输入框：
+
+```text
+PrimitiveStringMultiline（要朗读的目标文本）
+  → MlxTransformerLoader + MlxBreezeSampler
+  → MlxVAELoader（兼容句柄）+ MlxVAEDecoder
+  → MlxPilToTorch（AUDIO 输出，24 kHz 单声道）
+  → SaveAudio / PreviewAudio
+```
+
+可直接导入默认使用内置 `S0` 说话人的示例：
+
+```text
+workflows/breeze-tts2.json
+```
+
+声音克隆示例已经预先连接目标台词、参考音频逐字稿和 `Load Audio`：
+
+```text
+workflows/breeze-tts2-voice-clone.json
+```
+
+导入后选择一段 3–10 秒的干净参考人声，并把“参考音频逐字稿”改成录音中实际说出的
+完整内容；逐字稿必须尽量与录音一致。然后在“要生成的目标台词”中填写希望克隆音色
+朗读的新内容，即可排队生成。
+
+如果已经下载本地 MLX Whisper，可以导入自动转写版本；同一个 `Load Audio` 会同时送入
+Whisper 和 Breeze，`MlxWhisperTranscribe.text` 会直接连接到 `ref_text`：
+
+```text
+workflows/breeze-tts2-voice-clone-asr.json
+
+Load Audio ─┬→ MlxWhisperTranscribe → STRING → MlxBreezeSampler.ref_text
+            └───────────────────────── AUDIO → MlxBreezeSampler.ref_audio
+```
+
+示例默认使用：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/whisper-large-v3-mlx
+```
+
+`MlxWhisperTranscribe` 只扫描本地 `transformer/` 中同时包含 `config.json` 和
+`weights.npz`/`weights.safetensors`、且 `config.json:model_type` 为 `whisper` 的目录；
+不会因路径错误而静默联网下载。节点固定执行 `task=transcribe`，关闭 word timestamps，
+首个输出只有可直接供 Breeze 使用的纯文本。普通话可把 `language` 固定为 `zh`；粤语用
+`yue`；中英混合或未知语言可选 `auto`。`initial_prompt` 只用于提示人名、术语或产品名，
+不要填写“请转写”等任务指令。3–10 秒参考音频建议保持
+`temperature=0`、`condition_on_previous_text=false`。
+
+节点会取第一批音频、将声道平均为单声道，并在内存中重采样到 Whisper 所需的 16 kHz，
+不创建临时音频文件。转写完成后会主动释放 large-v3 及 MLX cache，再让 Breeze 加载，
+避免两个大模型同时常驻。ASR 仍可能漏掉语气词、数字或专有名词；音色克隆质量优先时，
+请检查识别结果，或改用上面的手工逐字稿工作流进行修正。
+
+### 权重与依赖
+
+下载 `mlx-community/Breeze-TTS-2-mlx-4bit`（也可使用 8-bit 或 BF16 变体），把**完整
+checkpoint 目录**放入或软链接到 transformer 目录。目录必须保留根部的
+`config.json`、模型权重及其文本/audio tokenizer 子目录；`config.json` 中的
+`model_type` 应为 `breeze_tts`：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/
+└── transformer/Breeze-TTS-2-mlx-4bit -> <完整 Hugging Face snapshot>
+```
+
+Transformer 与 VAE 两个 Loader 的 `model_type` 都选 `breeze_tts2`，路径都选同一个
+`Breeze-TTS-2-mlx-4bit`。Breeze checkpoint 已经包含主模型、文本编码器和 audio
+tokenizer，因此 VAE Loader 仅传递兼容句柄，不会重复加载模型，也不需要再向 `vae/`
+复制一份权重。真实量化精度由 checkpoint 决定；Loader 的 `quantize` 建议按所用变体
+填写，插件不会进行二次量化。
+
+Breeze runtime 固定为 `mlx-audio==0.5.1`，ASR runtime 固定为
+`mlx-whisper==0.4.3`。必须在 **ComfyUI 实际使用的 Python
+环境**中安装本仓库依赖并重启 ComfyUI：
+
+```bash
+python -m pip install -r /Users/apple/workspace/python/ComfyUI-MLX-GEN/requirements.txt
+```
+
+### 三种生成模式
+
+专用采样器只显示 Breeze 使用的生成参数。`text`、`ref_text` 与 `instruction` 都是
+外部 `STRING` socket，不会在采样器节点内生成文本框；可连接 ComfyUI 核心
+`PrimitiveStringMultiline` 或任意兼容的字符串输出。一次固定生成一条语音。
+
+- **`speaker`（内置说话人）**：在 `speaker` 选择 `S0`–`S9`。官方模型只公开
+  这十个标签，没有可靠的音色文字映射，因此本项目不臆测性别或年龄。
+- **`voice_clone`（音色克隆）**：把 ComfyUI 原生 `Load Audio`（或任意 `AUDIO`
+  输出）接到 `ref_audio`，并把另一个外部文本节点接到 `ref_text`，内容为参考音频的
+  **逐字转写**。建议使用 3–10 秒干净人声。插件会取第一批、声道求均值为单声道，再
+  用原始采样率写入临时 PCM16 WAV；`mlx-audio` 编码后该临时文件立即删除。
+- **`voice_design`（音色设计）**：不要连接 `ref_audio`，把音色、情绪、语速或表达方式
+  的外部文本接到 `instruction`。`cfg_scale != 1.0` 只在有 instruction 时
+  启用模型的 CFG 分支。
+
+`temperature`、`top_p`、`top_k`、`repetition_penalty` 和 `max_tokens` 会原样传给
+mlx-audio 0.5.1；`max_tokens` 是语音帧上限（最大 750），模型可以提前结束。`seed`
+控制采样随机性。
+
+原有 `MlxKSamplerMLX` 节点仍保留，已有工作流和其他模型链路不受影响；新的 Breeze
+示例与推荐链路使用 `MlxBreezeSampler`。
+
+完整模型只在 waveform 缓存未命中时加载一次。生成结束后最终 24 kHz 波形进入独立缓存，
+完整模型立即释放；VAE Decode 阶段只把该波形包装为 `AudioTrack`，不会再加载第二份模型。
+克隆缓存键使用规范化波形内容及其原采样率的摘要，不包含随机临时文件名。
+
 ## YuE2-3B 本地音乐生成
 
 YuE2 通过已有的通用 MLX 节点链在 **ComfyUI 进程内**完成文本规划、语义 codec
@@ -198,8 +310,9 @@ workflows/qwen-image-2512.json
 python -m pip install -r requirements.txt
 ```
 
-本项目的模型实现来自 `mflux==0.19.1`（发行包名见 `requirements.txt`），并依赖 Apple
-Silicon 上的 `mlx>=0.32.0,<0.33.0`。节点注册入口是仓库根目录的 `__init__.py`。
+图像模型实现来自 `mflux==0.19.1`，Breeze-TTS-2 runtime 来自
+`mlx-audio==0.5.1`（发行包名见 `requirements.txt`），并依赖 Apple Silicon 上的
+`mlx>=0.32.0,<0.33.0`。节点注册入口是仓库根目录的 `__init__.py`。
 
 **不要同时安装 `mflux` 与 `mlx-gen` 两个发行包。** 它们都会安装同名的 `mflux`
 Python 模块，但版本约束不同：本仓库固定的 `mflux==0.19.1` 需要 MLX 0.32.x，而
@@ -217,13 +330,14 @@ python -m pip show mlx mflux
 
 ## 静态回归测试
 
-YuE2、Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，覆盖模型登记、组件路径、
+YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，覆盖模型登记、组件路径、
 prompt/latent API、采样器边界，以及工作流节点、widget、socket 和 link 契约：
 
 ```bash
 /opt/anaconda3/envs/py313/bin/python tests/test_qwen_image.py
 /opt/anaconda3/envs/py313/bin/python tests/test_ideogram.py
 /opt/anaconda3/envs/py313/bin/python tests/test_yue2.py
+/opt/anaconda3/envs/py313/bin/python tests/test_breeze.py
 ```
 
 测试成功时退出状态为 0；任何检查失败都会汇总失败项并以状态 1 退出。
@@ -231,5 +345,5 @@ prompt/latent API、采样器边界，以及工作流节点、widget、socket �
 ## 其他示例工作流
 
 `workflows/` 还包含 Z-Image、Flux.2 Klein、Qwen-Image-Edit、Ideogram 4、MiniMax-H3
-与 YuE2 示例。各工作流序列化了对应模型的推荐采样参数；切换模型家族时请同时修改
+、YuE2 与 Breeze-TTS-2 示例。各工作流序列化了对应模型的推荐采样参数；切换模型家族时请同时修改
 Transformer、CLIP 和 VAE 加载器，避免混用不同权重集。

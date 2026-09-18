@@ -58,15 +58,16 @@ class MlxTextEncoder:
                 "（MlxQwenEditEncoder）节点，而不是本节点 —— 否则会得到一条"
                 "没有任何视觉信息的条件"
             )
-        # YuE2 没有独立文本编码器：正向文本是 style、负向文本是 lyrics，原文一直
-        # 保留到采样器，再由主模型同目录下的 qwen.tiktoken 编码。空 lyrics 表示纯音乐。
+        # 音频生成家族的文本编码器都封装在主 checkpoint 内：YuE2 的正/负文本分别
+        # 是 style / lyrics；Breeze 的正向文本是目标台词，负向文本只为保持标准连线。
+        # 这里都只透传原文，真正编码发生在采样器物化完整模型之后。
         if entry.media == "audio":
             prompt = text or ""
             cond = MlxConditioning(
                 clip=clip,
                 text=prompt,
                 encoding_key=runtime.cache_key(
-                    {"kind": "yue2_text", "clip": clip, "text": prompt}
+                    {"kind": f"{entry.family}_text", "clip": clip, "text": prompt}
                 ),
             )
             return (cond,)

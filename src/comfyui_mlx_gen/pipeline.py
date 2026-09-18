@@ -36,13 +36,14 @@ MlxVaeHandle 物化（编码与解码共用同一份实例）。采样器按 han
 
 from __future__ import annotations
 
+import json
 from inspect import signature
 from pathlib import Path
 from typing import Any, Sequence
 
 import mlx.core as mx
 
-from . import components, image, paths, runtime, weights
+from . import breeze, components, image, paths, runtime, weights
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.weights import loader as h3_loader
 from .types import MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
@@ -1688,6 +1689,143 @@ def decode_yue2_latents(latents, vae_handle, cache, batch_index: int) -> MlxPilI
     # Oobleck 输出 [samples, 2]；AudioTrack / ComfyUI AUDIO 使用 [channels, samples]。
     stereo = np.ascontiguousarray(np.array(waveform, dtype=np.float32).T)
     track = AudioTrack(waveform=stereo, sample_rate=yue2_pipeline.SAMPLE_RATE)
+    return MlxPilImage(images=(), batch_index=-1, audio=track)
+
+
+# === Breeze-TTS-2（完整 checkpoint → 24 kHz 单声道语音）========================
+BREEZE_MODULE_BUCKET = "breeze_module"
+BREEZE_WAVEFORM_BUCKET = "breeze_waveform"
+
+
+def breeze_model_dir(selection: str) -> Path:
+    """解析 transformer/ 下的完整 Breeze checkpoint，并验证格式。"""
+    _kind, resolved = paths.resolve("local", selection, "transformer")
+    directory = Path(resolved)
+    if directory.is_file():
+        directory = directory.parent
+    directory = directory.resolve()
+    config_path = directory / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Breeze-TTS-2 需要完整模型目录，{directory} 缺少 config.json"
+        )
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取 Breeze 配置 {config_path}：{exc}") from exc
+    if config.get("model_type") != "breeze_tts":
+        raise ValueError(
+            f"{directory} 不是 Breeze-TTS-2 checkpoint："
+            f"model_type={config.get('model_type')!r}（应为 'breeze_tts'）"
+        )
+    return directory
+
+
+def breeze_model_cache_key(model_handle) -> str:
+    directory = breeze_model_dir(model_handle.model_path)
+    return runtime.cache_key({"kind": "breeze_model", "directory": str(directory)})
+
+
+def prepare_breeze_model(entry, model_handle, cache):
+    """用 mlx-audio 一次装配主干、文本编码器和 audio tokenizer。"""
+    if entry.family != "breeze_tts2":
+        raise ValueError(f"prepare_breeze_model 收到非 Breeze 大类：{entry.family}")
+    directory = breeze_model_dir(model_handle.model_path)
+    key = breeze_model_cache_key(model_handle)
+
+    def build():
+        try:
+            from mlx_audio.tts.utils import load_model
+        except ImportError as exc:
+            requirements = Path(__file__).resolve().parents[2] / "requirements.txt"
+            raise RuntimeError(
+                "Breeze-TTS-2 需要 mlx-audio==0.5.1；请在 ComfyUI 使用的 Python 环境中运行 "
+                f"pip install -r {requirements}"
+            ) from exc
+        print(f"[Breeze-TTS-2] 从 {directory} 加载完整 checkpoint")
+        return load_model(directory)
+
+    model, _hit = cache.get_or_create(BREEZE_MODULE_BUCKET, key, build)
+    return model
+
+
+def release_breeze_model(model_handle, cache) -> None:
+    key = breeze_model_cache_key(model_handle)
+    if cache.evict(BREEZE_MODULE_BUCKET, key):
+        print("[Breeze-TTS-2] 已释放完整模型（最终波形继续保留供解码）")
+
+
+def breeze_waveform_cache_key(model_handle, params: dict[str, Any]) -> str:
+    """只对规范化音频内容取 digest，绝不把随机临时文件名写入缓存键。"""
+    cache_params = {key: value for key, value in params.items() if key != "reference"}
+    reference = params.get("reference")
+    if reference is not None:
+        _mono, sample_rate, digest = reference
+        cache_params["reference"] = {"sample_rate": sample_rate, "digest": digest}
+    return runtime.cache_key(
+        {"kind": "breeze_waveform", "model": model_handle, "params": cache_params}
+    )
+
+
+def has_breeze_waveform(model_handle, params: dict[str, Any], cache) -> bool:
+    _waveform, hit = cache.get(
+        BREEZE_WAVEFORM_BUCKET, breeze_waveform_cache_key(model_handle, params)
+    )
+    return hit
+
+
+def run_breeze_sampler(entry, model_handle, model, params: dict[str, Any], cache) -> MlxLatentHandle:
+    """生成或复用最终语音波形，并返回现有 latent 工作流可传递的轻量句柄。"""
+    if entry.family != "breeze_tts2":
+        raise ValueError(f"run_breeze_sampler 收到非 Breeze 大类：{entry.family}")
+    breeze.validate_params(params)
+    key = breeze_waveform_cache_key(model_handle, params)
+
+    def sample():
+        if model is None:
+            raise RuntimeError("Breeze waveform 缓存已失效，请重新执行采样器")
+        waveform, sample_rate = breeze.generate_waveform(model, params)
+        if int(sample_rate) <= 0:
+            raise RuntimeError(f"Breeze 返回了无效采样率：{sample_rate}")
+        array = mx.asarray(waveform, dtype=mx.float32).reshape(-1)
+        array = mx.clip(array, -1, 1)
+        mx.eval(array)
+        return array, int(sample_rate)
+
+    cached, _hit = cache.get_or_create(BREEZE_WAVEFORM_BUCKET, key, sample)
+    waveform, sample_rate = cached
+    samples = int(waveform.shape[0])
+    return MlxLatentHandle(
+        kind="breeze_audio",
+        shape=tuple(waveform.shape),
+        dtype=str(waveform.dtype),
+        cache_key=key,
+        model=model_handle.model_type,
+        source="local",
+        path=model_handle.model_path,
+        precision=model_handle.precision,
+        quantize=model_handle.quantize,
+        model_cache_key=breeze_model_cache_key(model_handle),
+        duration=samples / sample_rate,
+        audio_num_rows=samples,
+        sample_rate=sample_rate,
+        prompt_digest=runtime.cache_key(
+            {"text": params["text"], "mode": params["mode"], "speaker": params["speaker"]}
+        ),
+    )
+
+
+def decode_breeze_waveform(latents, batch_index: int) -> MlxPilImage:
+    """最终 waveform → AudioTrack；Breeze 不需要、也不会加载第二个 VAE。"""
+    import numpy as np
+
+    from .h3.video import AudioTrack
+
+    if batch_index not in (-1, 0):
+        print("[Breeze-TTS-2] 一次只有一条语音，batch_index 已按 0 处理")
+    waveform, sample_rate = latents
+    mono = np.ascontiguousarray(np.asarray(waveform, dtype=np.float32).reshape(1, -1))
+    track = AudioTrack(waveform=mono, sample_rate=int(sample_rate))
     return MlxPilImage(images=(), batch_index=-1, audio=track)
 
 

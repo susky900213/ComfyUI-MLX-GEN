@@ -9,6 +9,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from comfyui_mlx_gen.nodes import (  # noqa: E402
+    breeze_sampler,
     clip_loader,
     loader,
     lora,
@@ -20,10 +21,12 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     vae_decode,
     vae_encoder,
     vae_loader,
+    whisper_transcribe,
 )
 
 NODE_CLASS_MAPPINGS = {
     "MlxClipLoader": clip_loader.MlxClipLoader,
+    "MlxBreezeSampler": breeze_sampler.MlxBreezeSampler,
     "MlxTextEncoder": text_encoder.MlxTextEncoder,
     "MlxQwenEditEncoder": qwen_edit.MlxQwenEditEncoder,
     "MlxTransformerLoader": loader.MlxTransformerLoader,
@@ -36,10 +39,12 @@ NODE_CLASS_MAPPINGS = {
     "MlxVAEDecodeRawPIL": vae_decode.MlxVAEDecodeRawPIL,
     "MlxSaveImage": save.MlxSaveImage,
     "MlxPilToTorch": pil_to_torch.MlxPilToTorch,
+    "MlxWhisperTranscribe": whisper_transcribe.MlxWhisperTranscribe,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxClipLoader": "MLX CLIP 加载",
+    "MlxBreezeSampler": "MLX Breeze-TTS-2 采样器",
     "MlxTextEncoder": "MLX 文本编码器",
     "MlxQwenEditEncoder": "MLX Qwen 编辑条件（带参考图）",
     "MlxTransformerLoader": "MLX 模型加载",
@@ -52,6 +57,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxVAEDecodeRawPIL": "MLX VAE 解码（PIL）",
     "MlxSaveImage": "MLX 保存图片",
     "MlxPilToTorch": "MLX PIL → 张量",
+    "MlxWhisperTranscribe": "MLX Whisper 语音转文字",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

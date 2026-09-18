@@ -1,5 +1,9 @@
 # 本地 MLX 推理依赖；Ideogram 4 的 FP8 线性层需要 MLX 0.32。
 mlx>=0.32.0,<0.33.0
 mflux==0.19.1
+# Breeze-TTS-2 的完整本地 MLX runtime（主干、文本编码器与 24 kHz audio tokenizer）。
+mlx-audio==0.5.1
+# ComfyUI AUDIO → 本地 MLX Whisper 逐字转写（为 Breeze voice_clone 生成 ref_text）。
+mlx-whisper==0.4.3
 # YuE2 固定文本 / ABC tokenizer（生成在 ComfyUI 进程内完成，不需要 FastAPI）。
 tiktoken>=0.9
