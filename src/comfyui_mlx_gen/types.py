@@ -32,6 +32,7 @@ condition = "condition"  # 单条提示词 + 编码它所用的组件配置
 vae = "mlx_vae"  # MLX VAE handle（MlxVAELoader → MlxVAEEncoder / MlxVAEDecoder）
 ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 latent + grid ids）
 ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留原尺寸；MlxRefImageSet → MlxVAEEncoder）
+h3_keyframes = "mlx_h3_keyframes"  # H3 首/尾帧条件（图像本体留在缓存，handle 只带摘要与顺序）
 
 
 # --- 纯数据 handle ---
@@ -63,7 +64,8 @@ class MlxClipHandle:
     precision: str  # "bfloat16" | "float16" | "float32"
     max_length: int | None = None
     extra_options: dict[str, Any] = field(default_factory=dict)
-    loras: tuple[LoraRef, ...] = ()  # 只登记，M1 不实际应用（与 MlxModelHandle 一致）
+    # 为旧工作流保留字段；当前 CLIP LoRA 节点会明确拒绝非空 LoRA，避免静默无效。
+    loras: tuple[LoraRef, ...] = ()
     quantize: int | None = None  # None = 不量化（= 图片链路现状）；H3 必须 4 或 8
     cache_key: str = ""
 
@@ -84,6 +86,7 @@ class MlxConditioning:
     clip: MlxClipHandle
     text: str
     encoding_key: str = ""  # 编码数组的缓存键（数组本身留在 cache.py）
+    h3_keyframes: Any = None  # MlxH3Keyframes；仅 MiniMax-H3 的正向图文条件使用
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,24 @@ class MlxVaeHandle:
     # （音频 VAE 放在 vae/MiniMax-H3-audio，也可以放独立的 audio_vae/ 目录）
     role: str = "vae"
     cache_key: str = ""  # 编码器与解码器共用的缓存键
+
+
+@dataclass(frozen=True)
+class MlxH3Keyframes:
+    """MiniMax-H3 的有序首/尾帧条件；图片本体存于 ``h3_keyframe_source`` 缓存桶。
+
+    ``anchors`` 与缓存中的 PIL 元组逐项对应，只能按 ``first``、``last`` 排列。
+    图像已经在节点中按目标画布用 LANCZOS 拉伸，因此 Qwen3-VL presentation 与
+    Video VAE latent 锚点必定看到完全相同的像素。``digest`` 同时覆盖原图内容、
+    锚点位置、目标尺寸和 VAE 配置，供文本及 latent 缓存键防止错误复用。
+    """
+
+    anchors: tuple[str, ...]
+    width: int
+    height: int
+    digest: str
+    cache_key: str
+    vae: MlxVaeHandle
 
 
 @dataclass(frozen=True)

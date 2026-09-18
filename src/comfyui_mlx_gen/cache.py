@@ -27,6 +27,8 @@ _TYPE_CAPS: dict[str, int] = {
     "h3_module": 5,
     # 正 / 负条件各一条（H3 只用正向，但两个 MlxTextEncoder 会各存一条）
     "h3_prompt": 4,
+    # 首帧 / 尾帧经目标画布 LANCZOS 拉伸后的 PIL；当前条件 + 刚替换的一份
+    "h3_keyframe_source": 2,
     # 一次视频生成 = 一条（视频行 + 音频行 + 计划，几 GB 量级，只留最近的一份）
     "h3_latents": 1,
     # --- YuE2（主模型与 VAE 分阶段物化，任一时刻通常只有一条）---

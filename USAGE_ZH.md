@@ -539,11 +539,13 @@ MlxPilToTorch.audio ──────→ PreviewAudio / SaveAudio
 | --- | --- | --- | --- |
 | **MLX 文本编码器** `MlxTextEncoder` | `text`、`clip` | `condition` | 通用文本条件。图片模型通常放两个节点，分别接采样器的 `positive`/`negative`；Qwen Edit 禁止使用本节点。H3 会组装三段式 prompt 并只使用正向语义；YuE2 中正向是 style、负向是 lyrics；Breeze 推荐使用专用采样器，不走本节点。 |
 | **MLX Qwen 编辑条件（带参考图）** `MlxQwenEditEncoder` | `text`、`clip`、原生 `IMAGE` 批次、`max_images`（1–8） | `condition` | 仅用于 `qwen_edit`。正负两个条件节点必须连接同一批参考图；超出 `max_images` 的尾部图片会被截断。它让 Qwen2.5-VL 同时编码文本和图片，不能用普通 `MlxTextEncoder` 替代。 |
-| **MLX 模型 LoRA** `MlxModelLoraApply` | `model`、`lora`、`strength` | 新的 `model` handle | 从 `lora/` 选择文件并把配置附到 Transformer handle；同一 LoRA 不可用不同强度重复登记。 |
-| **MLX CLIP LoRA** `MlxClipLoraApply` | `clip`、`lora`、`strength` | 新的 `CLIP` handle | 把 LoRA 配置附到条件编码器 handle。 |
+| **MLX 模型 LoRA** `MlxModelLoraApply` | `model`、`lora`、`strength` | 新的 `model` handle | 从 `lora/` 选择文件；采样器在基础 Transformer 加载、量化完成后真正应用。支持 Z-Image、FLUX.2、Qwen Image/Edit、Ideogram 4 与 MiniMax-H3；可串联多个节点。 |
+| **MLX CLIP LoRA** `MlxClipLoraApply` | `clip`、`lora`、`strength` | 新的 `CLIP` handle | 为旧工作流保留。当前没有经过验证的文本编码器 mapping；选择非空 LoRA 会明确报错，不会静默忽略。 |
 
-> **LoRA 当前限制：**两个 LoRA 节点目前都只登记路径和强度，推理管线尚未真正读取并融合
-> LoRA 权重，因此连接它们不会改变生成结果。这是功能占位，不是已经可用的 LoRA 实现。
+`strength=0` 严格跳过该文件，等同基础模型；改变强度、顺序或组合会改变 Transformer 缓存键。
+图片模型复用 `mflux==0.19.1` 的官方 mapping，并把低秩分支保留在量化基础 Linear 外层，
+不会为了 LoRA 把整个 q4/q8 模型烘焙成另一种精度。Ideogram 4 的同一 LoRA 会同时应用到
+conditional 与 unconditional 两套 Transformer。
 
 ### 5.3 参考图与采样节点
 
@@ -609,7 +611,7 @@ MlxPilToTorch.audio ──────→ PreviewAudio / SaveAudio
 
 示例图片工作流常常同时连接 `MlxSaveImage` 和原生 `SaveImage`，所以同一结果可能保存两份。
 
-## 7. LoRA 目录与当前限制
+## 7. LoRA 支持
 
 LoRA 文件放到：
 
@@ -624,8 +626,30 @@ lora/my_style.safetensors
 lora/flux/my_character.safetensors
 ```
 
-但是当前 `MlxModelLoraApply` 和 `MlxClipLoraApply` 只把路径和强度写入配置 handle，采样与文本
-编码管线还没有实际加载/融合 LoRA。因此节点能出现在工作流中，但目前不会改变生成结果。
+把 `MlxTransformerLoader.model` 接到一个或多个 `MlxModelLoraApply`，再把最后一个节点的
+`model` 输出接到采样器。基础 Transformer 物化后，插件会按模型家族选择映射并应用权重；
+应用 0 层、目标形状不符、文件缺失或只成功一部分都会报错，不会退回基础模型继续生成。
+
+| 模型大类 | LoRA mapping / 格式 | 状态 |
+| --- | --- | --- |
+| `z_image` | mflux `ZImageLoRAMapping` | 支持普通浮点 LoRA |
+| `flux2` | mflux `Flux2LoRAMapping` | 支持普通浮点 LoRA / LoKr（以 mapping 可识别键为准） |
+| `qwen_image` / `qwen_edit` | mflux `QwenLoRAMapping` | 支持普通浮点 LoRA |
+| `ideogram4` | mflux `Ideogram4LoRAMapping` | 支持；同时应用到条件/无条件 Transformer |
+| `minimax_h3` | 插件内 H3 mapping | 支持 diffusers/LightX2V 拆分键、ComfyUI/ai-toolkit/kohya 原始融合键及 musubi 扁平键 |
+
+MiniMax-H3 还支持 ComfyUI 的 `int8_tensorwise + convrot` LoRA：插件会按文件中的
+`weight_scale` 和 `convrot_groupsize` 解码为 BF16，再拆融合 QKV、交换原始 SwiGLU 的
+`[gate; value]` 行序并应用。DiffSynth-Studio 的 `.default.weight` 融合 QKV 是逐 head 交错
+布局，目前会明确拒绝。对 H3 的 LightX2V Turbo LoRA，请按发布页建议使用 `strength=1.0`
+和对应的 4/8 步采样设置；LoRA 只改变 Transformer，不会自动修改采样器步数。
+
+当前限制：
+
+- `MlxClipLoraApply` 尚不支持；文本编码器 LoRA 需要单独的 CLIP/Qwen/T5 映射；
+- `yue2` 与 `breeze_tts2` 是音频生成 runtime，不接入 Transformer LoRA 节点；
+- 图片家族暂不解码 Comfy `comfy_quant` LoRA；若检测到会报错，不能把 int8 整数当浮点矩阵；
+- 原生 ComfyUI/Torch LoRA 节点仍不能连接本插件的小写 `model` MLX handle。
 
 ## 8. 常见问题
 

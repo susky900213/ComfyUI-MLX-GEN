@@ -24,6 +24,7 @@ from mlx.utils import tree_flatten
 from comfyui_mlx_gen.h3.latent_creator.h3_layout import (
     AUDIO_CHANNELS,
     FPS,
+    KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG,
     MAX_ASPECT_RATIO,
     MAX_DURATION_SECONDS,
@@ -154,9 +155,10 @@ def make_plan(
     )
 
 
-def packed_rows(plan: H3Plan, text_tokens: int = DEFAULT_TEXT_TOKENS) -> int:
+def packed_rows(plan: H3Plan, text_tokens: int = DEFAULT_TEXT_TOKENS, keyframe_count: int = 0) -> int:
     """打包序列的行数（峰值内存跟着它走，而不是单独跟画布或帧数走）。"""
-    return packed_sequence_length(plan.width, plan.height, plan.num_frames, int(text_tokens))
+    condition_rows = int(keyframe_count) * (plan.latent_height // PATCH_SIZE) * (plan.latent_width // PATCH_SIZE)
+    return packed_sequence_length(plan.width, plan.height, plan.num_frames, int(text_tokens)) + condition_rows
 
 
 def estimate_peak_bytes(
@@ -164,9 +166,14 @@ def estimate_peak_bytes(
     resident_bytes: int,
     text_tokens: int = DEFAULT_TEXT_TOKENS,
     cache_bytes: int = 0,
+    keyframe_count: int = 0,
 ) -> int:
     """预期峰值足迹 = 已物化组件 + MLX 缓存 + 每行标定值 × 行数。"""
-    return int(resident_bytes + cache_bytes + PEAK_BYTES_PER_PACKED_ROW * packed_rows(plan, text_tokens))
+    return int(
+        resident_bytes
+        + cache_bytes
+        + PEAK_BYTES_PER_PACKED_ROW * packed_rows(plan, text_tokens, keyframe_count)
+    )
 
 
 def preflight(
@@ -175,12 +182,13 @@ def preflight(
     physical_bytes: int,
     text_tokens: int = DEFAULT_TEXT_TOKENS,
     cache_bytes: int = 0,
+    keyframe_count: int = 0,
     log: Callable[[str], None] | None = print,
 ) -> None:
     """峰值放不下就拒绝，接近上限就警告（不改用户的请求，只把四个缩档说清楚）。"""
     if physical_bytes <= 0:
         return
-    expected = estimate_peak_bytes(plan, resident_bytes, text_tokens, cache_bytes)
+    expected = estimate_peak_bytes(plan, resident_bytes, text_tokens, cache_bytes, keyframe_count)
     gib = 1024**3
     lever = (
         "请缩时长（帧数最小 124）、换小画布（如 640×352）、降量化档位（q4），"
@@ -196,8 +204,14 @@ def preflight(
         log(f"⚠️ MiniMax-H3：{shape}，已经很接近上限（可能被系统在采样中途 kill）。{lever}")
 
 
-def build_layout(tags: np.ndarray, plan: H3Plan, patch_size: tuple[int, int, int], audio_channels: int = AUDIO_CHANNELS):
-    """把提示词的逐 token 标签 + 计划几何拼成一条打包序列（纯文生视频没有关键帧条件行）。"""
+def build_layout(
+    tags: np.ndarray,
+    plan: H3Plan,
+    patch_size: tuple[int, int, int],
+    audio_channels: int = AUDIO_CHANNELS,
+    keyframe_anchors: tuple[str, ...] = (),
+):
+    """把提示词标签、关键帧条件行及目标音视频行拼成一条序列。"""
     return build_packed_sequence(
         tags,
         plan.num_latent_frames,
@@ -206,7 +220,35 @@ def build_layout(tags: np.ndarray, plan: H3Plan, patch_size: tuple[int, int, int
         plan.num_audio_latents,
         patch_size=patch_size,
         audio_channels=audio_channels,
+        keyframe_anchors=keyframe_anchors,
     )
+
+
+def encode_keyframe_latents(keyframes: tuple[Any, ...], vae: Any) -> tuple[mx.array, ...]:
+    """将画布适配后的 PIL 关键帧编码成归一化的单帧 Video VAE latent。
+
+    每张图都复现官方单关键帧路径：ImageNet 归一化、posterior 用固定 seed 42
+    采样、经 float16 舍入后再按 VAE 的 mean/std 归一化。结果不进入长期缓存。
+    """
+    encoded: list[mx.array] = []
+    for frame in keyframes:
+        pixels = np.asarray(frame, dtype=np.float32) / 255.0
+        pixels = (pixels - np.array(PIXEL_MEAN, dtype=np.float32)) / np.array(PIXEL_STD, dtype=np.float32)
+        tensor = mx.array(pixels.transpose(2, 0, 1))[None, :, None]
+        mean, logvar = vae.encode(tensor.astype(component_dtype(vae)))
+        mean, logvar = mean.astype(mx.float32), logvar.astype(mx.float32)
+        noise = mx.random.normal(
+            mean.shape,
+            key=mx.random.key(KEYFRAME_ENCODE_SEED),
+            dtype=mx.float32,
+        )
+        latents = (mean + mx.exp(0.5 * logvar) * noise).astype(mx.float16).astype(mx.float32)
+        latents = (latents - vae.latents_mean.reshape(1, -1, 1, 1, 1)) / vae.latents_std.reshape(
+            1, -1, 1, 1, 1
+        )
+        mx.eval(latents)
+        encoded.append(latents)
+    return tuple(encoded)
 
 
 def sample(
@@ -215,29 +257,54 @@ def sample(
     tags: np.ndarray,
     plan: H3Plan,
     seed: int,
+    keyframe_latents: tuple[mx.array, ...] = (),
+    keyframe_anchors: tuple[str, ...] = (),
     log: Callable[[str], None] | None = print,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[mx.array, mx.array, Any]:
     """联合去噪：返回 `(video_rows, audio_rows, layout)`（都是未反归一化的 latent 行）。"""
-    layout = build_layout(tags, plan, tuple(transformer.patch_size))
+    if len(keyframe_latents) != len(keyframe_anchors):
+        raise ValueError(
+            "H3 关键帧 latent 与锚点数量不一致："
+            f"{len(keyframe_latents)} != {len(keyframe_anchors)}"
+        )
+    layout = build_layout(
+        tags,
+        plan,
+        tuple(transformer.patch_size),
+        keyframe_anchors=keyframe_anchors,
+    )
     video_scheduler = MiniMaxH3Scheduler(shift=plan.video_shift)
     audio_scheduler = MiniMaxH3Scheduler(shift=plan.audio_shift)
     video_scheduler.set_timesteps(plan.grid_points)
     audio_scheduler.set_timesteps(plan.grid_points)
 
-    # 抽噪顺序与参考实现一致：视频在前、音频在后（同一条 seed 下结果才可比）
-    keys = mx.random.split(mx.random.key(int(seed)), 2)
+    # 抽噪顺序与参考实现一致：整组条件增强噪声在前，随后是目标视频、目标音频。
+    keys = mx.random.split(mx.random.key(int(seed)), len(keyframe_latents) + 2)
+    key_video, key_audio = keys[-2], keys[-1]
     video_rows = patchify_video_latents(
         mx.random.normal(
             (1, transformer.in_channels, plan.num_latent_frames, plan.latent_height, plan.latent_width),
-            key=keys[0],
+            key=key_video,
             dtype=mx.float32,
         ),
         tuple(transformer.patch_size),
     )
+    if keyframe_latents:
+        condition_rows = []
+        for condition, key in zip(keyframe_latents, keys[:-2], strict=True):
+            expected = (1, int(transformer.in_channels), 1, plan.latent_height, plan.latent_width)
+            if tuple(condition.shape) != expected:
+                raise ValueError(
+                    f"H3 关键帧 latent 形状应为 {expected}，收到 {tuple(condition.shape)}"
+                )
+            condition_noise = mx.random.normal(condition.shape, key=key, dtype=mx.float32)
+            noised = video_scheduler.scale_noise(condition, KEYFRAME_NOISE_AUG, condition_noise)
+            condition_rows.append(patchify_video_latents(noised, tuple(transformer.patch_size)))
+        video_rows = mx.concatenate([*condition_rows, video_rows], axis=0)
     audio_rows = mx.random.normal(
         (plan.num_audio_latents * AUDIO_CHANNELS, transformer.audio_in_channels),
-        key=keys[1],
+        key=key_audio,
         dtype=mx.float32,
     )
 
@@ -276,7 +343,9 @@ def sample(
             on_progress(step + 1, total)
         if log:
             log(f"[H3 采样] step {step + 1}/{total} t={float(video_t):.3f}")
-    return video_rows, audio_rows, layout
+    # 条件行只服务于 transformer 上下文，不能进入最终 latent：decode_video() 会严格按
+    # plan.num_latent_frames 反打包目标行。纯 T2V 时两个 offset 都是 0，行为保持不变。
+    return video_rows[condition_video_rows:], audio_rows[condition_audio_rows:], layout
 
 
 def component_dtype(module: Any) -> mx.Dtype:

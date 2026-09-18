@@ -1,0 +1,721 @@
+{
+  "id": "mlx-minimax-h3-i2va-last-frame",
+  "revision": 0,
+  "last_node_id": 12,
+  "last_link_id": 13,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [
+        0,
+        -120
+      ],
+      "size": [
+        380,
+        260
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxClipLoader"
+      },
+      "title": "H3 条件编码器 + tokenizer（q8，编码完即释放）",
+      "widgets_values": [
+        "minimax_h3",
+        "text_encoder",
+        "MiniMax-H3",
+        "bfloat16",
+        8192,
+        8
+      ]
+    },
+    {
+      "id": 2,
+      "type": "MlxTextEncoder",
+      "pos": [
+        1280,
+        120
+      ],
+      "size": [
+        420,
+        360
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1,
+          "slot_index": 0
+        },
+        {
+          "name": "h3_keyframes",
+          "type": "mlx_h3_keyframes",
+          "link": 13,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "condition",
+          "type": "condition",
+          "links": [
+            2,
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxTextEncoder"
+      },
+      "title": "H3 提示词 + 尾帧条件视频视觉条件",
+      "widgets_values": [
+        "integrated_multimodal_description: 视频共包含 1 个镜头，这是一段自然观察类短片，记录清晨湖面上一只白鹭捕鱼的瞬间。画面采用自然光、低饱和冷色调，长焦镜头从远处缓慢推近：主体是一只通体白色、喙细长的成年白鹭，独立于浅水区的灰黑色礁石上；背景是晨雾中淡青色的远山与缓慢流动的江水，水面反射柔和的银色天光。白鹭先是侧身静立，随后微微俯身、猛地探出长喙，把一条银白色小鱼甩出水面，鱼在逆光里闪了一下，白鹭仰头吞下鱼，重新立正并抖了抖羽毛。整体节奏安静，镜头缓慢推进并带轻微手持呼吸感。\n\noverall_soundscape: 清晨户外环境音：轻柔的风声、远处零星鸟鸣、缓慢流动的江水与浪花轻拍礁石的水声；白鹭捕鱼的瞬间有短促的水花溅起声与翅膀扑动声。\n\nnon_diegetic_music: 极简的钢琴与弦乐，节奏舒缓、音量克制，不喧宾夺主。"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MlxTransformerLoader",
+      "pos": [
+        0,
+        180
+      ],
+      "size": [
+        380,
+        240
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxTransformerLoader"
+      },
+      "title": "H3 transformer（27B，q8；compile 会被 H3 强制关掉）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3",
+        8,
+        "bfloat16",
+        false,
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MlxVAELoader",
+      "pos": [
+        0,
+        540
+      ],
+      "size": [
+        380,
+        220
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAELoader"
+      },
+      "title": "H3 音频 VAE（role=audio_vae）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3",
+        "bfloat16",
+        8,
+        "audio_vae"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "MlxKSamplerMLX",
+      "pos": [
+        1760,
+        120
+      ],
+      "size": [
+        400,
+        460
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "link": 4,
+          "slot_index": 0
+        },
+        {
+          "name": "positive",
+          "type": "condition",
+          "link": 2,
+          "slot_index": 1
+        },
+        {
+          "name": "negative",
+          "type": "condition",
+          "link": 3,
+          "slot_index": 2
+        },
+        {
+          "name": "ref_images",
+          "type": "mlx_ref_images",
+          "link": null,
+          "slot_index": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latents",
+          "type": "latents",
+          "links": [
+            6
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxKSamplerMLX"
+      },
+      "title": "H3 尾帧条件视频 + 立体声采样（640×352 / 124 帧 / 50 步）",
+      "widgets_values": [
+        20260917,
+        50,
+        640,
+        352,
+        1,
+        1.0,
+        "flow_match_euler_discrete",
+        124,
+        12.0,
+        3.0,
+        "auto"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "MlxVAEDecodeRawPIL",
+      "pos": [
+        2220,
+        120
+      ],
+      "size": [
+        400,
+        260
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "latents",
+          "type": "latents",
+          "link": 6,
+          "slot_index": 0
+        },
+        {
+          "name": "audio_vae",
+          "type": "mlx_vae",
+          "link": 5,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "links": [
+            7
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAEDecodeRawPIL"
+      },
+      "title": "H3 解码（视频 VAE 由 widget 现取；音轨靠接进来的 audio_vae）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3",
+        "bfloat16",
+        8,
+        -1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "MlxPilToTorch",
+      "pos": [
+        2680,
+        120
+      ],
+      "size": [
+        340,
+        200
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "link": 7,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            8
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "masks",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            9
+          ],
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxPilToTorch"
+      },
+      "title": "PIL → IMAGE / MASK / AUDIO",
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "CreateVideo",
+      "pos": [
+        3080,
+        120
+      ],
+      "size": [
+        320,
+        200
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 8,
+          "slot_index": 0
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 9,
+          "slot_index": 1
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "widget": {
+            "name": "bit_depth"
+          },
+          "link": null
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "widget": {
+            "name": "color_space"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            10
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "title": "帧 + 音轨 → VIDEO（H3 是 24 fps）",
+      "widgets_values": [
+        24,
+        8,
+        "sRGB"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "SaveVideo",
+      "pos": [
+        3460,
+        120
+      ],
+      "size": [
+        340,
+        300
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 10,
+          "slot_index": 0
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "title": "存成 mp4（尾帧条件视频 + 立体声）",
+      "widgets_values": [
+        "video/MiniMax-H3-last",
+        "mp4"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "MlxVAELoader",
+      "pos": [
+        0,
+        840
+      ],
+      "size": [
+        380,
+        220
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "links": [
+            11
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAELoader"
+      },
+      "title": "H3 视频 VAE（关键帧编码，role=vae）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3",
+        "bfloat16",
+        8,
+        "vae"
+      ]
+    },
+    {
+      "id": 11,
+      "type": "LoadImage",
+      "pos": [
+        440,
+        -80
+      ],
+      "size": [
+        320,
+        340
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            12
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "H3 尾帧（将拉伸到 640×352）",
+      "widgets_values": [
+        "h3_last_frame.png"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "MlxH3KeyframeCondition",
+      "pos": [
+        820,
+        120
+      ],
+      "size": [
+        400,
+        300
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "link": 11,
+          "slot_index": 0
+        },
+        {
+          "name": "first_frame",
+          "type": "IMAGE",
+          "link": null,
+          "slot_index": 1
+        },
+        {
+          "name": "last_frame",
+          "type": "IMAGE",
+          "link": 12,
+          "slot_index": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "keyframes",
+          "type": "mlx_h3_keyframes",
+          "links": [
+            13
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxH3KeyframeCondition"
+      },
+      "title": "H3 尾帧条件视频（LANCZOS 适配目标画布）",
+      "widgets_values": [
+        640,
+        352
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      2,
+      0,
+      5,
+      1,
+      "condition"
+    ],
+    [
+      3,
+      2,
+      0,
+      5,
+      2,
+      "condition"
+    ],
+    [
+      4,
+      3,
+      0,
+      5,
+      0,
+      "model"
+    ],
+    [
+      5,
+      4,
+      0,
+      6,
+      1,
+      "mlx_vae"
+    ],
+    [
+      6,
+      5,
+      0,
+      6,
+      0,
+      "latents"
+    ],
+    [
+      7,
+      6,
+      0,
+      7,
+      0,
+      "images"
+    ],
+    [
+      8,
+      7,
+      0,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      9,
+      7,
+      2,
+      8,
+      1,
+      "AUDIO"
+    ],
+    [
+      10,
+      8,
+      0,
+      9,
+      0,
+      "VIDEO"
+    ],
+    [
+      11,
+      10,
+      0,
+      12,
+      0,
+      "mlx_vae"
+    ],
+    [
+      12,
+      11,
+      0,
+      12,
+      2,
+      "IMAGE"
+    ],
+    [
+      13,
+      12,
+      0,
+      2,
+      1,
+      "mlx_h3_keyframes"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4,
+  "extra_workflow": {
+    "title": "MiniMax-H3 尾帧条件视频 + 立体声"
+  }
+}

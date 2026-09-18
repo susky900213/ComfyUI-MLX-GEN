@@ -176,6 +176,29 @@ class MlxKSamplerMLX:
                     f"[MlxKSamplerMLX] {entry.family} 不看 scheduler / guidance / 负向条件"
                     "（guidance 蒸馏模型，每步一次前向），已忽略这三项"
                 )
+            keyframes = positive.h3_keyframes
+            if keyframes is not None:
+                if (
+                    keyframes.vae.model_type != model.model_type
+                    or keyframes.vae.role != "vae"
+                ):
+                    raise ValueError(
+                        "H3 关键帧必须由当前模型大类的视频 VAE（role=vae）编码："
+                        f"关键帧是 model_type={keyframes.vae.model_type!r}, "
+                        f"role={keyframes.vae.role!r}，采样器是 {model.model_type!r}"
+                    )
+                if keyframes.width != int(width) or keyframes.height != int(height):
+                    raise ValueError(
+                        "H3 关键帧目标画布必须与采样器一致："
+                        f"关键帧是 {keyframes.width}×{keyframes.height}，"
+                        f"采样器是 {int(width)}×{int(height)}"
+                    )
+            expected_key = pipeline.h3_prompt_encoding_key(positive.clip, positive.text, keyframes)
+            if positive.encoding_key != expected_key:
+                raise RuntimeError(
+                    "H3 关键帧与 Qwen3-VL presentation 编码不匹配；"
+                    "请重新运行当前连线下的「MLX 文本编码器」节点"
+                )
             params = {
                 "seed": int(seed),
                 "steps": int(steps),
@@ -186,12 +209,26 @@ class MlxKSamplerMLX:
                 "audio_shift": float(audio_shift),
                 "positive_encoding_key": positive.encoding_key,
                 "prompt_digest": positive.text,
+                "keyframe_digest": keyframes.digest if keyframes is not None else "",
+                "keyframe_anchors": keyframes.anchors if keyframes is not None else (),
             }
-            comps = pipeline.prepare_h3_sampler_components(entry, model, CACHE)
-            handle = pipeline.run_h3_sampler(entry, model, comps, params, CACHE)
-            # 潜变量已进 h3_latents 桶：transformer（q8 约 35 GB）用完就丢，
-            # 别和解码要用的 VAE 一起占着（换 seed / 步数重跑时会重新懒加载）
-            pipeline.release_h3_sampler_components(entry, model, CACHE)
+            # 相同 latent 仍在缓存时，不能为重建同一 handle 再加载 5 GB VAE 或 35 GB transformer。
+            if pipeline.has_h3_latents(model, params, CACHE):
+                return (pipeline.run_h3_sampler(entry, model, None, params, CACHE),)
+            keyframe_latents = pipeline.encode_h3_keyframes(keyframes, CACHE) if keyframes is not None else ()
+            try:
+                comps = pipeline.prepare_h3_sampler_components(entry, model, CACHE)
+                handle = pipeline.run_h3_sampler(
+                    entry,
+                    model,
+                    comps,
+                    params,
+                    CACHE,
+                    keyframe_latents=keyframe_latents,
+                )
+            finally:
+                # 潜变量已进 h3_latents 桶：transformer（q8 约 35 GB）用完或异常都释放。
+                pipeline.release_h3_sampler_components(entry, model, CACHE)
             return (handle,)
 
         # YuE2：正向文本 = style，负向文本 = lyrics（空 lyrics = 纯音乐）。模型内部

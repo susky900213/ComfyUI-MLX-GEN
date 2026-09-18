@@ -20,6 +20,8 @@ from ..types import (
     entry_for,
     MlxClipHandle,
     MlxConditioning,
+    MlxH3Keyframes,
+    h3_keyframes as h3_keyframes_type,
 )
 
 
@@ -33,14 +35,15 @@ class MlxTextEncoder:
                     {"default": "a red cube", "multiline": True, "dynamicPrompts": True},
                 ),
                 "clip": (CLIP, {}),
-            }
+            },
+            "optional": {"h3_keyframes": (h3_keyframes_type, {})},
         }
 
     RETURN_TYPES = (condition,)
     FUNCTION = "encode"
     CATEGORY = "MLX/Gen"
 
-    def encode(self, text, clip):
+    def encode(self, text, clip, h3_keyframes=None):
         if clip is None:
             raise ValueError("必须先连接 MlxClipLoader 的输出")
         if not isinstance(clip, MlxClipHandle):
@@ -52,6 +55,10 @@ class MlxTextEncoder:
         entry = entry_for(clip.model_type)
         if not entry.supported:
             raise NotImplementedError(f"{clip.model_type} 尚未实现：{entry.notes}")
+        if h3_keyframes is not None and not isinstance(h3_keyframes, MlxH3Keyframes):
+            raise ValueError("h3_keyframes 必须连接「MLX H3 关键帧条件」的输出")
+        if h3_keyframes is not None and entry.family != "minimax_h3":
+            raise ValueError(f"h3_keyframes 只支持 minimax_h3，当前条件大类是 {entry.family}")
         if entry.family == "qwen_edit":
             raise ValueError(
                 "Qwen-Image-Edit 的条件必须带参考图，请用「MLX Qwen 编辑条件」"
@@ -90,19 +97,36 @@ class MlxTextEncoder:
                     f"quantize 改成 8 或 4；当前是 {clip.quantize}）"
                 )
             composed = pipeline.compose_h3_prompt(prompt)
-            comps = pipeline.prepare_h3_encoder(
-                entry, clip, CACHE, runtime.cache_key({"kind": "module", "clip": clip})
-            )
-            encoding_key = pipeline.h3_prompt_encoding_key(clip, composed)
-            embeds, tags = pipeline.encode_h3_prompt(entry, comps, composed, CACHE, encoding_key)
+            if h3_keyframes is not None and (
+                h3_keyframes.vae.model_type != clip.model_type
+                or h3_keyframes.vae.role != "vae"
+            ):
+                raise ValueError(
+                    "H3 关键帧必须使用当前文本条件大类的视频 VAE（role=vae）："
+                    f"关键帧是 model_type={h3_keyframes.vae.model_type!r}, "
+                    f"role={h3_keyframes.vae.role!r}，文本条件是 {clip.model_type!r}"
+                )
+            encoding_key = pipeline.h3_prompt_encoding_key(clip, composed, h3_keyframes)
+            try:
+                comps = pipeline.prepare_h3_encoder(
+                    entry, clip, CACHE, runtime.cache_key({"kind": "module", "clip": clip})
+                )
+                embeds, tags = pipeline.encode_h3_prompt(
+                    entry, comps, composed, CACHE, encoding_key, h3_keyframes
+                )
+            finally:
+                # 条件编码器约 30 GB；成功或异常都必须立即释放。
+                pipeline.release_h3_encoder(entry, clip, CACHE)
             print(
                 f"[MlxTextEncoder] {entry.family}: {int(tags.shape[0])} 个 token，"
                 f"条件张量 {tuple(embeds.shape)} {embeds.dtype}"
             )
-            # 编码结果已进 h3_prompt 桶（采样器只按键取张量）：条件编码器约 30 GB，
-            # 用完立刻丢掉，别占着到采样阶段（换提示词重跑时会重新懒加载）
-            pipeline.release_h3_encoder(entry, clip, CACHE)
-            cond = MlxConditioning(clip=clip, text=composed, encoding_key=encoding_key)
+            cond = MlxConditioning(
+                clip=clip,
+                text=composed,
+                encoding_key=encoding_key,
+                h3_keyframes=h3_keyframes,
+            )
             return (cond,)
 
         # 1) 按需创建 text_encoder + tokenizer（同一 handle 第二次执行直接命中缓存）

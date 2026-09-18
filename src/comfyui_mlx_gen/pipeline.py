@@ -43,11 +43,11 @@ from typing import Any, Sequence
 
 import mlx.core as mx
 
-from . import breeze, components, image, paths, runtime, weights
+from . import breeze, components, image, paths, runtime, transformer_lora, weights
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.weights import loader as h3_loader
 from .progress import SamplingProgress
-from .types import MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
+from .types import MlxH3Keyframes, MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
 from .yue2 import pipeline as yue2_pipeline
 from .yue2.model import load_model as load_yue2_model
 from .yue2.vae import load_vae as load_yue2_vae
@@ -284,6 +284,12 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
             path,
             model_handle.quantize or None,
             class_kwargs=component_class_kwargs(entry, role, path, model_config),
+        )
+        transformer_lora.apply_transformer_loras(
+            entry.family,
+            instance,
+            model_handle.loras,
+            role=role,
         )
         return instance
 
@@ -1876,10 +1882,11 @@ def prepare_h3_components(
     selections: dict[str, str],
     quantize: int | None = None,
     precision: str = "bfloat16",
+    loras=(),
 ) -> dict[str, Any]:
-    """只装 roles 里列出的组件；同一「role + 目录 + 精度 + 量化档位」复用同一份。
+    """只装 roles 里列出的组件；同一「role + 目录 + 精度 + 量化档位 + LoRA」复用同一份。
 
-    每个 role 单独一条缓存（都在 h3_module 桶里，上限 4）：MlxTextEncoder 只要
+    每个 role 单独一条缓存（都在 h3_module 桶里，上限 5）：MlxTextEncoder 只要
     text_encoder + tokenizer，MlxKSamplerMLX 只要 transformer，解码节点要 VAE。
     """
 
@@ -1894,6 +1901,13 @@ def prepare_h3_components(
         if kind == "missing":
             raise FileNotFoundError(f"未找到 {role} 权重：{path}")
         comp = h3_loader.load(role, kind, path, quantize, precision)
+        if role == "transformer":
+            transformer_lora.apply_transformer_loras(
+                entry.family,
+                comp.module,
+                loras,
+                role=role,
+            )
         bits = f"q{comp.bits}" if comp.bits else "不量化"
         print(
             f"[H3 组件] {role}: 常驻参数约 {comp.parameter_bytes() / 1e9:.1f} GB"
@@ -1908,7 +1922,14 @@ def prepare_h3_components(
         if role == "audio_vae" and kind == "missing":
             # 音频 VAE 既可以放 audio_vae/，也可以继续放 vae/（本仓库的软链就在 vae/）
             kind, resolved = paths.resolve("local", selection, "vae")
-        key = h3_component_cache_key(entry, role, resolved, quantize, precision)
+        key = h3_component_cache_key(
+            entry,
+            role,
+            resolved,
+            quantize,
+            precision,
+            loras if role == "transformer" else (),
+        )
         comps[role], _hit = cache.get_or_create(
             H3_MODULE_BUCKET, key, lambda role=role, kind=kind, path=resolved: build(role, kind, path)
         )
@@ -1937,6 +1958,7 @@ def prepare_h3_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
         {"transformer": model_handle.model_path},
         quantize=int(model_handle.quantize) or None,
         precision=model_handle.precision,
+        loras=model_handle.loras,
     )
 
 
@@ -1964,7 +1986,7 @@ def h3_component_dir(entry, role: str, selection: str) -> str:
     return path
 
 
-def h3_component_cache_key(entry, role: str, path: str, quantize, precision) -> str:
+def h3_component_cache_key(entry, role: str, path: str, quantize, precision, loras=()) -> str:
     """组件在 h3_module 桶里的键：prepare / release 两边共用，保证键完全对得上。"""
     return runtime.cache_key(
         {
@@ -1973,6 +1995,7 @@ def h3_component_cache_key(entry, role: str, path: str, quantize, precision) -> 
             "path": path,
             "quantize": quantize,
             "precision": precision,
+            "loras": loras if role == "transformer" else (),
         }
     )
 
@@ -1984,6 +2007,7 @@ def release_h3_components(
     selections: dict[str, str],
     quantize: int | None = None,
     precision: str = "bfloat16",
+    loras=(),
 ) -> None:
     """「用完即释放」：把这一段刚用过的组件从 h3_module 桶里丢掉，下次需要时再懒加载。
 
@@ -1992,7 +2016,14 @@ def release_h3_components(
     """
     for role in roles:
         path = h3_component_dir(entry, role, selections.get(role, ""))
-        key = h3_component_cache_key(entry, role, path, quantize, precision)
+        key = h3_component_cache_key(
+            entry,
+            role,
+            path,
+            quantize,
+            precision,
+            loras if role == "transformer" else (),
+        )
         if cache.evict(H3_MODULE_BUCKET, key):
             print(f"[H3 组件] 已释放 {role}（下次需要时重新懒加载）")
 
@@ -2018,6 +2049,7 @@ def release_h3_sampler_components(entry, model_handle, cache) -> None:
         {"transformer": model_handle.model_path},
         quantize=int(model_handle.quantize) or None,
         precision=model_handle.precision,
+        loras=model_handle.loras,
     )
 
 
@@ -2040,19 +2072,38 @@ def compose_h3_prompt(text: str) -> str:
     return h3_prompt.compose_prompt(text)
 
 
-def h3_prompt_encoding_key(clip, prompt: str) -> str:
+def h3_prompt_encoding_key(clip, prompt: str, keyframes: MlxH3Keyframes | None = None) -> str:
     """H3 条件的编码键（换大类 / 换目录 / 换精度 / 换量化 / 换文本都会换键）。"""
-    return runtime.cache_key({"kind": "h3_prompt", "clip": clip, "text": prompt})
+    return runtime.cache_key(
+        {
+            "kind": "h3_prompt",
+            "clip": clip,
+            "text": prompt,
+            "keyframes": keyframes.digest if keyframes is not None else "",
+        }
+    )
 
 
-def encode_h3_prompt(entry, comps, prompt: str, cache, cache_key: str) -> tuple[Any, Any]:
+def encode_h3_prompt(
+    entry,
+    comps,
+    prompt: str,
+    cache,
+    cache_key: str,
+    keyframes: MlxH3Keyframes | None = None,
+) -> tuple[Any, Any]:
     """编码 presentation → `(embeds (1,L,hidden), tags (L,) int32)`（存进缓存）。"""
 
     def build() -> tuple[Any, Any]:
+        images = None
+        if keyframes is not None:
+            images, hit = cache.get("h3_keyframe_source", keyframes.cache_key)
+            if not hit or images is None:
+                raise RuntimeError("H3 关键帧图像缓存已失效，请重新运行「MLX H3 关键帧条件」节点")
         encode = runtime.import_object(entry.prompt_encoder)
         # comps 里是 LoadedH3Component（模块 + 量化档位 + 生效精度），而
         # encode_presentation 要的是里面那个 nn.Module（它调 text_encoder.encode(...)）
-        return encode(comps["text_encoder"].module, comps["tokenizer"], prompt)
+        return encode(comps["text_encoder"].module, comps["tokenizer"], prompt, images or ())
 
     return cache.get_or_create(H3_PROMPT_BUCKET, cache_key, build)[0]
 
@@ -2087,7 +2138,36 @@ def h3_latent_cache_key(params: dict[str, Any], model_handle) -> str:
     return runtime.cache_key({"kind": "h3_latents", "params": params, "model": model_handle})
 
 
-def run_h3_sampler(entry, model_handle, comps, params: dict[str, Any], cache) -> MlxLatentHandle:
+def has_h3_latents(model_handle, params: dict[str, Any], cache) -> bool:
+    """在加载 Video VAE / transformer 前探测相同 H3 latent 是否仍在缓存。"""
+    _latents, hit = cache.get(H3_LATENT_BUCKET, h3_latent_cache_key(params, model_handle))
+    return bool(hit)
+
+
+def encode_h3_keyframes(keyframes: MlxH3Keyframes, cache) -> tuple[Any, ...]:
+    """临时物化 Video VAE 编码关键帧；无论成功失败都立即释放 VAE。"""
+    images, hit = cache.get("h3_keyframe_source", keyframes.cache_key)
+    if not hit or images is None:
+        raise RuntimeError("H3 关键帧图像缓存已失效，请重新运行「MLX H3 关键帧条件」节点")
+    if len(images) != len(keyframes.anchors):
+        raise RuntimeError(
+            "H3 关键帧缓存与 handle 数量不一致，请重新运行「MLX H3 关键帧条件」节点"
+        )
+    try:
+        vae = prepare_h3_vae(keyframes.vae, cache)
+        return h3_pipeline.encode_keyframe_latents(tuple(images), vae)
+    finally:
+        release_h3_vae(keyframes.vae, cache)
+
+
+def run_h3_sampler(
+    entry,
+    model_handle,
+    comps,
+    params: dict[str, Any],
+    cache,
+    keyframe_latents: tuple[Any, ...] = (),
+) -> MlxLatentHandle:
     """规划 → 内存预检 → 联合去噪 → 把 `(视频行, 音频行, 计划)` 存进 h3_latents 桶。"""
     plan = h3_pipeline.make_plan(
         int(params["width"]),
@@ -2111,6 +2191,7 @@ def run_h3_sampler(entry, model_handle, comps, params: dict[str, Any], cache) ->
             int(runtime.system_total_memory()),
             text_tokens=int(tags.shape[0]),
             cache_bytes=_mlx_memory_bytes(),
+            keyframe_count=len(params.get("keyframe_anchors", ())),
             log=print,
         )
         video_rows, audio_rows, _layout = h3_pipeline.sample(
@@ -2119,6 +2200,8 @@ def run_h3_sampler(entry, model_handle, comps, params: dict[str, Any], cache) ->
             tags,
             plan,
             int(params["seed"]),
+            keyframe_latents=keyframe_latents,
+            keyframe_anchors=tuple(params.get("keyframe_anchors", ())),
             log=print,
             on_progress=progress.update_absolute,
         )

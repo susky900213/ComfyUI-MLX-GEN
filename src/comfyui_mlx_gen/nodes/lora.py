@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from .. import paths
+from ..transformer_lora import supported_families
 from ..types import CLIP, LoraRef, MlxClipHandle, MlxModelHandle
 
 NO_LORA = "<无 LoRA>"
@@ -20,6 +21,8 @@ def _add(model, path: str, strength: float):
                     f"同一 LoRA 出现两次且强度不同: {path}（{item.strength} 与 {strength}）"
                 )
             return model  # 相同值 → 直接复用
+    if float(strength) == 0.0:
+        return model  # 首次登记 0 强度严格等同基础 handle（缓存键也不变）
     loras.append(LoraRef(path, strength))
     return replace(model, loras=tuple(loras))
 
@@ -44,11 +47,16 @@ class MlxModelLoraApply:
             raise ValueError("必须先连接 MlxTransformerLoader 的输出")
         if lora == NO_LORA:
             return (model,)
+        if model.model_type not in supported_families():
+            raise ValueError(
+                f"{model.model_type} 当前不支持 Transformer LoRA；"
+                f"支持的模型大类：{', '.join(supported_families())}"
+            )
         return (_add(model, lora, strength),)
 
 
 class MlxClipLoraApply:
-    """给 CLIP model 挂 LoRA（M1 只登记，不实际应用；与 MlxModelLoraApply 一致）。"""
+    """保留旧工作流节点；当前没有经过验证的文本编码器 LoRA mapping。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -70,4 +78,8 @@ class MlxClipLoraApply:
             raise ValueError("必须先连接 MlxClipLoader 的输出")
         if lora == NO_LORA:
             return (clip,)
-        return (_add(clip, lora, strength),)
+        raise NotImplementedError(
+            "MLX CLIP LoRA 尚不支持：mflux 0.19.1 的现有 mapping 只覆盖扩散/视频 "
+            "Transformer。请把 LoRA 接到「MLX 模型 LoRA」节点；包含文本编码器权重的 "
+            "LoRA 需要单独的 CLIP/Qwen/T5 映射，插件不会再静默登记后忽略。"
+        )

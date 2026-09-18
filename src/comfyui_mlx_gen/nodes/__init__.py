@@ -3,6 +3,7 @@
 from .breeze_sampler import MlxBreezeSampler
 from .clip_loader import MlxClipLoader
 from .loader import MlxTransformerLoader
+from .h3_keyframes import MlxH3KeyframeCondition
 from .lora import MlxClipLoraApply, MlxModelLoraApply
 from .text_encoder import MlxTextEncoder
 from .qwen_edit import MlxQwenEditEncoder
@@ -18,6 +19,7 @@ from .whisper_transcribe import MlxWhisperTranscribe
 __all__ = [
     "MlxBreezeSampler",
     "MlxClipLoader",
+    "MlxH3KeyframeCondition",
     "MlxTextEncoder",
     "MlxQwenEditEncoder",
     "MlxRefImageSet",

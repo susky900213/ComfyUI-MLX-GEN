@@ -376,6 +376,24 @@ python -m pip show mlx mflux
 最后一条应显示 `mlx 0.32.x` 与 `mflux 0.19.1`，且 `python -m pip show mlx-gen`
 应显示未安装。请务必在 **ComfyUI 实际使用的 Python 环境**中执行这些命令。
 
+## Transformer LoRA
+
+`MlxModelLoraApply` 已接入真实推理链路。LoRA 文件放在
+`/Users/apple/ComfyUI-Shared/models/mlx/lora/`，可串联多个节点后再接
+`MlxKSamplerMLX.model`。支持以下模型家族：
+
+- Z-Image：`ZImageLoRAMapping`；
+- FLUX.2 Klein：`Flux2LoRAMapping`；
+- Qwen Image / Qwen Edit：`QwenLoRAMapping`；
+- Ideogram 4：`Ideogram4LoRAMapping`，同时应用到条件和无条件 Transformer；
+- MiniMax-H3：插件内专用 mapping，包含 LightX2V/diffusers、原始融合 QKV/MLP、
+  musubi-tuner 键和 ComfyUI `int8-convrot` LoRA 解码。
+
+LoRA 在基础权重加载和量化完成后应用，并保留为量化 Linear 外层的低秩分支；不同路径、
+顺序与强度参与缓存键。`strength=0` 完全跳过。CLIP/text-encoder LoRA、YuE2 和
+Breeze-TTS-2 LoRA 当前不支持，并会明确报错而不是静默生成基础模型结果。详细格式和限制见
+[`USAGE_ZH.md` 第 7 节](USAGE_ZH.md#7-lora-支持)。
+
 ## 静态回归测试
 
 MiniMax-H3、YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，
@@ -388,6 +406,7 @@ MiniMax-H3、YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不�
 /opt/anaconda3/envs/py313/bin/python tests/test_h3_pipenetwork.py
 /opt/anaconda3/envs/py313/bin/python tests/test_yue2.py
 /opt/anaconda3/envs/py313/bin/python tests/test_breeze.py
+/opt/anaconda3/envs/py313/bin/python tests/test_lora.py
 ```
 
 测试成功时退出状态为 0；任何检查失败都会汇总失败项并以状态 1 退出。
