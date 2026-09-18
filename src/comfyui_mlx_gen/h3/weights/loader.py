@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import gc
 import json
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -28,9 +29,14 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from comfyui_mlx_gen import paths
 from comfyui_mlx_gen.h3 import config
 from comfyui_mlx_gen.h3.weights import h3_weight_definition as h3def
 from comfyui_mlx_gen.h3.weights.h3_weight_mapping import MiniMaxH3WeightMapping
+from comfyui_mlx_gen.h3.weights.pipenetwork_adapter import (
+    adapt_transformer_state,
+    has_quantized_tensor_keys,
+)
 
 _DTYPE_NAMES = {
     "bfloat16": mx.bfloat16,
@@ -56,6 +62,31 @@ class LoadedH3Component:
         return sum(int(value.size) * int(value.itemsize) for _, value in tree_flatten(self.module.parameters()))
 
 
+@dataclass(frozen=True)
+class PrequantizedRecipe:
+    """PipeNetwork ``quant_config.json`` 中影响模块结构的完整 recipe。"""
+
+    bits: int
+    group_size: int
+    quantize_adaln: bool
+    adaln_bits: int | None
+
+    def bits_for_local_module(self, path: str) -> int | None:
+        core_suffixes = (
+            ".attn.to_q",
+            ".attn.to_k",
+            ".attn.to_v",
+            ".attn.to_out.0",
+            ".ff.net.0.proj",
+            ".ff.net.2",
+        )
+        if path.startswith("transformer_blocks.") and path.endswith(".adaln_proj.linear"):
+            return self.adaln_bits if self.quantize_adaln else None
+        if any(path.endswith(suffix) for suffix in core_suffixes):
+            return self.bits
+        return None
+
+
 def effective_dtype(definition: h3def.H3ComponentDef, precision: str) -> str:
     """组件的生效精度：组件规则里的强制精度优先（音频 VAE = float32）。"""
     return definition.precision or precision
@@ -72,17 +103,32 @@ def load(
     """把一个 H3 组件从磁盘流式加载进内存（kind 由 paths.resolve 给出，当前只支持目录 / 单文件）。"""
     if kind == "missing":
         raise FileNotFoundError(f"未找到 {role} 权重: {path}")
+    if kind == "dir":
+        path = str(paths.normalize_hf_cache_path(path))
     definition = h3def.MiniMaxH3WeightDefinition.component(role)
     dtype_name = effective_dtype(definition, precision)
     if dtype_name not in _DTYPE_NAMES:
         raise ValueError(f"未知精度 {dtype_name}（可选：{', '.join(_DTYPE_NAMES)}）")
     base_dtype = _DTYPE_NAMES[dtype_name]
-    bits = None if definition.skip_quantization else (int(quantize) if quantize else None)
+    requested_bits = None if definition.skip_quantization else (int(quantize) if quantize else None)
 
     module = config.build_model(role, path)
-    # 量化前的参数形状：量化会把 (out, in) 换成 (out, in * 32 / bits)，校验要用原始形状
-    expected = {key: tuple(value.shape) for key, value in tree_flatten(module.parameters())}
-    if bits:
+    float_expected = {key: tuple(value.shape) for key, value in tree_flatten(module.parameters())}
+    recipe = _prequantized_recipe(role, path)
+    num_heads = None
+    if recipe is not None:
+        try:
+            num_heads = int(module.transformer_blocks[0].attn.heads)
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("无法从 MiniMax-H3 transformer 模块结构读取 attention head 数") from exc
+        _reconstruct_prequantized_modules(module, recipe)
+        bits = recipe.bits
+        # 预量化 checkpoint 已经存储 packed weight/scales/biases，必须按量化后模块树校验。
+        expected = {key: tuple(value.shape) for key, value in tree_flatten(module.parameters())}
+    else:
+        bits = requested_bits
+        expected = float_expected
+    if bits and recipe is None:
         # 只改结构：此时参数还是未求值的懒初始化，nn.quantize 不会真的算一遍
         nn.quantize(
             module,
@@ -96,10 +142,24 @@ def load(
         if isinstance(sub, (nn.QuantizedLinear, nn.QuantizedEmbedding))
     }
     if log:
-        quantized_note = f"量化 q{bits}（{len(quantized_modules)} 个模块）" if bits else "不量化"
+        if recipe is not None:
+            adaln_note = (
+                f"，AdaLN q{recipe.adaln_bits}" if recipe.quantize_adaln else "，AdaLN 保持浮点"
+            )
+            quantized_note = (
+                f"读取预量化 q{recipe.bits}/g{recipe.group_size}{adaln_note}"
+                f"（{len(quantized_modules)} 个模块）"
+            )
+        else:
+            quantized_note = f"运行时量化 q{bits}（{len(quantized_modules)} 个模块）" if bits else "不量化"
         log(f"[H3 加载] {role}: {len(expected)} 个参数，{quantized_note}，精度 {dtype_name}")
         log(f"[H3 加载] {role}: 目录 {path}")
-    if bits and log:
+        if recipe is not None and requested_bits not in (None, recipe.bits):
+            log(
+                f"[H3 加载] {role}: 忽略 Loader quantize={requested_bits}；"
+                f"checkpoint recipe 指定 q{recipe.bits}"
+            )
+    if bits and recipe is None and log:
         log(
             "[H3 加载] %s: 敏感路径保持原精度（%s）"
             % (role, " / ".join(h3def.MiniMaxH3WeightDefinition.TRANSFORMER_QUANTIZATION_SENSITIVE_FRAGMENTS))
@@ -108,7 +168,17 @@ def load(
     loaded: dict[str, tuple[int, ...]] = {}
     for shard in _shard_files(role, path):
         written = _load_shard(
-            module, role, shard, base_dtype, bits, quantized_modules, expected, loaded, log
+            module,
+            role,
+            shard,
+            base_dtype,
+            bits,
+            quantized_modules,
+            expected,
+            loaded,
+            log,
+            recipe=recipe,
+            num_heads=num_heads,
         )
         if log:
             log(f"[H3 加载] {role}: {Path(shard).name} → 写入 {written} 个张量")
@@ -146,6 +216,95 @@ def _shard_files(role: str, path: str) -> list[str]:
     return shards
 
 
+def _prequantized_recipe(role: str, path: str) -> PrequantizedRecipe | None:
+    """读取并严格校验 PipeNetwork transformer 的量化 recipe。"""
+    root = Path(path)
+    if role != "transformer" or not root.is_dir():
+        return None
+    recipe_path = root / "quant_config.json"
+    if not recipe_path.is_file():
+        return None
+    try:
+        raw = json.loads(recipe_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"无法读取预量化配置 {recipe_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"预量化配置必须是 JSON object：{recipe_path}")
+    bits = raw.get("bits")
+    group_size = raw.get("group_size")
+    if (
+        not isinstance(bits, int)
+        or isinstance(bits, bool)
+        or not isinstance(group_size, int)
+        or isinstance(group_size, bool)
+    ):
+        raise ValueError(f"{recipe_path} 必须包含 JSON 整数 bits 与 group_size")
+    if bits not in {2, 3, 4, 5, 6, 8}:
+        raise ValueError(f"{recipe_path} 的 bits={bits} 不受 MLX affine quantization 支持")
+    if group_size <= 0 or group_size & (group_size - 1):
+        raise ValueError(f"{recipe_path} 的 group_size 必须是正的 2 次幂，收到 {group_size}")
+    quantize_adaln = raw.get("quantize_adaln", False)
+    if not isinstance(quantize_adaln, bool):
+        raise ValueError(f"{recipe_path} 的 quantize_adaln 必须是 bool")
+    adaln_bits = raw.get("adaln_bits", 8)
+    if not isinstance(adaln_bits, int) or isinstance(adaln_bits, bool):
+        raise ValueError(f"{recipe_path} 的 adaln_bits 必须是 JSON 整数")
+    if quantize_adaln and adaln_bits not in {2, 3, 4, 5, 6, 8}:
+        raise ValueError(f"{recipe_path} 的 adaln_bits={adaln_bits} 不受 MLX 支持")
+    shards = _shard_files(role, path)
+    if not any(_safetensors_has_quantized_keys(shard) for shard in shards):
+        raise ValueError(
+            f"{recipe_path} 存在，但权重没有 .scales/.biases 量化张量；"
+            "拒绝把浮点 checkpoint 当作预量化 checkpoint"
+        )
+    return PrequantizedRecipe(
+        bits=bits,
+        group_size=group_size,
+        quantize_adaln=quantize_adaln,
+        adaln_bits=adaln_bits if quantize_adaln else None,
+    )
+
+
+def _safetensors_has_quantized_keys(path: str | Path) -> bool:
+    """只读取 safetensors header，避免为检测格式把整个 shard 映射进内存。"""
+    file = Path(path)
+    try:
+        with file.open("rb") as handle:
+            size_raw = handle.read(8)
+            if len(size_raw) != 8:
+                raise ValueError("header 长度字段不完整")
+            header_size = struct.unpack("<Q", size_raw)[0]
+            if header_size <= 0 or header_size > file.stat().st_size - 8:
+                raise ValueError(f"header 长度非法：{header_size}")
+            header = json.loads(handle.read(header_size))
+    except (OSError, json.JSONDecodeError, struct.error, ValueError) as exc:
+        raise ValueError(f"无法读取 safetensors header {file}: {exc}") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header 不是 object：{file}")
+    return has_quantized_tensor_keys(key for key in header if key != "__metadata__")
+
+
+def _reconstruct_prequantized_modules(module: nn.Module, recipe: PrequantizedRecipe) -> None:
+    """只重建 QuantizedLinear 容器；其中的占位参数随后逐 shard 覆盖。"""
+    def predicate(path: str, child: nn.Module) -> bool | dict[str, int]:
+        if not isinstance(child, nn.Linear):
+            return False
+        module_bits = recipe.bits_for_local_module(path)
+        if module_bits is None:
+            return False
+        if child.weight.shape[-1] % recipe.group_size:
+            # 与 PipeNetwork 转换器一致：候选层不能完整分组时保留浮点结构。
+            return False
+        return {"group_size": recipe.group_size, "bits": module_bits}
+
+    nn.quantize(
+        module,
+        group_size=recipe.group_size,
+        bits=recipe.bits,
+        class_predicate=predicate,
+    )
+
+
 def _text_encoder_shards(root: Path) -> list[str] | None:
     """只读含「embed_tokens / 前 50 层 / 视觉塔」的 shard；其余 Qwen3-VL 的层永不读盘。"""
     index = root / "model.safetensors.index.json"
@@ -172,6 +331,8 @@ def _load_shard(
     expected: dict[str, tuple[int, ...]],
     loaded: dict[str, tuple[int, ...]],
     log: Callable[[str], None] | None,
+    recipe: PrequantizedRecipe | None = None,
+    num_heads: int | None = None,
 ) -> int:
     """读一个 shard：过滤 → 改名 / 变换 → 精度转换 →（量化）写入模块，返回写入的张量数。"""
     definition = h3def.MiniMaxH3WeightDefinition.component(role)
@@ -201,6 +362,10 @@ def _load_shard(
         mapped = {key: definition.bulk_transform(value) for key, value in raw.items()}
     else:
         mapped = raw
+    if role == "transformer" and recipe is not None:
+        if num_heads is None:
+            raise ValueError("PipeNetwork transformer 适配缺少 num_attention_heads")
+        mapped = adapt_transformer_state(mapped, num_heads)
     if role == "audio_vae":
         # torch 的 weight_norm 折叠 + 1D 核转 MLX 布局，必须在写入之前做完
         mapped = MiniMaxH3WeightMapping.convert_audio_vae_state(mapped)
@@ -209,11 +374,21 @@ def _load_shard(
     skipped = 0
     for key, tensor in mapped.items():
         if key not in expected:
+            if recipe is not None:
+                raise ValueError(
+                    f"PipeNetwork 预量化权重含本地 H3 模块不存在的键：{key} "
+                    f"（来自 {Path(shard).name}）"
+                )
             # mapping 之外的键（例如 Qwen3-VL 第 50 层以后）在模块里没有对应参数
             skipped += 1
             continue
+        if key in loaded:
+            raise ValueError(f"MiniMax-H3 权重跨 shard 重复写入参数：{key}（{Path(shard).name}）")
         tensor = _to_dtype(role, key, tensor, base_dtype)
-        flat.extend(_quantize_entry(key, tensor, bits, quantized_modules))
+        if recipe is None:
+            flat.extend(_quantize_entry(key, tensor, bits, quantized_modules))
+        else:
+            flat.append((key, tensor))
         loaded[key] = tuple(tensor.shape)
     if skipped and log:
         log(f"[H3 加载] {role}: 跳过 {skipped} 个模块里没有的键")

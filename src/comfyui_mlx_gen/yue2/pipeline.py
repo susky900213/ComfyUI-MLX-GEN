@@ -242,7 +242,10 @@ def synthesize(model, prefix, codec, seed, steps=32, noise=None, on_progress=Non
         noise = mx.random.normal((len(codec), 64), key=mx.random.key(seed))
     delta = 1.0 / steps
     output = []
-    for start, end in chunk_ranges(len(codec), len(prefix)):
+    ranges = chunk_ranges(len(codec), len(prefix))
+    total_steps = len(ranges) * steps
+    completed_steps = 0
+    for start, end in ranges:
         ar_tokens = prefix + [token + CODEC_OFFSET for token in codec[start:end]] + [MUSIC_END]
         ar_cache = model.nar_prefill(ar_tokens)
         state = noise[start:end].astype(mx.bfloat16)
@@ -254,8 +257,9 @@ def synthesize(model, prefix, codec, seed, steps=32, noise=None, on_progress=Non
                 midpoint, _logit(timestep - delta / 2), ar_cache, len(ar_tokens)
             ) * delta
             mx.eval(state)
+            completed_steps += 1
             if on_progress is not None:
-                on_progress(step + 1, steps)
+                on_progress(completed_steps, total_steps)
         output.append(state.astype(mx.float32))
     return mx.concatenate(output)
 
@@ -285,6 +289,7 @@ def generate_music_latents(
     max_tokens: int | None = None,
     cfg_scale: float | None = None,
     log: Callable[[str], None] = print,
+    on_progress: Callable[[int, int], None] | None = None,
 ):
     """执行 YuE2 的 ABC 规划、语义 AR 与 NAR，返回 latent 和诊断信息。"""
     if cot not in INSTRUCTIONS:
@@ -346,17 +351,20 @@ def generate_music_latents(
     nar_steps = int(steps or generation_config.get("ode_steps", 32))
     duration = audio_samples(len(codec)) / SAMPLE_RATE
     log(f"[YuE2 NAR] {len(codec)} 帧（约 {duration:.1f}s），{nar_steps} 步 midpoint")
+
+    def report_nar_progress(index: int, total: int) -> None:
+        if on_progress is not None:
+            on_progress(index, total)
+        if index == total or index % 8 == 0:
+            log(f"[YuE2 NAR] step {index}/{total}")
+
     latents = synthesize(
         model,
         prefix,
         codec,
         seed,
         nar_steps,
-        on_progress=lambda index, total: (
-            log(f"[YuE2 NAR] step {index}/{total}")
-            if index == total or index % 8 == 0
-            else None
-        ),
+        on_progress=report_nar_progress,
     )
     return latents, {
         "abc": abc_text,

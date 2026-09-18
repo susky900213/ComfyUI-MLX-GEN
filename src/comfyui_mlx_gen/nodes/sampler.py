@@ -197,6 +197,11 @@ class MlxKSamplerMLX:
         # YuE2：正向文本 = style，负向文本 = lyrics（空 lyrics = 纯音乐）。模型内部
         # tokenizer 同时参与 ABC / codec AR，因此文本节点只透传原文，不提前编码。
         if entry.media == "audio":
+            if entry.family != "yue2":
+                raise ValueError(
+                    f"{entry.family} 不使用通用 MLX KSampler；"
+                    "请改用「MLX Breeze Sampler」专用节点"
+                )
             if ref_images is not None:
                 raise ValueError("YuE2 不支持参考图，请把 ref_images 断开")
             if int(batch_size) != 1:

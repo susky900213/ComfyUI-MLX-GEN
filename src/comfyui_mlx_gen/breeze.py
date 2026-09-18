@@ -13,7 +13,7 @@ import tempfile
 import wave
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import numpy as np
 
@@ -106,8 +106,17 @@ def validate_params(params: dict[str, Any]) -> None:
         raise ValueError("Breeze cfg_scale 必须是有限数")
 
 
-def generate_waveform(model: Any, params: dict[str, Any]) -> tuple[Any, int]:
-    """调用 mlx-audio 0.5.1，并返回一维 waveform 与 runtime 报告的采样率。"""
+def generate_waveform(
+    model: Any,
+    params: dict[str, Any],
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[Any, int]:
+    """调用 mlx-audio 0.5.1，并返回一维 waveform 与 runtime 报告的采样率。
+
+    Breeze 没有原生回调，但 ``stream=True`` 会在真实自回归循环中按音频 token
+    分块产出 ``GenerationResult``。需要进度时消费这些分块并按 ``token_count``
+    更新；最终波形由上游流式解码器的连续 chunk 原样拼接。
+    """
     validate_params(params)
     mode = params["mode"]
     kwargs = {
@@ -121,18 +130,35 @@ def generate_waveform(model: Any, params: dict[str, Any]) -> tuple[Any, int]:
         "top_k": int(params["top_k"]),
         "repetition_penalty": float(params["repetition_penalty"]),
         "seed": int(params["seed"]),
-        "stream": False,
+        "stream": on_progress is not None,
     }
 
     def consume(ref_audio=None):
         kwargs["ref_audio"] = ref_audio
-        results = list(model.generate(params["text"], **kwargs))
-        if not results:
+        chunks = []
+        sample_rate = SAMPLE_RATE
+        completed_tokens = 0
+        for result in model.generate(params["text"], **kwargs):
+            if not hasattr(result, "audio"):
+                raise RuntimeError("Breeze-TTS-2 GenerationResult 缺少 audio")
+            chunks.append(result.audio)
+            sample_rate = int(getattr(result, "sample_rate", SAMPLE_RATE))
+            if on_progress is not None:
+                completed_tokens += max(0, int(getattr(result, "token_count", 0)))
+                max_tokens = int(params["max_tokens"])
+                on_progress(min(completed_tokens, max_tokens), max_tokens)
+        if not chunks:
             raise RuntimeError("Breeze-TTS-2 没有返回 GenerationResult")
-        result = results[-1]
-        if not hasattr(result, "audio"):
-            raise RuntimeError("Breeze-TTS-2 GenerationResult 缺少 audio")
-        return result.audio, int(getattr(result, "sample_rate", SAMPLE_RATE))
+        if on_progress is not None:
+            # EOS 通常早于 max_tokens；生成结束即代表本次工作完成。
+            on_progress(int(params["max_tokens"]), int(params["max_tokens"]))
+        if len(chunks) == 1:
+            waveform = chunks[0]
+        else:
+            import mlx.core as mx
+
+            waveform = mx.concatenate([mx.asarray(chunk).reshape(-1) for chunk in chunks])
+        return waveform, sample_rate
 
     if mode != "voice_clone":
         return consume()

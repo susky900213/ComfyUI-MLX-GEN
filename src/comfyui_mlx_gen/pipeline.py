@@ -46,6 +46,7 @@ import mlx.core as mx
 from . import breeze, components, image, paths, runtime, weights
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.weights import loader as h3_loader
+from .progress import SamplingProgress
 from .types import MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
 from .yue2 import pipeline as yue2_pipeline
 from .yue2.model import load_model as load_yue2_model
@@ -847,7 +848,7 @@ def _predict_flux2(
     return fn(latents, latent_ids, pos_embeds, pos_ids, neg_embeds, neg_ids, guidance, timestep)
 
 
-def _sample_z_image(defn, comps, params, cache, model_config, guidance):
+def _sample_z_image(defn, comps, params, cache, model_config, guidance, on_progress=None):
     """Z-Image 采样循环（与 ZImage.generate_image 一致：单数组条件 + linear 调度器）。"""
     config = make_sampler_config(defn, model_config, params)
     scheduler = build_scheduler(params["scheduler_name"], config)
@@ -874,13 +875,15 @@ def _sample_z_image(defn, comps, params, cache, model_config, guidance):
             )
             current = scheduler.step(noise=noise, timestep=t, latents=current)
             mx.eval(current)
+            if on_progress is not None:
+                on_progress()
         final.append(current)
     stacked = mx.stack(final, axis=0)  # [B, 16, 1, h/8, w/8]
     mx.eval(stacked)
     return stacked
 
 
-def _sample_flux2(defn, comps, params, cache, model_config, guidance):
+def _sample_flux2(defn, comps, params, cache, model_config, guidance, on_progress=None):
     """Flux2 采样循环（与 Flux2Klein.generate_image 的 txt2img 一致）。
 
     与 Z-Image 的差别：
@@ -917,6 +920,8 @@ def _sample_flux2(defn, comps, params, cache, model_config, guidance):
                 noise=noise, timestep=t, latents=current, sigmas=scheduler.sigmas
             )
             mx.eval(current)
+            if on_progress is not None:
+                on_progress()
         final.append(current)
     stacked = mx.concatenate(final, axis=0)  # [B, seq, C]
     mx.eval(stacked)
@@ -1055,7 +1060,7 @@ def _predict_flux2_edit_cached(
     return negative_noise + guidance * (noise - negative_noise)
 
 
-def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance):
+def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance, on_progress=None):
     """Flux.2 参考图编辑采样：循环与 `_sample_flux2` 相同，只换单步预测为 edit 版。
 
     - 参考图 latent 按缓存键从 cache.py 的 `ref_encoding` 桶取（编码节点已算好）；
@@ -1127,6 +1132,8 @@ def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance):
                 noise=noise, timestep=t, latents=current, sigmas=scheduler.sigmas
             )
             mx.eval(current)
+            if on_progress is not None:
+                on_progress()
         final.append(current)
     stacked = mx.concatenate(final, axis=0)  # [B, seq, C]
     mx.eval(stacked)
@@ -1147,7 +1154,7 @@ def qwen_guided_noise(noise: Any, noise_negative: Any, guidance: float) -> Any:
     return combined * (cond_norm / noise_norm)
 
 
-def _sample_qwen_edit(defn, comps, params, cache, model_config, guidance):
+def _sample_qwen_edit(defn, comps, params, cache, model_config, guidance, on_progress=None):
     """Qwen-Image-Edit 采样：目标 latent 与参考 latent 拼 seq，每个 step 只取回目标段。
 
     与 mflux `QwenImageEdit.generate_image` 的循环逐步一致：
@@ -1202,6 +1209,8 @@ def _sample_qwen_edit(defn, comps, params, cache, model_config, guidance):
                 noise = qwen_guided_noise(noise, negative_noise, guidance)
             latents = scheduler.step(noise=noise, timestep=t, latents=latents)
             mx.eval(latents)
+            if on_progress is not None:
+                on_progress()
         final.append(latents)
     stacked = mx.concatenate(final, axis=0)  # [B, seq, C]
     mx.eval(stacked)
@@ -1245,7 +1254,7 @@ def _predict_qwen(transformer, latents, step, config, encodings, negative, guida
     return fn(latents, step, pos_embeds, pos_mask, neg_embeds, neg_mask, guidance)
 
 
-def _sample_qwen_image(defn, comps, params, cache, model_config, guidance):
+def _sample_qwen_image(defn, comps, params, cache, model_config, guidance, on_progress=None):
     """Qwen-Image 文生图（与 mflux `QwenImage.generate_image` 的 t2i 分支一致）。
 
     与 `_sample_qwen_edit` 的三点差别：
@@ -1284,13 +1293,15 @@ def _sample_qwen_image(defn, comps, params, cache, model_config, guidance):
             )
             current = scheduler.step(noise=noise, timestep=t, latents=scaled)
             mx.eval(current)
+            if on_progress is not None:
+                on_progress()
         final.append(current)
     stacked = mx.concatenate(final, axis=0)  # [B, seq, 64]
     mx.eval(stacked)
     return stacked
 
 
-def _sample_ideogram4(defn, comps, params, cache):
+def _sample_ideogram4(defn, comps, params, cache, on_progress=None):
     """Ideogram 4 FP8 文生图；与 MFLUX Ideogram4.generate_image 的去噪语义一致。"""
     preset = ideogram4_preset(params["scheduler_name"])
     num_steps = int(preset.num_steps)
@@ -1380,6 +1391,8 @@ def _sample_ideogram4(defn, comps, params, cache):
                 velocity = guide * pos_v + (1.0 - guide) * neg_v
             z = z + velocity * (s_value - t_value)
             mx.eval(z)
+            if on_progress is not None:
+                on_progress()
         final.append(z)
     stacked = mx.concatenate(final, axis=0)
     mx.eval(stacked)
@@ -1404,30 +1417,48 @@ def run_sampler(defn, model_handle, comps, params, cache):
     # 只有**明确声明**不支持 CFG（False，如 z-image-turbo）才清零；
     # None（qwen-image-edit）表示「未声明」，保留 widget 上的值 —— Qwen 编辑必须有 CFG。
     guidance = float(params["guidance"]) if model_config.supports_guidance is not False else 0.0
+    progress_steps = (
+        int(ideogram4_preset(params["scheduler_name"]).num_steps)
+        if defn.family == "ideogram4"
+        else int(params["steps"])
+    )
+    progress = SamplingProgress(progress_steps * int(params["batch_size"]))
 
     def sample():
         # 接了参考图 → 编辑（edit）分支；按大类分派，不静默降级
         # （qwen_image 是文生图大类，接参考图在「MLX KSampler」里就被挡掉了）
         if params.get("ref_cache_key"):
             if defn.family == "flux2":
-                return _sample_flux2_edit(defn, comps, params, cache, model_config, guidance)
+                return _sample_flux2_edit(
+                    defn, comps, params, cache, model_config, guidance, progress.update
+                )
             if defn.family == "qwen_edit":
-                return _sample_qwen_edit(defn, comps, params, cache, model_config, guidance)
+                return _sample_qwen_edit(
+                    defn, comps, params, cache, model_config, guidance, progress.update
+                )
             raise NotImplementedError(
                 f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit 的 edit 路径）"
             )
         if defn.family == "flux2":
-            return _sample_flux2(defn, comps, params, cache, model_config, guidance)
+            return _sample_flux2(
+                defn, comps, params, cache, model_config, guidance, progress.update
+            )
         if defn.family == "qwen_image":
-            return _sample_qwen_image(defn, comps, params, cache, model_config, guidance)
+            return _sample_qwen_image(
+                defn, comps, params, cache, model_config, guidance, progress.update
+            )
         if defn.family == "ideogram4":
-            return _sample_ideogram4(defn, comps, params, cache)
-        return _sample_z_image(defn, comps, params, cache, model_config, guidance)
+            return _sample_ideogram4(defn, comps, params, cache, progress.update)
+        return _sample_z_image(
+            defn, comps, params, cache, model_config, guidance, progress.update
+        )
 
     key = runtime.cache_key(
         {"kind": "noise", "params": params, "config": model_config.model_name}
     )
-    latents, _hit = cache.get_or_create("component_weights", key, sample)
+    latents, hit = cache.get_or_create("component_weights", key, sample)
+    if hit:
+        progress.complete()
     # 句柄里只存「大类 + 权重集名」，供下游按同一路径继续解析
     return MlxLatentHandle(
         kind="noise",
@@ -1614,6 +1645,7 @@ def run_yue2_sampler(entry, model_handle, comps, params: dict[str, Any], cache) 
     ``comps`` 在缓存命中时允许为 ``None``；factory 不会执行，因此无需重新加载主模型。
     """
     key = yue2_latent_cache_key(model_handle, params)
+    progress = SamplingProgress(int(params["steps"]))
 
     def sample():
         if comps is None:
@@ -1630,10 +1662,13 @@ def run_yue2_sampler(entry, model_handle, comps, params: dict[str, Any], cache) 
             max_tokens=int(params["max_tokens"]),
             cfg_scale=float(params["guidance"]),
             log=print,
+            on_progress=progress.update_absolute,
         )
         return latents
 
-    latents, _hit = cache.get_or_create("component_weights", key, sample)
+    latents, hit = cache.get_or_create("component_weights", key, sample)
+    if hit:
+        progress.complete()
     duration = yue2_pipeline.audio_samples(latents.shape[0]) / yue2_pipeline.SAMPLE_RATE
     return MlxLatentHandle(
         kind="yue2_audio",
@@ -1780,11 +1815,14 @@ def run_breeze_sampler(entry, model_handle, model, params: dict[str, Any], cache
         raise ValueError(f"run_breeze_sampler 收到非 Breeze 大类：{entry.family}")
     breeze.validate_params(params)
     key = breeze_waveform_cache_key(model_handle, params)
+    progress = SamplingProgress(int(params["max_tokens"]))
 
     def sample():
         if model is None:
             raise RuntimeError("Breeze waveform 缓存已失效，请重新执行采样器")
-        waveform, sample_rate = breeze.generate_waveform(model, params)
+        waveform, sample_rate = breeze.generate_waveform(
+            model, params, on_progress=progress.update_absolute
+        )
         if int(sample_rate) <= 0:
             raise RuntimeError(f"Breeze 返回了无效采样率：{sample_rate}")
         array = mx.asarray(waveform, dtype=mx.float32).reshape(-1)
@@ -1792,7 +1830,9 @@ def run_breeze_sampler(entry, model_handle, model, params: dict[str, Any], cache
         mx.eval(array)
         return array, int(sample_rate)
 
-    cached, _hit = cache.get_or_create(BREEZE_WAVEFORM_BUCKET, key, sample)
+    cached, hit = cache.get_or_create(BREEZE_WAVEFORM_BUCKET, key, sample)
+    if hit:
+        progress.complete()
     waveform, sample_rate = cached
     samples = int(waveform.shape[0])
     return MlxLatentHandle(
@@ -2059,6 +2099,7 @@ def run_h3_sampler(entry, model_handle, comps, params: dict[str, Any], cache) ->
         log=print,
     )
     print(f"[H3 采样] {plan.summary()}")
+    progress = SamplingProgress(plan.steps)
 
     def sample() -> tuple[Any, Any, Any]:
         embeds, tags = cached_h3_prompt(cache, params["positive_encoding_key"])
@@ -2073,12 +2114,20 @@ def run_h3_sampler(entry, model_handle, comps, params: dict[str, Any], cache) ->
             log=print,
         )
         video_rows, audio_rows, _layout = h3_pipeline.sample(
-            loaded.module, embeds, tags, plan, int(params["seed"]), log=print
+            loaded.module,
+            embeds,
+            tags,
+            plan,
+            int(params["seed"]),
+            log=print,
+            on_progress=progress.update_absolute,
         )
         return video_rows, audio_rows, plan
 
     key = h3_latent_cache_key(params, model_handle)
-    (video_rows, audio_rows, plan), _hit = cache.get_or_create(H3_LATENT_BUCKET, key, sample)
+    (video_rows, audio_rows, plan), hit = cache.get_or_create(H3_LATENT_BUCKET, key, sample)
+    if hit:
+        progress.complete()
     return MlxLatentHandle(
         kind="h3_video",
         shape=tuple(video_rows.shape),

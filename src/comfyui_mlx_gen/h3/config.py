@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,17 @@ _TUPLE_KEYS = (
 # 需要 tuple[tuple[int, ...], ...] 的键
 _NESTED_TUPLE_KEYS = ("resblock_dilation_sizes",)
 
+# PipeNetwork/minimax-h3-mlx 保留 MiniMax 原始 DiT 配置名；本地模块使用 diffusers 名。
+_TRANSFORMER_ALIASES = {
+    "token_refiner_num_layers": "num_refiner_layers",
+    "ffn_hidden_size": "ffn_dim",
+    "latents_dim": "in_channels",
+    "audio_latents_dim": "audio_in_channels",
+    "timestep_input_dim": "freq_dim",
+    "time_embed_hidden_size": "time_embed_hidden_dim",
+    "rope_inv_freq_len": "rope_freq_dim",
+}
+
 
 def read_config(path: str | Path) -> dict[str, Any]:
     """读一个组件目录（或某个 .json 文件）的配置；缺失 / 损坏时给中文错误。"""
@@ -57,8 +69,12 @@ def read_config(path: str | Path) -> dict[str, Any]:
 
 def _ctor_kwargs(cls: Any, config: dict[str, Any]) -> dict[str, Any]:
     """`config` 里与 `cls.__init__` 形参同名的键（顺带做列表 → tuple 的转换）。"""
-    code = cls.__init__.__code__
-    names = code.co_varnames[1 : code.co_argcount]
+    names = tuple(
+        name
+        for name, parameter in inspect.signature(cls.__init__).parameters.items()
+        if name != "self"
+        and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
     kwargs = {name: config[name] for name in names if name in config}
     for key in _TUPLE_KEYS:
         if isinstance(kwargs.get(key), list):
@@ -66,6 +82,76 @@ def _ctor_kwargs(cls: Any, config: dict[str, Any]) -> dict[str, Any]:
     for key in _NESTED_TUPLE_KEYS:
         if isinstance(kwargs.get(key), list):
             kwargs[key] = tuple(tuple(int(v) for v in row) for row in kwargs[key])
+    return kwargs
+
+
+def transformer_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    """把 diffusers 或 MiniMax 原始 transformer 配置转成本地构造参数并校验。
+
+    原始配置还显式保存两个可由结构推导的输出宽度；本地模块不把它们暴露为构造参数，
+    但仍校验，避免用一份结构不兼容的 config 静默构造默认模型。
+    """
+    from comfyui_mlx_gen.h3.model.h3_transformer.h3_transformer import MiniMaxH3Transformer
+
+    converted = dict(config)
+    for source, target in _TRANSFORMER_ALIASES.items():
+        if source not in config:
+            continue
+        if target in config and config[target] != config[source]:
+            raise ValueError(
+                f"MiniMax-H3 transformer 配置冲突：{source}={config[source]!r}，"
+                f"但 {target}={config[target]!r}"
+            )
+        converted[target] = config[source]
+
+    kwargs = _ctor_kwargs(MiniMaxH3Transformer, converted)
+    signature = inspect.signature(MiniMaxH3Transformer.__init__)
+    values = {
+        name: kwargs.get(name, parameter.default)
+        for name, parameter in signature.parameters.items()
+        if name != "self"
+    }
+    unresolved = [name for name, value in values.items() if value is inspect.Parameter.empty]
+    if unresolved:
+        raise ValueError(f"MiniMax-H3 transformer 配置缺少构造字段：{unresolved}")
+
+    positive_ints = (
+        "num_attention_heads",
+        "attention_head_dim",
+        "hidden_size",
+        "num_layers",
+        "num_refiner_layers",
+        "ffn_dim",
+        "in_channels",
+        "audio_in_channels",
+        "text_dim",
+        "freq_dim",
+        "time_embed_hidden_dim",
+        "time_embed_dim",
+        "rope_freq_dim",
+    )
+    invalid = [name for name in positive_ints if not isinstance(values[name], int) or values[name] <= 0]
+    patch_size = values["patch_size"]
+    if invalid:
+        raise ValueError(f"MiniMax-H3 transformer 配置字段必须是正整数：{invalid}")
+    if not isinstance(patch_size, tuple) or len(patch_size) != 3 or any(v <= 0 for v in patch_size):
+        raise ValueError(f"MiniMax-H3 patch_size 必须是三个正整数，收到 {patch_size!r}")
+    if 6 * int(values["rope_freq_dim"]) > int(values["attention_head_dim"]):
+        raise ValueError(
+            "MiniMax-H3 RoPE 宽度超过 attention head："
+            f"6 * rope_freq_dim={6 * int(values['rope_freq_dim'])} > {values['attention_head_dim']}"
+        )
+
+    derived = {
+        "adaln_out_features": 6 * 3 * int(values["hidden_size"]),
+        "final_adaln_out_features": 2 * int(values["hidden_size"]),
+    }
+    for name, expected in derived.items():
+        if name in config and int(config[name]) != expected:
+            raise ValueError(
+                f"MiniMax-H3 transformer 配置 {name}={config[name]!r}，"
+                f"但按 hidden_size 推导应为 {expected}"
+            )
     return kwargs
 
 
@@ -105,6 +191,8 @@ def class_kwargs(role: str, path: str | Path) -> dict[str, Any]:
     config = read_config(path)
     if role == "text_encoder":
         return _text_encoder_kwargs(config)
+    if role == "transformer":
+        return transformer_kwargs(config)
     return _ctor_kwargs(_ctor_of(role), config)
 
 

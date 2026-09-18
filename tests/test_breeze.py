@@ -25,7 +25,6 @@ from comfyui_mlx_gen import NODE_CLASS_MAPPINGS, paths, pipeline  # noqa: E402
 from comfyui_mlx_gen import breeze  # noqa: E402
 from comfyui_mlx_gen.cache import Cache  # noqa: E402
 from comfyui_mlx_gen.nodes import breeze_sampler as breeze_sampler_module  # noqa: E402
-from comfyui_mlx_gen.nodes import sampler as sampler_module  # noqa: E402
 from comfyui_mlx_gen.nodes import vae_decode as vae_decode_module  # noqa: E402
 from comfyui_mlx_gen.types import (  # noqa: E402
     MlxClipHandle,
@@ -121,7 +120,7 @@ check(
     str(entry),
 )
 check(
-    "Breeze 专用采样器已注册且旧采样器仍保留",
+    "Breeze 专用采样器与通用采样器节点均已注册",
     {
         "MlxBreezeSampler", "MlxTransformerLoader", "MlxKSamplerMLX", "MlxVAELoader",
         "MlxVAEDecoder", "MlxPilToTorch",
@@ -243,29 +242,72 @@ with tempfile.TemporaryDirectory() as tmp:
         check("参考音频缓存键只看内容摘要，不看数组身份/临时文件名", key2 == key3 and key1 != key2)
 
         calls = []
+        progress_updates = []
+
+        class RecordingProgress:
+            def __init__(self, total):
+                self.total = total
+
+            def update_absolute(self, current, total=None):
+                progress_updates.append((current, total or self.total))
+
+            def complete(self):
+                progress_updates.append((self.total, self.total))
 
         class FakeModel:
             def generate(self, text, **kwargs):
                 calls.append((text, kwargs))
                 if kwargs["ref_audio"] is not None:
                     assert Path(kwargs["ref_audio"]).is_file()
-                yield SimpleNamespace(audio=mx.array([-2.0, -0.25, 0.5, 2.0]), sample_rate=24000)
+                yield SimpleNamespace(
+                    audio=mx.array([-2.0, -0.25]), sample_rate=24000, token_count=3
+                )
+                yield SimpleNamespace(
+                    audio=mx.array([0.5, 2.0]), sample_rate=24000, token_count=2
+                )
 
         cache = Cache()
-        handle = pipeline.run_breeze_sampler(entry, model_handle, FakeModel(), params(), cache)
+        old_progress = pipeline.SamplingProgress
+        pipeline.SamplingProgress = RecordingProgress
+        try:
+            handle = pipeline.run_breeze_sampler(entry, model_handle, FakeModel(), params(), cache)
+            reused = pipeline.run_breeze_sampler(entry, model_handle, None, params(), cache)
+        finally:
+            pipeline.SamplingProgress = old_progress
         cached, hit = cache.get("breeze_waveform", handle.cache_key)
         check(
-            "采样缓存最终裁剪波形并返回 24 kHz breeze_audio latent",
+            "流式 token chunk 驱动进度、拼接并缓存 24 kHz waveform",
             hit
             and handle.kind == "breeze_audio"
             and handle.sample_rate == 24000
             and handle.audio_num_rows == 4
             and tuple(cached[0].shape) == (4,)
-            and np.allclose(np.asarray(cached[0]), [-1.0, -0.25, 0.5, 1.0]),
-            str(handle),
+            and np.allclose(np.asarray(cached[0]), [-1.0, -0.25, 0.5, 1.0])
+            and calls[0][1]["stream"] is True
+            and progress_updates == [(3, 8), (5, 8), (8, 8), (8, 8)],
+            f"{handle} / progress={progress_updates}",
         )
-        reused = pipeline.run_breeze_sampler(entry, model_handle, None, params(), cache)
         check("相同参数命中 waveform 后无需模型", reused.cache_key == handle.cache_key and len(calls) == 1)
+
+        non_stream_calls = []
+
+        class NonStreamingModel:
+            def generate(self, text, **kwargs):
+                non_stream_calls.append((text, kwargs))
+                yield SimpleNamespace(
+                    audio=mx.array([0.25, -0.5]), sample_rate=24000, token_count=2
+                )
+
+        waveform, sample_rate = breeze.generate_waveform(
+            NonStreamingModel(), params(mode="speaker")
+        )
+        check(
+            "未传进度回调时保留 mlx-audio 非流式生成行为",
+            non_stream_calls[0][1]["stream"] is False
+            and sample_rate == 24000
+            and np.allclose(np.asarray(waveform), [0.25, -0.5]),
+            str(non_stream_calls),
+        )
 
         clone_params = params(
             mode="voice_clone", ref_text="參考音頻內容", reference=(mono, sample_rate, digest)
@@ -304,54 +346,18 @@ with tempfile.TemporaryDirectory() as tmp:
         paths.MODEL_ROOT = old_root
 
 
-# ------------------------------------------------------ 5. 旧 sampler 三模式分派/释放
+# ------------------------------------------------------ 5. 通用 sampler 明确拒绝 Breeze
 clip = make_clip()
 positive = MlxConditioning(text="這是目標台詞", clip=clip, encoding_key="positive")
 negative = MlxConditioning(text="ignored", clip=clip, encoding_key="negative")
-fake_cache = Cache()
-old_cache = sampler_module.CACHE
-old_has = pipeline.has_breeze_waveform
-old_prepare = pipeline.prepare_breeze_model
-old_run = pipeline.run_breeze_sampler
-old_release = pipeline.release_breeze_model
-captured = {}
-sentinel = object()
-try:
-    sampler_module.CACHE = fake_cache
-    pipeline.has_breeze_waveform = lambda *_args: False
-    pipeline.prepare_breeze_model = lambda *_args: "complete-model"
-
-    def fake_run(_entry, _handle, complete_model, sampler_params, _cache):
-        captured.update(sampler_params)
-        captured["complete_model"] = complete_model
-        return sentinel
-
-    pipeline.run_breeze_sampler = fake_run
-    pipeline.release_breeze_model = lambda *_args: captured.setdefault("released", True)
-    result = NODE_CLASS_MAPPINGS["MlxKSamplerMLX"]().sample(
+check_raises(
+    "通用 sampler 明确提示 Breeze 使用专用节点",
+    ValueError,
+    "MLX Breeze Sampler",
+    lambda: NODE_CLASS_MAPPINGS["MlxKSamplerMLX"]().sample(
         model=make_model(), positive=positive, negative=negative, seed=19, steps=1,
-        width=512, height=512, batch_size=1, guidance=1.0, scheduler="breeze_tts",
-        breeze_mode="voice_design", breeze_speaker="S3",
-        breeze_instruction="清晰、有活力", breeze_max_tokens=12,
-    )
-finally:
-    sampler_module.CACHE = old_cache
-    pipeline.has_breeze_waveform = old_has
-    pipeline.prepare_breeze_model = old_prepare
-    pipeline.run_breeze_sampler = old_run
-    pipeline.release_breeze_model = old_release
-
-check(
-    "旧 sampler 的 Breeze 分支仍可用且始终释放完整模型",
-    result == (sentinel,)
-    and captured["text"] == "這是目標台詞"
-    and captured["mode"] == "voice_design"
-    and captured["speaker"] == "S3"
-    and captured["instruction"] == "清晰、有活力"
-    and captured["max_tokens"] == 12
-    and captured["complete_model"] == "complete-model"
-    and captured["released"] is True,
-    str(captured),
+        width=512, height=512, batch_size=1, guidance=1.0, scheduler="breeze_tts"
+    ),
 )
 
 

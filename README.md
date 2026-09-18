@@ -3,6 +3,8 @@
 面向 Apple Silicon 的 ComfyUI MLX 生成节点。模型组件通过纯数据 handle 在节点间传递，
 Transformer、文本编码器和 VAE 只在实际消费它们的节点中延迟加载。
 
+完整的安装、模型目录、节点和示例工作流说明见：[中文使用手册](USAGE_ZH.md)。
+
 ## Breeze-TTS-2 本地语音生成
 
 Breeze-TTS-2 通过专用采样器在 **ComfyUI 进程内**完成文本编码、语音 token 生成与
@@ -206,6 +208,52 @@ vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
 - 已验证 4-bit 端到端链路可将 `[200, 64]` latent 解码为 48 kHz 立体声；实际听感仍应
   结合目标提示词和音频设备人工试听。
 
+## MiniMax-H3 与 PipeNetwork 预量化 Transformer
+
+仓库提供两个可直接导入的 MiniMax-H3 工作流：
+
+```text
+workflows/minimax-h3-t2va.json          # 视频 + 音频
+workflows/minimax-h3-t2v-no-audio.json # 仅视频
+```
+
+默认工作流使用 640×352、124 帧（24 fps）和 50 步。H3 的 transformer、Qwen3-VL
+文本编码器、tokenizer、视频 VAE 与音频 VAE 是五个独立组件；常规目录布局如下：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/
+├── transformer/MiniMax-H3/
+├── text_encoder/MiniMax-H3/       # text_encoder_back
+├── tokenizer/MiniMax-H3/
+├── vae/MiniMax-H3/                # 视频 VAE
+└── audio_vae/MiniMax-H3/          # 音频 VAE
+```
+
+Transformer 也可以直接使用
+[`pipenetwork/MiniMax-H3-MLX-8bit`](https://huggingface.co/pipenetwork/MiniMax-H3-MLX-8bit)
+的原生 MLX 预量化 checkpoint，而不需要先反量化再重新量化。它只替换上面第一项：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/
+└── MiniMax-H3-MLX-8bit -> <HF cache>/models--pipenetwork--MiniMax-H3-MLX-8bit
+```
+
+软链接可以指向完整 Hugging Face cache 外壳，不必手工定位 commit 目录。插件会读取
+`refs/main` 并解析到对应的 `snapshots/<revision>/`；如果引用缺失、revision 非法、snapshot
+不存在或为空，会立即报告 cache 损坏。直接链接到 snapshot 或普通模型目录仍保持原行为。
+
+加载 PipeNetwork checkpoint 时，插件会在读取权重前严格校验 `quant_config.json` 与
+safetensors header，然后按仓库声明的 `bits`、`group_size` 和 AdaLN 位宽重建 MLX
+`QuantizedLinear` 模块。磁盘中的 packed `weight`、`scales`、`biases` 会逐 shard 直接写入，
+不会反量化，也不会二次量化；fused QKV 和 MLP 只做布局与模块名转换。此时 Transformer
+Loader 的 `quantize` 选择不会改变 checkpoint 精度，建议仍选择 `8`，使工作流配置与实际
+q8 权重一致。文本编码器与两个 VAE 仍使用各自原有的加载/量化设置。
+
+导入工作流后，把 `MlxTransformerLoader` 的路径改成 `MiniMax-H3-MLX-8bit`；CLIP、
+tokenizer、视频 VAE 与音频 VAE 继续选择 `MiniMax-H3`。完整 8-bit transformer 约 35 GB，
+按 7 个 shard 增量加载；最终内存还要叠加文本编码器、VAE、MLX cache 和采样激活，请先用
+示例的 640×352 / 124 帧做冒烟验证。
+
 ## Ideogram 4 FP8 本地文生图
 
 Ideogram 通过现有 ComfyUI MLX 节点链运行，**不调用 API**，也没有单独的 Ideogram
@@ -330,12 +378,14 @@ python -m pip show mlx mflux
 
 ## 静态回归测试
 
-YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，覆盖模型登记、组件路径、
-prompt/latent API、采样器边界，以及工作流节点、widget、socket 和 link 契约：
+MiniMax-H3、YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不加载真实大权重，
+覆盖模型登记、组件路径、prompt/latent API、采样器边界，以及工作流节点、widget、socket
+和 link 契约：
 
 ```bash
 /opt/anaconda3/envs/py313/bin/python tests/test_qwen_image.py
 /opt/anaconda3/envs/py313/bin/python tests/test_ideogram.py
+/opt/anaconda3/envs/py313/bin/python tests/test_h3_pipenetwork.py
 /opt/anaconda3/envs/py313/bin/python tests/test_yue2.py
 /opt/anaconda3/envs/py313/bin/python tests/test_breeze.py
 ```

@@ -216,6 +216,7 @@ def sample(
     plan: H3Plan,
     seed: int,
     log: Callable[[str], None] | None = print,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[mx.array, mx.array, Any]:
     """联合去噪：返回 `(video_rows, audio_rows, layout)`（都是未反归一化的 latent 行）。"""
     layout = build_layout(tags, plan, tuple(transformer.patch_size))
@@ -271,6 +272,8 @@ def sample(
             audio_pred[0, condition_audio_rows:].astype(mx.float32), step, audio_rows[condition_audio_rows:]
         )
         mx.eval(video_rows, audio_rows)
+        if on_progress is not None:
+            on_progress(step + 1, total)
         if log:
             log(f"[H3 采样] step {step + 1}/{total} t={float(video_t):.3f}")
     return video_rows, audio_rows, layout
