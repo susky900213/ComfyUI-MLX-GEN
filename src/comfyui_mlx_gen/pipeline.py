@@ -44,6 +44,7 @@ from typing import Any, Sequence
 import mlx.core as mx
 
 from . import breeze, components, image, paths, runtime, transformer_lora, weights
+from .compiled_predict import CompiledPredictCache
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.weights import loader as h3_loader
 from .progress import SamplingProgress
@@ -800,8 +801,33 @@ def build_scheduler(scheduler_name: str, config: Any) -> Any:
     return scheduler
 
 
-def _predict(transformer, latents, timestep, sigmas, encodings, negative, guidance, use_compile):
-    """单步预测（含 CFG；与 ZImage._predict 一致）。"""
+# --- 单步预测（编译产物在采样循环「外面」建一次）------------------------------
+# 每个 predict 变体各占一份 CompiledPredictCache（z_image / flux2 / flux2_edit /
+# flux2_edit_cached 互不挤占）：键只覆盖 Python 层的差异（是否开编译），
+# 数组的形状与数值都由调用方当参数传进来，`mx.compile` 自己按签名重 trace，
+# 因此换 prompt / 换尺寸 / 换步数都不会撞上旧计算图。
+COMPILED_PREDICT: dict[str, CompiledPredictCache] = {}
+
+
+def compiled_predict(variant: str) -> CompiledPredictCache:
+    """取某 predict 变体的编译缓存（没有就新建一份，之后一直复用）。"""
+    cache = COMPILED_PREDICT.get(variant)
+    if cache is None:
+        cache = CompiledPredictCache()
+        COMPILED_PREDICT[variant] = cache
+    return cache
+
+
+def make_z_image_predict(transformer, use_compile: bool):
+    """造 Z-Image 的单步预测（含 CFG；与 ZImage._predict 一致），返回可复用的 callable。
+
+    工厂只在采样循环**外面**调一次：`mx.compile` 因此只发生一次，
+    所有 seed、所有 step 共用同一份 trace（旧写法每步都重新 `mx.compile` 一次）；
+    编译产物还按「模块 + 编译开关」存在 `COMPILED_PREDICT` 里，
+    同一份权重的第二次采样连 trace 都不用重建。
+
+    返回的签名：`predict(latents, timestep, sigmas, encodings, negative, guidance)`。
+    """
 
     def predict(x, t, s, feats, neg_feats, scale):
         noise = transformer(timestep=t, x=x, cap_feats=feats, sigmas=s)
@@ -810,26 +836,26 @@ def _predict(transformer, latents, timestep, sigmas, encodings, negative, guidan
         negative = transformer(timestep=t, x=x, cap_feats=neg_feats, sigmas=s)
         return negative + scale * (noise - negative)
 
-    fn = mx.compile(predict) if use_compile else predict
-    return fn(latents, timestep, sigmas, encodings, negative, guidance)
+    return compiled_predict("z_image").get_or_build(
+        key=("t2i", bool(use_compile)),
+        weights_token=transformer,
+        build=lambda: mx.compile(predict) if use_compile else predict,
+    )
 
 
-def _predict_flux2(
-    transformer, latents, latent_ids, timestep, encodings, negative, guidance, use_compile
-):
-    """Flux2 单步预测（含 CFG；与 Flux2Klein._predict 一致）。
+def make_flux2_predict(transformer, use_compile: bool):
+    """造 Flux2 的单步预测（含 CFG；与 Flux2Klein._predict 一致），返回可复用的 callable。
 
+    与 z_image 同理：编译只做一次，整段采样（含多个 batch 项）复用同一份 trace。
     latents 是打包形式 `[B, seq, C]`，配套 `latent_ids`（grid ids `[B, seq, 4]`）；
     encodings / negative 都是 `(prompt_embeds, text_ids)` 二元组（negative 可为 None）。
     CFG 组合顺序与参考实现一致：`negative + guidance * (noise - negative)`。
-    """
-    pos_embeds, pos_ids = encodings
-    if negative is not None:
-        neg_embeds, neg_ids = negative
-    else:
-        neg_embeds, neg_ids = None, None
 
-    def predict(x, img_ids, p_embeds, p_ids, n_embeds, n_ids, scale, t):
+    返回的签名：`predict(latents, latent_ids, timestep, encodings, negative, guidance)`。
+    """
+
+    def predict(x, img_ids, t, enc, neg, scale):
+        p_embeds, p_ids = enc
         noise = transformer(
             hidden_states=x,
             encoder_hidden_states=p_embeds,
@@ -838,8 +864,9 @@ def _predict_flux2(
             txt_ids=p_ids,
             guidance=None,
         )
-        if n_embeds is None:
+        if neg is None:
             return noise
+        n_embeds, n_ids = neg
         negative_noise = transformer(
             hidden_states=x,
             encoder_hidden_states=n_embeds,
@@ -850,8 +877,11 @@ def _predict_flux2(
         )
         return negative_noise + scale * (noise - negative_noise)
 
-    fn = mx.compile(predict) if use_compile else predict
-    return fn(latents, latent_ids, pos_embeds, pos_ids, neg_embeds, neg_ids, guidance, timestep)
+    return compiled_predict("flux2").get_or_build(
+        key=("t2i", bool(use_compile)),
+        weights_token=transformer,
+        build=lambda: mx.compile(predict) if use_compile else predict,
+    )
 
 
 def _sample_z_image(defn, comps, params, cache, model_config, guidance, on_progress=None):
@@ -867,18 +897,16 @@ def _sample_z_image(defn, comps, params, cache, model_config, guidance, on_progr
         if guidance > 1.0
         else None
     )
-    use_compile = bool(params.get("compile_model", True))
     transformer = comps["transformer"]
+    # 单步预测（含编译）在循环外只建一次：所有 seed / 所有 step 复用同一份 trace
+    predict = make_z_image_predict(transformer, bool(params.get("compile_model", True)))
     final = []
     for latents in per_seed:
         current = latents
         for t in range(params["steps"]):
             sigma_t = scheduler.sigmas[t].reshape((1,))
             timestep = mx.ones_like(sigma_t) - sigma_t
-            noise = _predict(
-                transformer, current, timestep, scheduler.sigmas,
-                encodings, negative, guidance, use_compile,
-            )
+            noise = predict(current, timestep, scheduler.sigmas, encodings, negative, guidance)
             current = scheduler.step(noise=noise, timestep=t, latents=current)
             mx.eval(current)
             if on_progress is not None:
@@ -913,15 +941,14 @@ def _sample_flux2(defn, comps, params, cache, model_config, guidance, on_progres
     apple_silicon = runtime.import_object("mflux.utils.apple_silicon:AppleSiliconUtil")
     use_compile = bool(params.get("compile_model", True)) and not apple_silicon.is_m1_or_m2()
     transformer = comps["transformer"]
+    # 同 z_image：编译只发生在循环外，整段采样（含 batch 内多个 seed）复用同一份 trace
+    predict = make_flux2_predict(transformer, use_compile)
     final = []
     for latents, latent_ids, _latent_h, _latent_w in per_seed:
         current = latents  # [1, seq, C]
         for t in range(params["steps"]):
             timestep = scheduler.timesteps[t]
-            noise = _predict_flux2(
-                transformer, current, latent_ids, timestep,
-                encodings, negative, guidance, use_compile,
-            )
+            noise = predict(current, latent_ids, timestep, encodings, negative, guidance)
             current = scheduler.step(
                 noise=noise, timestep=t, latents=current, sigmas=scheduler.sigmas
             )
@@ -954,32 +981,24 @@ def _new_kv_cache(transformer):
     )
 
 
-def _predict_flux2_edit(
-    transformer,
-    latents,
-    ref_latents,
-    latent_ids,
-    ref_ids,
-    timestep,
-    encodings,
-    negative,
-    guidance,
-    use_compile,
-    kv_cache=None,
-    negative_kv_cache=None,
-):
-    """Flux2 edit 单步预测（含 CFG；与 mflux `Flux2KleinEdit._predict` 一致）。
+def make_flux2_edit_predict(transformer, use_compile: bool):
+    """造 Flux2 edit 的单步预测（含 CFG；与 mflux `Flux2KleinEdit._predict` 一致）。
 
     目标 token 在前、参考图 token 在后；`noise` 只取回目标段
     `[:, :latents.shape[1]]`；CFG 组合顺序同样是 `neg + scale * (pos - neg)`。
-    kv 缓存只在第 1 步（`extract`）走这里 —— 之后由 `_predict_flux2_edit_cached`
-    只送目标 token，因此本函数在 kv 启用时始终收到 `use_compile=False`（与 mflux 一致：
-    缓存对象要在步之间改状态，不编译）。
-    """
-    pos_embeds, pos_ids = encodings
-    neg_embeds, neg_ids = negative if negative is not None else (None, None)
+    工厂只在采样循环**外面**调一次，所有 step / seed 复用同一份编译产物。
+    带 kv 缓存时只有第 1 步（`extract`）走这里 —— 之后由
+    `make_flux2_edit_cached_predict` 只送目标 token，因此启用 kv 时本工厂
+    始终收到 `use_compile=False`（与 mflux 一致：kv 缓存对象要在步之间改状态，
+    既不能烘进计算图，也不是数组 / 标量常量，不能当编译入参）。
 
-    def predict(x, refs, ids, rids, p_embeds, p_ids, n_embeds, n_ids, scale, t, kvc, nkvc):
+    返回的签名：
+    `predict(latents, ref_latents, latent_ids, ref_ids, timestep, encodings, negative,
+    guidance, kv_cache, negative_kv_cache)`。
+    """
+
+    def predict(x, refs, ids, rids, t, enc, neg, scale, kvc, nkvc):
+        p_embeds, p_ids = enc
         hidden = mx.concatenate([x, refs], axis=1)
         img_ids = mx.concatenate([ids, rids], axis=1)
         noise = transformer(
@@ -992,8 +1011,9 @@ def _predict_flux2_edit(
             kv_cache=kvc,
         )
         noise = noise[:, : x.shape[1]]
-        if n_embeds is None:
+        if neg is None:
             return noise
+        n_embeds, n_ids = neg
         negative_noise = transformer(
             hidden_states=hidden,
             encoder_hidden_states=n_embeds,
@@ -1006,64 +1026,58 @@ def _predict_flux2_edit(
         negative_noise = negative_noise[:, : x.shape[1]]
         return negative_noise + scale * (noise - negative_noise)
 
-    fn = mx.compile(predict) if use_compile else predict
-    return fn(
-        latents,
-        ref_latents,
-        latent_ids,
-        ref_ids,
-        pos_embeds,
-        pos_ids,
-        neg_embeds,
-        neg_ids,
-        guidance,
-        timestep,
-        kv_cache,
-        negative_kv_cache,
+    return compiled_predict("flux2_edit").get_or_build(
+        key=("extract", bool(use_compile)),
+        weights_token=transformer,
+        build=lambda: mx.compile(predict) if use_compile else predict,
     )
 
 
-def _predict_flux2_edit_cached(
-    transformer,
-    latents,
-    latent_ids,
-    timestep,
-    encodings,
-    negative,
-    guidance,
-    kv_cache,
-    negative_kv_cache=None,
-):
-    """kv 缓存命中（`mode="cached"`）时的 edit 单步预测：只送目标 token。
+def make_flux2_edit_cached_predict(transformer):
+    """kv 缓存命中（`mode="cached"`）时的 edit 单步预测工厂：只送目标 token。
 
     与 mflux `Flux2KleinEdit._cached_predict` 一致：参考图 token 的 K/V 已在第 1 步
-    抽进 kv 缓存，这里不再 concat 参考图；与 mflux 一样**不编译**。
+    抽进 kv 缓存，这里不再 concat 参考图；与 mflux 一样**不编译**，
+    工厂仍只在循环外调一次，省掉每步重建函数的开销。
+
+    返回的签名：
+    `predict(latents, latent_ids, timestep, encodings, negative, guidance,
+    kv_cache, negative_kv_cache)`。
     """
-    pos_embeds, pos_ids = encodings
-    neg_embeds, neg_ids = negative if negative is not None else (None, None)
-    noise = transformer(
-        hidden_states=latents,
-        encoder_hidden_states=pos_embeds,
-        timestep=timestep,
-        img_ids=latent_ids,
-        txt_ids=pos_ids,
-        guidance=None,
-        kv_cache=kv_cache,
+
+    def predict(x, ids, t, enc, neg, scale, kvc, nkvc):
+        p_embeds, p_ids = enc
+        noise = transformer(
+            hidden_states=x,
+            encoder_hidden_states=p_embeds,
+            timestep=t,
+            img_ids=ids,
+            txt_ids=p_ids,
+            guidance=None,
+            kv_cache=kvc,
+        )
+        noise = noise[:, : x.shape[1]]
+        if neg is None:
+            return noise
+        n_embeds, n_ids = neg
+        negative_noise = transformer(
+            hidden_states=x,
+            encoder_hidden_states=n_embeds,
+            timestep=t,
+            img_ids=ids,
+            txt_ids=n_ids,
+            guidance=None,
+            kv_cache=nkvc or kvc,
+        )
+        negative_noise = negative_noise[:, : x.shape[1]]
+        return negative_noise + scale * (noise - negative_noise)
+
+    # 始终不编译（见上）；仍然走缓存，让同一份权重反复采样时复用同一个函数对象
+    return compiled_predict("flux2_edit_cached").get_or_build(
+        key=("cached", False),
+        weights_token=transformer,
+        build=lambda: predict,
     )
-    noise = noise[:, : latents.shape[1]]
-    if neg_embeds is None:
-        return noise
-    negative_noise = transformer(
-        hidden_states=latents,
-        encoder_hidden_states=neg_embeds,
-        timestep=timestep,
-        img_ids=latent_ids,
-        txt_ids=neg_ids,
-        guidance=None,
-        kv_cache=negative_kv_cache or kv_cache,
-    )
-    negative_noise = negative_noise[:, : latents.shape[1]]
-    return negative_noise + guidance * (noise - negative_noise)
 
 
 def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance, on_progress=None):
@@ -1093,6 +1107,9 @@ def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance, on_pr
     )
     use_compile = bool(params.get("compile_model", True)) and not kv_enabled and not _is_m1_or_m2()
     transformer = comps["transformer"]
+    # 两份单步预测（第 1 步的 extract、之后的 cached）都在循环外建一次
+    predict_extract = make_flux2_edit_predict(transformer, use_compile)
+    predict_cached = make_flux2_edit_cached_predict(transformer)
     final = []
     for latents, latent_ids, _latent_h, _latent_w in per_seed:
         current = latents  # [1, seq, C]
@@ -1108,8 +1125,7 @@ def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance, on_pr
                     negative_kv_cache.configure(mode=mode, num_ref_tokens=ref_latents.shape[1])
             timestep = scheduler.timesteps[t]
             if kv_cache is not None and t > 0:
-                noise = _predict_flux2_edit_cached(
-                    transformer,
+                noise = predict_cached(
                     current,
                     latent_ids,
                     timestep,
@@ -1120,8 +1136,7 @@ def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance, on_pr
                     negative_kv_cache,
                 )
             else:
-                noise = _predict_flux2_edit(
-                    transformer,
+                noise = predict_extract(
                     current,
                     ref_latents,
                     latent_ids,
@@ -1130,7 +1145,6 @@ def _sample_flux2_edit(defn, comps, params, cache, model_config, guidance, on_pr
                     encodings,
                     negative,
                     guidance,
-                    use_compile,
                     kv_cache,
                     negative_kv_cache,
                 )
@@ -1223,32 +1237,38 @@ def _sample_qwen_edit(defn, comps, params, cache, model_config, guidance, on_pro
     return stacked
 
 
-def _predict_qwen(transformer, latents, step, config, encodings, negative, guidance, use_compile):
-    """Qwen 单步预测（含 CFG；与 mflux `QwenImage._predict` 一致）。
+def make_qwen_predict(transformer, config, use_compile: bool):
+    """造 Qwen 的单步预测（含 CFG；与 mflux `QwenImage._predict` 一致），返回可复用的 callable。
 
     latents 是打包形式 `[1, seq, 64]`，条件 `encodings` 是 `(embeds, mask)`；
     `step` 是**步号 int**（transformer 内部按 `config.scheduler.sigmas[step]`
     反查 sigma，与 mflux 的 `for t in config.time_steps` 一致），因此
     CFG 组合用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定）。
-    """
-    pos_embeds, pos_mask = encodings
-    if negative is not None:
-        neg_embeds, neg_mask = negative
-    else:
-        neg_embeds, neg_mask = None, None
 
-    def predict(x, t, p_embeds, p_mask, n_embeds, n_mask, scale):
+    与 flux2 / z_image 的工厂不同，这里**不编译**，因此也不进
+    `CompiledPredictCache`：transformer 要整份 `config` 和步号 int，
+    两者都不是数组 / 标量常量，当编译入参会直接把计算图烘坏（把建函数时
+    的 Config 留在计算图里，换了步数 / 尺寸 / 调度器就会算错）；
+    `entry.supports_compile=False` 也已经把 `use_compile` 关掉，
+    工厂仍然只在采样循环**外面**调一次，循环里复用同一个闭包。
+
+    返回的签名：`predict(latents, step, encodings, negative, guidance)`。
+    """
+
+    def predict(x, step, enc, neg, scale):
+        p_embeds, p_mask = enc
         noise = transformer(
-            t=t,
+            t=step,
             config=config,
             hidden_states=x,
             encoder_hidden_states=p_embeds,
             encoder_hidden_states_mask=p_mask,
         )
-        if n_embeds is None:
+        if neg is None:
             return noise
+        n_embeds, n_mask = neg
         negative_noise = transformer(
-            t=t,
+            t=step,
             config=config,
             hidden_states=x,
             encoder_hidden_states=n_embeds,
@@ -1256,8 +1276,7 @@ def _predict_qwen(transformer, latents, step, config, encodings, negative, guida
         )
         return qwen_guided_noise(noise, negative_noise, scale)
 
-    fn = mx.compile(predict) if use_compile else predict
-    return fn(latents, step, pos_embeds, pos_mask, neg_embeds, neg_mask, guidance)
+    return predict
 
 
 def _sample_qwen_image(defn, comps, params, cache, model_config, guidance, on_progress=None):
@@ -1285,8 +1304,10 @@ def _sample_qwen_image(defn, comps, params, cache, model_config, guidance, on_pr
     negative = (
         cached_encoding(cache, params["negative_encoding_key"], "负") if guidance > 1.0 else None
     )
-    use_compile = bool(params.get("compile_model", True))
     transformer = comps["transformer"]
+    # 单步预测在循环外建一次，所有 seed / 所有 step 复用同一个闭包
+    # （Qwen 这条链路始终不编译，见 make_qwen_predict）
+    predict = make_qwen_predict(transformer, config, bool(params.get("compile_model", True)))
     final = []
     for latents in per_seed:
         current = latents  # [1, (h/16)(w/16), 64]
@@ -1294,9 +1315,7 @@ def _sample_qwen_image(defn, comps, params, cache, model_config, guidance, on_pr
             # 与参考实现一致地过一遍 scale_model_input（Qwen 用的两个调度器都继承
             # BaseScheduler 的恒等实现，因此这里等价于直接用 current）
             scaled = scheduler.scale_model_input(current, t)
-            noise = _predict_qwen(
-                transformer, scaled, t, config, encodings, negative, guidance, use_compile
-            )
+            noise = predict(scaled, t, encodings, negative, guidance)
             current = scheduler.step(noise=noise, timestep=t, latents=scaled)
             mx.eval(current)
             if on_progress is not None:

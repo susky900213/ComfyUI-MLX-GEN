@@ -41,7 +41,7 @@ class MlxTransformerLoader:
                 "quantize": (QUANTIZE_OPTIONS, {"default": 8}),
                 "precision": (["bfloat16", "float16", "float32"], {"default": "bfloat16"}),
                 "compile": ([True, False], {"default": True}),
-                "compile_cache_limit": ([0, 1, 2, 3], {"default": 2}),
+                "compile_cache_limit": ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32, 64], {"default": 2}),
             }
         }
 
