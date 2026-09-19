@@ -32,7 +32,8 @@ condition = "condition"  # 单条提示词 + 编码它所用的组件配置
 vae = "mlx_vae"  # MLX VAE handle（MlxVAELoader → MlxVAEEncoder / MlxVAEDecoder）
 ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 latent + grid ids）
 ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留原尺寸；MlxRefImageSet → MlxVAEEncoder）
-h3_keyframes = "mlx_h3_keyframes"  # H3 首/尾帧条件（图像本体留在缓存，handle 只带摘要与顺序）
+# H3 视觉条件（首 / 尾帧锚点 + 多图参考；图片本体留在缓存，handle 只带键、顺序与画布）
+h3_keyframes = "mlx_h3_keyframes"
 
 
 # --- 纯数据 handle ---
@@ -86,7 +87,8 @@ class MlxConditioning:
     clip: MlxClipHandle
     text: str
     encoding_key: str = ""  # 编码数组的缓存键（数组本身留在 cache.py）
-    h3_keyframes: Any = None  # MlxH3Keyframes；仅 MiniMax-H3 的正向图文条件使用
+    # MlxH3VisualCondition；仅 MiniMax-H3 的正向「带图」条件使用（纯文生视频时为空）
+    h3_keyframes: Any = None
 
 
 @dataclass(frozen=True)
@@ -155,21 +157,80 @@ class MlxVaeHandle:
 
 
 @dataclass(frozen=True)
-class MlxH3Keyframes:
-    """MiniMax-H3 的有序首/尾帧条件；图片本体存于 ``h3_keyframe_source`` 缓存桶。
+class MlxH3VisualCondition:
+    """MiniMax-H3 的视觉条件：有序图片 + 可选的首 / 尾帧 latent 锚点。
 
-    ``anchors`` 与缓存中的 PIL 元组逐项对应，只能按 ``first``、``last`` 排列。
-    图像已经在节点中按目标画布用 LANCZOS 拉伸，因此 Qwen3-VL presentation 与
-    Video VAE latent 锚点必定看到完全相同的像素。``digest`` 同时覆盖原图内容、
-    锚点位置、目标尺寸和 VAE 配置，供文本及 latent 缓存键防止错误复用。
+    图片本体不进 handle：按 ``images_key`` 存在 cache.py 的 ``h3_keyframe_source``
+    桶里（值是 ``tuple[PIL.Image, ...]``，顺序 = presentation 里 ``<Picture i>``
+    的编号，第 1 张就是 ``<Picture 1>``）。
+
+    H3 的打包序列只有 ``first`` / ``last`` 两个 latent 锚点槽
+    （``h3/latent_creator/h3_layout.py`` 的 ``keyframe_anchors`` 只认这两个值），
+    因此 ``anchors`` 最多 2 项、只能按 ``first`` → ``last`` 排列；
+    ``anchor_images`` 与 ``anchors`` 一一对应，指出该锚点钉在第几张图上：
+
+    - ``anchors`` 为空 = **纯参考**：图只进 Qwen3-VL 的 presentation（视觉提示），
+      不占 latent 行 —— 这是「多张图片参考生视频」在本模型上唯一的通路；
+    - 有锚点时，被点名的那几张图必须已经按目标画布（``width`` × ``height``）
+      用 LANCZOS 拉伸过，这样 Qwen3-VL 与 Video VAE 看到的是同一份像素；
+      没被点名的参考图保留自己的尺寸（``preprocess_image`` 会各自 smart-resize）。
+
+    ``digest`` 覆盖图片内容 + 顺序 + 锚点 + 画布 + VAE，供 presentation 与
+    latent 的缓存键防止错误复用。
+
+    只有 ``MiniMax-H3-REF``（``transformer_ref``，官方 H3-Base-Ref2VA）学过
+    「按参考生成」：2 张以上、或 ``anchors`` 为空时，``MlxKSamplerMLX`` 会要求
+    transformer 选 REF 那一套（校验见 ``h3/pipeline.check_visual_condition_checkpoint``）；
+    1~2 张并钉成首 / 尾锚点才是 Base 的 I2VA / FL2VA 任务。
     """
 
-    anchors: tuple[str, ...]
-    width: int
-    height: int
-    digest: str
-    cache_key: str
-    vae: MlxVaeHandle
+    images_key: str  # "h3_keyframe_source" 桶里那个有序 PIL 元组的键
+    picture_count: int  # 送进 presentation 的图片张数（1..MAX_VISUAL_PICTURES）
+    anchors: tuple[str, ...] = ()  # () | ("first",) | ("last",) | ("first", "last")
+    anchor_images: tuple[int, ...] = ()  # 与 anchors 对齐：该锚点用第几张图（0 基）
+    width: int = 0  # 目标画布（必须与采样器一致）
+    height: int = 0
+    digest: str = ""  # 有序图片 + 锚点 + 画布的摘要（进缓存键）
+    source: str = "keyframe"  # "keyframe" | "reference" | "video"
+    source_label: str = ""  # 报告 / 排错用：源图片或源视频的名字
+    vae: MlxVaeHandle | None = None  # 有锚点时必须有视频 VAE（role=vae）；纯参考可为空
+
+    def __post_init__(self) -> None:
+        if self.picture_count < 1:
+            raise ValueError(f"H3 视觉条件至少需要 1 张图，收到 {self.picture_count} 张")
+        if not self.images_key:
+            raise ValueError("H3 视觉条件必须带图片缓存键（图片本体留在 cache.py）")
+        if len(self.anchor_images) != len(self.anchors):
+            raise ValueError(
+                f"H3 视觉条件的锚点与图片下标没有一一对应：{self.anchors} 对 {self.anchor_images}"
+            )
+        if self.anchors not in {(), ("first",), ("last",), ("first", "last")}:
+            raise ValueError(
+                "H3 的打包序列只有首帧与尾帧两个锚点槽，"
+                f"锚点只能按 first → last 排列，收到 {self.anchors}"
+            )
+        if len(set(self.anchor_images)) != len(self.anchor_images):
+            raise ValueError(f"H3 视觉条件的两个锚点指向了同一张图：{self.anchor_images}")
+        for anchor, index in zip(self.anchors, self.anchor_images):
+            if not 0 <= int(index) < int(self.picture_count):
+                raise ValueError(
+                    f"H3 视觉条件的 {anchor} 锚点指向第 {index} 张图，"
+                    f"但只有 {self.picture_count} 张图"
+                )
+        if int(self.width) % 32 or int(self.height) % 32:
+            raise ValueError(
+                f"H3 的画布宽高必须是 32 的正整数倍，收到 {self.width}×{self.height}"
+            )
+        if self.anchors and self.vae is None:
+            raise ValueError(
+                "H3 的 latent 锚点必须用视频 VAE（role=vae）编码："
+                "请把「MLX VAE 加载器」的 vae 输出接到本节点的 vae 入口"
+            )
+        if self.vae is not None and (self.vae.model_type != "minimax_h3" or self.vae.role != "vae"):
+            raise ValueError(
+                "H3 视觉条件必须使用 minimax_h3 的视频 VAE（role=vae），"
+                f"收到 model_type={self.vae.model_type!r}, role={self.vae.role!r}"
+            )
 
 
 @dataclass(frozen=True)

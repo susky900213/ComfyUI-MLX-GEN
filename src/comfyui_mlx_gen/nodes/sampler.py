@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from .. import pipeline
 from ..cache import CACHE
+from ..h3 import pipeline as h3_pipeline
 from ..h3.latent_creator.h3_layout import valid_frame_counts
 from ..types import condition, entry_for, model, model_types, ref_images
 
@@ -178,19 +179,30 @@ class MlxKSamplerMLX:
                 )
             keyframes = positive.h3_keyframes
             if keyframes is not None:
-                if (
+                # 参考生视频（Ref2VA）与首 / 尾锚点（I2VA / FL2VA）是两套不同的
+                # transformer 权重：拿 Base 跑参考图，模型只会读到文本里的图片描述
+                checkpoint_note = h3_pipeline.check_visual_condition_checkpoint(model, keyframes)
+                if checkpoint_note:
+                    print(f"[MlxKSamplerMLX] {checkpoint_note}")
+                if keyframes.vae is None:
+                    # 纯参考（anchor=none）：图只进 Qwen3-VL 的 presentation，没有 latent 锚点
+                    print(
+                        f"[MlxKSamplerMLX] {keyframes.source_label or '视觉条件'}："
+                        "没有首 / 尾帧锚点，图片只当视觉提示（presentation）"
+                    )
+                elif (
                     keyframes.vae.model_type != model.model_type
                     or keyframes.vae.role != "vae"
                 ):
                     raise ValueError(
-                        "H3 关键帧必须由当前模型大类的视频 VAE（role=vae）编码："
-                        f"关键帧是 model_type={keyframes.vae.model_type!r}, "
+                        "H3 视觉条件必须由当前模型大类的视频 VAE（role=vae）编码："
+                        f"条件是 model_type={keyframes.vae.model_type!r}, "
                         f"role={keyframes.vae.role!r}，采样器是 {model.model_type!r}"
                     )
                 if keyframes.width != int(width) or keyframes.height != int(height):
                     raise ValueError(
-                        "H3 关键帧目标画布必须与采样器一致："
-                        f"关键帧是 {keyframes.width}×{keyframes.height}，"
+                        "H3 视觉条件的目标画布必须与采样器一致："
+                        f"条件是 {keyframes.width}×{keyframes.height}，"
                         f"采样器是 {int(width)}×{int(height)}"
                     )
             expected_key = pipeline.h3_prompt_encoding_key(positive.clip, positive.text, keyframes)
@@ -215,7 +227,10 @@ class MlxKSamplerMLX:
             # 相同 latent 仍在缓存时，不能为重建同一 handle 再加载 5 GB VAE 或 35 GB transformer。
             if pipeline.has_h3_latents(model, params, CACHE):
                 return (pipeline.run_h3_sampler(entry, model, None, params, CACHE),)
-            keyframe_latents = pipeline.encode_h3_keyframes(keyframes, CACHE) if keyframes is not None else ()
+            # 锚点 latent 与 params["keyframe_anchors"] 一一对应（纯参考时两个都是空）
+            keyframe_latents = (
+                pipeline.encode_h3_keyframes(keyframes, CACHE)[1] if keyframes is not None else ()
+            )
             try:
                 comps = pipeline.prepare_h3_sampler_components(entry, model, CACHE)
                 handle = pipeline.run_h3_sampler(

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from comfyui_mlx_gen import image, pipeline  # noqa: E402
-from comfyui_mlx_gen.cache import Cache  # noqa: E402
+from comfyui_mlx_gen.cache import CACHE, Cache  # noqa: E402
 from comfyui_mlx_gen.h3 import pipeline as h3_pipeline  # noqa: E402
 from comfyui_mlx_gen.h3.latent_creator.h3_layout import (  # noqa: E402
     AUDIO_CHANNELS,
@@ -31,12 +31,13 @@ from comfyui_mlx_gen.h3.latent_creator.h3_layout import (  # noqa: E402
 )
 from comfyui_mlx_gen.h3.scheduler.minimax_h3_scheduler import MiniMaxH3Scheduler  # noqa: E402
 from comfyui_mlx_gen.nodes import h3_keyframes as keyframe_node  # noqa: E402
+from comfyui_mlx_gen.nodes import ref_image_set as ref_set_node  # noqa: E402
 from comfyui_mlx_gen.nodes import sampler as sampler_node  # noqa: E402
 from comfyui_mlx_gen.nodes import text_encoder as text_encoder_node  # noqa: E402
 from comfyui_mlx_gen.types import (  # noqa: E402
     MlxClipHandle,
     MlxConditioning,
-    MlxH3Keyframes,
+    MlxH3VisualCondition,
     MlxModelHandle,
     MlxVaeHandle,
     entry_for,
@@ -89,7 +90,7 @@ try:
     last, _ = node.pack(video_vae, 64, 32, last_frame=last_src)
     both, report = node.pack(video_vae, 64, 32, first_frame=first_src, last_frame=last_src)
 
-    cached_both, hit = node_cache.get("h3_keyframe_source", both.cache_key)
+    cached_both, hit = node_cache.get("h3_keyframe_source", both.images_key)
     manual_first = image.to_pil_batch(first_src)[0].resize((64, 32), Image.Resampling.LANCZOS)
     manual_last = image.to_pil_batch(last_src)[0].resize((64, 32), Image.Resampling.LANCZOS)
     check("首帧模式锚点为 first", first.anchors == ("first",), str(first.anchors))
@@ -153,6 +154,347 @@ finally:
     keyframe_node.CACHE = old_cache
 
 
+# ------------------------------------------------- 1b. 多图参考条件（N 张只进 presentation）
+# 参考图集与 H3 视觉条件节点共用 cache.py 的同一个实例：两边都得指到同一份缓存，
+# 否则会出现「读不到参考图」的假故障。h3_keyframe_source 桶只留 2 条，
+# 因此这里换成独立 Cache，并在每次 pack 之后马上核对。
+old_keyframe_cache = keyframe_node.CACHE
+old_ref_cache = ref_set_node.CACHE
+iso_cache = Cache()
+keyframe_node.CACHE = iso_cache
+ref_set_node.CACHE = iso_cache
+try:
+    ref_set = ref_set_node.MlxRefImageSet()
+    multi_source, multi_count, _ = ref_set.pack(
+        tensor_image(8, 12), tensor_image(10, 14, 0.5), tensor_image(6, 9, 0.75)
+    )
+    check("参考图集按顺序打包 3 张", multi_count == 3, str(multi_count))
+
+    multi_node = keyframe_node.MlxH3MultiReferenceCondition()
+    pure_ref, pure_report = multi_node.pack(multi_source, "none", True, 64, 32)
+    pure_images, pure_hit = iso_cache.get("h3_keyframe_source", pure_ref.images_key)
+    check(
+        "纯参考：三张图都进 presentation，但没有 latent 锚点",
+        pure_ref.anchors == ()
+        and pure_ref.anchor_images == ()
+        and pure_ref.picture_count == 3
+        and pure_ref.vae is None
+        and pure_hit
+        and [pil.size for pil in pure_images] == [(12, 8), (14, 10), (9, 6)],
+        f"{pure_ref.anchors} / {pure_ref.anchor_images} / {pure_ref.picture_count}",
+    )
+    check(
+        "纯参考时不物化 Video VAE，也不占 latent 行",
+        pipeline.encode_h3_keyframes(pure_ref, iso_cache) == ((), ()),
+    )
+
+    ref_first, _ = multi_node.pack(multi_source, "first", True, 64, 32, vae=video_vae)
+    first_images, first_hit = iso_cache.get("h3_keyframe_source", ref_first.images_key)
+    check(
+        "按源宽高比解析画布（4:3 给出 32 倍数且比例接近）",
+        ref_first.width % 32 == 0
+        and ref_first.height % 32 == 0
+        and abs(ref_first.width / ref_first.height - 12 / 8) < 0.2,
+        f"{ref_first.width}×{ref_first.height}",
+    )
+    check(
+        "只钉第 1 张：它按画布拉伸，后两张仍是原尺寸",
+        ref_first.anchors == ("first",)
+        and ref_first.anchor_images == (0,)
+        and first_hit
+        and first_images[0].size == (ref_first.width, ref_first.height)
+        and first_images[1].size == (14, 10)
+        and first_images[2].size == (9, 6),
+        str([pil.size for pil in first_images]),
+    )
+
+    ref_last, _ = multi_node.pack(multi_source, "last", True, 64, 32, vae=video_vae)
+    check(
+        "只钉最后 1 张：锚点指向第 3 张",
+        ref_last.anchors == ("last",) and ref_last.anchor_images == (2,),
+        f"{ref_last.anchors} / {ref_last.anchor_images}",
+    )
+
+    ref_both, both_report = multi_node.pack(multi_source, "first_last", True, 64, 32, vae=video_vae)
+    both_images, both_hit = iso_cache.get("h3_keyframe_source", ref_both.images_key)
+    check(
+        "首尾都钉时锚点映射到非相邻下标（0 与 2）",
+        ref_both.anchors == ("first", "last")
+        and ref_both.anchor_images == (0, 2)
+        and ref_both.picture_count == 3,
+        f"{ref_both.anchors} / {ref_both.anchor_images}",
+    )
+    check(
+        "被点名当锚点的两张图按画布拉伸，中间那张仍是原尺寸",
+        both_hit
+        and both_images[0].size == (ref_both.width, ref_both.height)
+        and both_images[1].size == (14, 10)
+        and both_images[2].size == (ref_both.width, ref_both.height),
+        str([pil.size for pil in both_images]),
+    )
+    check(
+        "换锚点会换 handle（摘要与图片缓存键都跟着变）",
+        len({pure_ref.digest, ref_first.digest, ref_last.digest, ref_both.digest}) == 4
+        and len(
+            {
+                pure_ref.images_key,
+                ref_first.images_key,
+                ref_last.images_key,
+                ref_both.images_key,
+            }
+        )
+        == 4,
+    )
+    check(
+        "报告里写明 <Picture 1..N> 与锚点映射",
+        "<Picture 1..3>" in pure_report
+        and "无锚点（纯参考）" in pure_report
+        and "first←第1张" in both_report
+        and "last←第3张" in both_report,
+        f"{pure_report} / {both_report}",
+    )
+    single_source, _, _ = ref_set.pack(tensor_image(8, 12))
+    check_raises(
+        "只有一张参考图时拒绝选 first_last",
+        ValueError,
+        "至少要 2 张",
+        lambda: multi_node.pack(single_source, "first_last", True, 64, 32, vae=video_vae),
+    )
+    check_raises(
+        "锚点不是 none 却没接 VAE 时明确拒绝",
+        ValueError,
+        "需要视频 VAE",
+        lambda: multi_node.pack(multi_source, "first", True, 64, 32),
+    )
+    check_raises(
+        "没接参考图集（handle 类型不对）时拒绝",
+        ValueError,
+        "必须连接「MLX 参考图集」",
+        lambda: multi_node.pack("not-a-ref-source", "none", True, 64, 32),
+    )
+
+
+    big_source, big_count, _ = ref_set.pack(
+        torch.cat([tensor_image(8, 12), tensor_image(8, 12, 0.1), tensor_image(8, 12, 0.2)], dim=0),
+        torch.cat([tensor_image(8, 12), tensor_image(8, 12, 0.3), tensor_image(8, 12, 0.4)], dim=0),
+        torch.cat([tensor_image(8, 12), tensor_image(8, 12, 0.5), tensor_image(8, 12, 0.6)], dim=0),
+        torch.cat([tensor_image(8, 12), tensor_image(8, 12, 0.7), tensor_image(8, 12, 0.8)], dim=0),
+    )
+    check("批次槽位展开后共 12 张参考图", big_count == 12, str(big_count))
+    check_raises(
+        "参考图超过 9 张时直接拒绝（H3-Base-Ref2VA 的官方上限是 9 张）",
+        ValueError,
+        "最多送 9 张",
+        lambda: multi_node.pack(big_source, "none", True, 64, 32),
+    )
+
+    # --------------------------------------------- 1c. 视频条件（从源视频取一帧当锚点）
+    frames = torch.cat(
+        [tensor_image(36, 64), tensor_image(36, 64, 0.25), tensor_image(36, 64, 0.5)], dim=0
+    )
+    fake_video = SimpleNamespace(
+        file_path="fake-source.mp4",
+        get_components=lambda: SimpleNamespace(images=frames, audio=None, frame_rate=25),
+    )
+    video_node = keyframe_node.MlxH3VideoCondition()
+    cont, cont_report = video_node.pack(
+        fake_video, "continue_from_end", True, 64, 32, vae=video_vae
+    )
+    manual_last_frame = image.to_pil_batch(frames)[-1].resize(
+        (cont.width, cont.height), Image.Resampling.LANCZOS
+    )
+    cont_images, cont_hit = iso_cache.get("h3_keyframe_source", cont.images_key)
+    check(
+        "续写模式取源视频最后一帧钉成 first 锚点",
+        cont.anchors == ("first",)
+        and cont.anchor_images == (0,)
+        and cont_hit
+        and cont_images[0].tobytes() == manual_last_frame.tobytes(),
+    )
+    back, _ = video_node.pack(fake_video, "continue_from_start", True, 64, 32, vae=video_vae)
+    manual_first_frame = image.to_pil_batch(frames)[0].resize(
+        (back.width, back.height), Image.Resampling.LANCZOS
+    )
+    back_images, back_hit = iso_cache.get("h3_keyframe_source", back.images_key)
+    check(
+        "倒补模式取源视频第一帧钉成 last 锚点",
+        back.anchors == ("last",)
+        and back_hit
+        and back_images[0].tobytes() == manual_first_frame.tobytes(),
+    )
+    check(
+        "按源视频宽高比解析画布（16:9 → 32 倍数且比例接近）",
+        cont.width % 32 == 0
+        and cont.height % 32 == 0
+        and cont.width > 64
+        and abs(cont.width / cont.height - 64 / 36) < 0.05
+        and cont.source == "video",
+        f"{cont.width}×{cont.height}",
+    )
+    check(
+        "报告与 source_label 标明源视频与取用的帧",
+        "源视频第 3 / 3 帧" in cont.source_label
+        and "源视频第 3 帧当 first 锚点" in cont_report,
+        f"{cont.source_label} / {cont_report}",
+    )
+    check_raises(
+        "没接 VAE 时拒绝（锚点必须能编码成 latent）",
+        ValueError,
+        "必须把取出来的那一帧编码成 latent 锚点",
+        lambda: video_node.pack(fake_video, "continue_from_end", True, 64, 32),
+    )
+    check_raises(
+        "源视频只有一帧时拒绝做续写条件",
+        ValueError,
+        "不足以做续写条件",
+        lambda: video_node.pack(
+            SimpleNamespace(
+                file_path="one-frame.mp4",
+                get_components=lambda: SimpleNamespace(
+                    images=tensor_image(36, 64), audio=None, frame_rate=25
+                ),
+            ),
+            "continue_from_end",
+            True,
+            64,
+            32,
+            vae=video_vae,
+        ),
+    )
+    check_raises(
+        "接的不是 VIDEO（没有 get_components）时拒绝",
+        ValueError,
+        "必须连接 ComfyUI 的「Load Video」",
+        lambda: video_node.pack(object(), "continue_from_end", True, 64, 32, vae=video_vae),
+    )
+finally:
+    keyframe_node.CACHE = old_keyframe_cache
+    ref_set_node.CACHE = old_ref_cache
+
+
+# ---------------------------------------- 1d. 任务档位 ↔ transformer 权重（参考要用 REF）
+# 「参考生视频」走的是官方 H3-Base-Ref2VA 那条权重（transformer_ref / MiniMax-H3-ref）：
+# 只有它学过按参考生成，用 Base 时参考图只会被当成文本里的一段描述。
+base_model = MlxModelHandle(
+    model_type="minimax_h3",
+    model_path="MiniMax-H3",
+    quantize=8,
+    precision="bfloat16",
+    compile=False,
+    compile_cache_limit=2,
+)
+ref_model = MlxModelHandle(
+    model_type="minimax_h3",
+    model_path="MiniMax-H3-ref",
+    quantize=8,
+    precision="bfloat16",
+    compile=False,
+    compile_cache_limit=2,
+)
+serve_ref_model = MlxModelHandle(
+    model_type="minimax_h3",
+    model_path="MiniMax-H3-Ref2VA-MLX-Serve-8bit.safetensors",
+    quantize=8,
+    precision="bfloat16",
+    compile=False,
+    compile_cache_limit=2,
+)
+check("MiniMax-H3 仍然算 Base 权重", not h3_pipeline.uses_ref_checkpoint(base_model.model_path))
+check(
+    "目录名 MiniMax-H3-ref 识别成 REF 权重",
+    h3_pipeline.uses_ref_checkpoint(ref_model.model_path),
+    ref_model.model_path,
+)
+check(
+    "单文件 MiniMax-H3-Ref2VA-… 也识别成 REF 权重",
+    h3_pipeline.uses_ref_checkpoint(serve_ref_model.model_path),
+    serve_ref_model.model_path,
+)
+check(
+    "3 张纯参考 → 该用 REF；首尾锚点 → 该用 Base；纯文生视频 → 两档都行",
+    h3_pipeline.checkpoint_tier_for_condition(pure_ref) == "ref"
+    and h3_pipeline.checkpoint_tier_for_condition(both) == "base"
+    and h3_pipeline.checkpoint_tier_for_condition(None) == "any",
+)
+check_raises(
+    "拿 Base 权重跑参考生视频（3 张参考图）直接拒绝",
+    ValueError,
+    "必须用 Minimax-H3-REF",
+    lambda: h3_pipeline.check_visual_condition_checkpoint(base_model, pure_ref),
+)
+check_raises(
+    "2 张但都不钉锚点：Base 权重同样拒绝（纯参考只有 REF 学过）",
+    ValueError,
+    "必须用 Minimax-H3-REF",
+    lambda: h3_pipeline.check_visual_condition_checkpoint(
+        base_model,
+        MlxH3VisualCondition(
+            images_key="two-refs",
+            picture_count=2,
+            anchors=(),
+            width=64,
+            height=32,
+            digest="two-refs",
+            source="reference",
+            source_label="2 张参考图",
+        ),
+    ),
+)
+check(
+    "REF 权重 + 3 张参考图放行，并说明图只进 presentation",
+    "只进 Qwen3-VL 的 presentation"
+    in h3_pipeline.check_visual_condition_checkpoint(ref_model, pure_ref),
+)
+check(
+    "用 REF 权重跑首尾锚点只给提示，不报错",
+    "I2VA / FL2VA" in h3_pipeline.check_visual_condition_checkpoint(ref_model, both),
+)
+check(
+    "Base 权重 + 首尾锚点完全对味（不需要提示）",
+    h3_pipeline.check_visual_condition_checkpoint(base_model, both) == "",
+)
+check_raises(
+    "REF 权重下 10 张图仍超上限（官方 9 张）",
+    ValueError,
+    "最多喂 9 张",
+    lambda: h3_pipeline.check_visual_condition_checkpoint(
+        ref_model,
+        MlxH3VisualCondition(
+            images_key="ten-refs",
+            picture_count=10,
+            anchors=("first", "last"),
+            anchor_images=(0, 9),
+            width=64,
+            height=32,
+            digest="ten-refs",
+            source="reference",
+            source_label="10 张参考图",
+            vae=video_vae,
+        ),
+    ),
+)
+check_raises(
+    "Base 权重下 3 张以上按上限直接拒绝",
+    ValueError,
+    "最多喂 2 张",
+    lambda: h3_pipeline.check_visual_condition_checkpoint(
+        base_model,
+        MlxH3VisualCondition(
+            images_key="three-refs",
+            picture_count=3,
+            anchors=("first", "last"),
+            anchor_images=(0, 2),
+            width=64,
+            height=32,
+            digest="three-refs",
+            source="reference",
+            source_label="3 张参考图（钉首尾）",
+            vae=video_vae,
+        ),
+    ),
+)
+
+
 # --------------------------------------------------------- 2. presentation 键与源图缓存一致性
 clip = MlxClipHandle(
     model_type="minimax_h3",
@@ -169,7 +511,7 @@ both_key = pipeline.h3_prompt_encoding_key(clip, "prompt", both)
 check("纯文本、首帧、尾帧、首尾帧 presentation 缓存键互相隔离", len({plain_key, first_key, last_key, both_key}) == 4)
 
 prompt_cache = Cache()
-prompt_cache.get_or_create("h3_keyframe_source", both.cache_key, lambda: cached_both)
+prompt_cache.get_or_create("h3_keyframe_source", both.images_key, lambda: cached_both)
 captured: dict[str, object] = {}
 old_import = pipeline.runtime.import_object
 pipeline.runtime.import_object = lambda _spec: (
@@ -195,12 +537,16 @@ check(
     and tuple(encoded[0].shape) == (1, 3, 4),
 )
 
-missing = MlxH3Keyframes(
+missing = MlxH3VisualCondition(
+    images_key="missing",
+    picture_count=1,
     anchors=("first",),
+    anchor_images=(0,),
     width=64,
     height=32,
     digest="missing",
-    cache_key="missing",
+    source="keyframe",
+    source_label="缺失的关键帧",
     vae=video_vae,
 )
 check_raises(
@@ -411,37 +757,33 @@ def sampler_call(positive, negative=None, width=64, height=32):
     )
 
 
-forged_audio_keyframes = MlxH3Keyframes(
-    anchors=("first",),
-    width=64,
-    height=32,
-    digest="forged-audio",
-    cache_key="forged-audio",
-    vae=MlxVaeHandle(
-        model_type="minimax_h3",
-        path="MiniMax-H3",
-        precision="bfloat16",
-        quantize=8,
-        role="audio_vae",
-    ),
-)
-forged_audio_condition = MlxConditioning(
-    clip=clip,
-    text="prompt",
-    encoding_key=pipeline.h3_prompt_encoding_key(clip, "prompt", forged_audio_keyframes),
-    h3_keyframes=forged_audio_keyframes,
-)
+def make_audio_vae_condition() -> MlxH3VisualCondition:
+    """尝试伪造「用 Audio VAE 编码锚点」的 handle（构造阶段就该挡住）。"""
+    return MlxH3VisualCondition(
+        images_key="forged-audio",
+        picture_count=1,
+        anchors=("first",),
+        anchor_images=(0,),
+        width=64,
+        height=32,
+        digest="forged-audio",
+        source="keyframe",
+        source_label="伪造的音频 VAE 关键帧",
+        vae=MlxVaeHandle(
+            model_type="minimax_h3",
+            path="MiniMax-H3",
+            precision="bfloat16",
+            quantize=8,
+            role="audio_vae",
+        ),
+    )
+
+
 check_raises(
-    "sampler 再次拒绝伪造的 Audio VAE 关键帧 handle",
+    "handle 在数据类构造阶段就拒绝 H3 Audio VAE",
     ValueError,
     "role=vae",
-    lambda: sampler_call(forged_audio_condition),
-)
-check_raises(
-    "文本编码器在加载组件前拒绝伪造的 Audio VAE 关键帧 handle",
-    ValueError,
-    "role=vae",
-    lambda: text_encoder_node.MlxTextEncoder().encode("prompt", clip, forged_audio_keyframes),
+    make_audio_vae_condition,
 )
 
 first_condition = MlxConditioning(
@@ -630,7 +972,7 @@ check(
 )
 
 lifecycle_cache = Cache()
-lifecycle_cache.get_or_create("h3_keyframe_source", first.cache_key, lambda: (cached_both[0],))
+lifecycle_cache.get_or_create("h3_keyframe_source", first.images_key, lambda: (cached_both[0],))
 old_prepare_vae = pipeline.prepare_h3_vae
 old_encode_latents = pipeline.h3_pipeline.encode_keyframe_latents
 old_release_vae = pipeline.release_h3_vae
@@ -665,7 +1007,7 @@ finally:
     pipeline.release_h3_vae = old_release_vae
 check(
     "Video VAE 在成功、编码异常和准备异常路径都释放",
-    vae_success == ("latent",)
+    vae_success == (("first",), ("latent",))
     and vae_failed
     and vae_prepare_failed
     and vae_releases == ["released", "released", "released"],
@@ -792,6 +1134,133 @@ for workflow_name, expected_mode in workflow_modes.items():
         == [keyframe_workflow_node["id"], 0, text_workflow_node["id"], 1]
     )
     check(f"工作流 {workflow_name} 的节点、link、slot 与关键帧模式有效", valid)
+
+
+# --------------------------------------- 8. 六份新工作流（多图 / 视频 / 纯参考）契约
+def workflow_is_valid(workflow):
+    """核对工作流的节点、link、slot 是否自洽（links 数组与节点槽位双向对得上）。"""
+    nodes = {item["id"]: item for item in workflow["nodes"]}
+    links = {item[0]: item for item in workflow["links"]}
+    valid = (
+        len(nodes) == len(workflow["nodes"])
+        and len(links) == len(workflow["links"])
+        and workflow["last_node_id"] == max(nodes)
+        and workflow["last_link_id"] == max(links)
+    )
+    for link_id, source, source_slot, target, target_slot, type_name in workflow["links"]:
+        output = nodes[source]["outputs"][source_slot]
+        input_ = nodes[target]["inputs"][target_slot]
+        valid = valid and (
+            link_id in (output.get("links") or [])
+            and input_.get("link") == link_id
+            and output["type"] == input_["type"] == type_name
+        )
+    for _, workflow_node in nodes.items():
+        for input_slot, input_ in enumerate(workflow_node.get("inputs", [])):
+            link_id = input_.get("link")
+            valid = valid and input_.get("slot_index") == input_slot
+            if link_id is not None:
+                valid = valid and (
+                    link_id in links
+                    and links[link_id][3:6] == [workflow_node["id"], input_slot, input_["type"]]
+                )
+        for output_slot, output in enumerate(workflow_node.get("outputs", [])):
+            valid = valid and output.get("slot_index") == output_slot
+            for link_id in output.get("links") or []:
+                valid = valid and (
+                    link_id in links
+                    and links[link_id][1:3] == [workflow_node["id"], output_slot]
+                    and links[link_id][5] == output["type"]
+                )
+    return valid, nodes, links
+
+
+VISUAL_TYPES = {"MlxH3KeyframeCondition", "MlxH3MultiReferenceCondition", "MlxH3VideoCondition"}
+# 值 = (必须出现的节点, 视觉条件是否带 latent 锚点, 期望的 transformer 权重集)。
+# 参考生视频（多图 / 纯参考）必须落在 Minimax-H3-ref 上，其余都留在 Base。
+WORKFLOW_CONTRACTS = {
+    "minimax-h3-single-image-to-video.json": (
+        {"MlxH3KeyframeCondition", "MlxTextEncoder", "MlxKSamplerMLX", "MlxVAELoader"},
+        True,
+        "MiniMax-H3",
+    ),
+    "minimax-h3-multi-image-to-video.json": (
+        {"MlxRefImageSet", "MlxH3MultiReferenceCondition", "MlxKSamplerMLX"},
+        True,
+        "MiniMax-H3-ref",
+    ),
+    "minimax-h3-reference-only-to-video.json": (
+        {"MlxRefImageSet", "MlxH3MultiReferenceCondition", "MlxKSamplerMLX"},
+        False,
+        "MiniMax-H3-ref",
+    ),
+    "minimax-h3-video-continuation-keep-audio.json": (
+        {"LoadVideo", "MlxH3VideoCondition", "GetVideoComponents", "CreateVideo",
+         "ConcatenateVideo", "AudioConcat", "SaveVideo"},
+        True,
+        "MiniMax-H3",
+    ),
+    "minimax-h3-video-continuation-drop-audio.json": (
+        {"LoadVideo", "MlxH3VideoCondition", "CreateVideo", "SaveVideo"},
+        True,
+        "MiniMax-H3",
+    ),
+    "minimax-h3-video-continuation-replace-audio.json": (
+        {"LoadVideo", "MlxH3VideoCondition", "LoadAudio", "CreateVideo", "SaveVideo"},
+        True,
+        "MiniMax-H3",
+    ),
+}
+for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW_CONTRACTS.items():
+    workflow = json.loads((ROOT / "workflows" / workflow_name).read_text(encoding="utf-8"))
+    valid, workflow_nodes, workflow_links = workflow_is_valid(workflow)
+    types = {item["type"] for item in workflow["nodes"]}
+    visual = next(item for item in workflow["nodes"] if item["type"] in VISUAL_TYPES)
+    text = next(item for item in workflow["nodes"] if item["type"] == "MlxTextEncoder")
+    sampler = next(item for item in workflow["nodes"] if item["type"] == "MlxKSamplerMLX")
+    transformer = next(item for item in workflow["nodes"] if item["type"] == "MlxTransformerLoader")
+    clip_loader = next(item for item in workflow["nodes"] if item["type"] == "MlxClipLoader")
+    vae_loader = next(item for item in workflow["nodes"] if item["type"] == "MlxVAELoader")
+    # 视觉源必须真的接到条件节点：只连 VAE、或者漏连 ref_images，都等于图白配
+    source_inputs = [item for item in visual["inputs"] if item["name"] != "vae"]
+    wired_sources = sum(1 for item in source_inputs if item["link"] is not None)
+    if visual["type"] == "MlxH3KeyframeCondition":
+        # 首 / 尾帧允许只接一张，但一张都不接就是配错
+        valid = valid and wired_sources >= 1
+    else:
+        # 图集 / 源视频是这类条件的唯一入口，必须接上
+        valid = valid and wired_sources == len(source_inputs) == 1
+    keyframe_links = [
+        item for item in workflow["links"] if item[3] == text["id"] and item[4] == 1
+    ]
+    condition_links = [
+        item for item in workflow["links"] if item[3] == sampler["id"] and item[4] in (1, 2)
+    ]
+    valid = (
+        valid
+        and required_types <= types
+        and len(keyframe_links) == 1
+        and keyframe_links[0][1] == visual["id"]
+        and keyframe_links[0][5] == "mlx_h3_keyframes"
+        and len(condition_links) == 2
+        and all(item[1] == text["id"] for item in condition_links)
+        # 视觉条件的画布必须与采样器一致，否则采样器会直接报错
+        and visual["widgets_values"][-2:] == sampler["widgets_values"][2:4]
+        # 没有锚点时不该接视频 VAE；有锚点时必须接
+        and (visual["inputs"][1]["link"] is not None) == has_anchor
+        # 参考生视频（不钉锚点 / 2 张以上）必须落在 REF 权重上，
+        # 否则采样器会在 check_visual_condition_checkpoint 里直接报错
+        and transformer["widgets_values"][1] == expected_checkpoint
+        and h3_pipeline.uses_ref_checkpoint(transformer["widgets_values"][1])
+        == (expected_checkpoint == "MiniMax-H3-ref")
+        and (has_anchor or h3_pipeline.uses_ref_checkpoint(transformer["widgets_values"][1]))
+        # 条件编码器 / tokenizer / VAE 两边共用同一套（REF 只换 transformer）
+        and clip_loader["widgets_values"][2] == "MiniMax-H3"
+        and vae_loader["widgets_values"][1] == "MiniMax-H3"
+        and workflow["id"].startswith("mlx-")
+        and bool(workflow["extra_workflow"]["title"])
+    )
+    check(f"工作流 {workflow_name} 的节点、link、slot 与视觉条件契约有效", valid)
 
 
 if FAILED:

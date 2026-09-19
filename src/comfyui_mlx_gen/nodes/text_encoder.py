@@ -20,7 +20,7 @@ from ..types import (
     entry_for,
     MlxClipHandle,
     MlxConditioning,
-    MlxH3Keyframes,
+    MlxH3VisualCondition,
     h3_keyframes as h3_keyframes_type,
 )
 
@@ -55,8 +55,8 @@ class MlxTextEncoder:
         entry = entry_for(clip.model_type)
         if not entry.supported:
             raise NotImplementedError(f"{clip.model_type} 尚未实现：{entry.notes}")
-        if h3_keyframes is not None and not isinstance(h3_keyframes, MlxH3Keyframes):
-            raise ValueError("h3_keyframes 必须连接「MLX H3 关键帧条件」的输出")
+        if h3_keyframes is not None and not isinstance(h3_keyframes, MlxH3VisualCondition):
+            raise ValueError("h3_keyframes 必须连接「MLX H3 关键帧 / 多图参考 / 视频条件」的输出")
         if h3_keyframes is not None and entry.family != "minimax_h3":
             raise ValueError(f"h3_keyframes 只支持 minimax_h3，当前条件大类是 {entry.family}")
         if entry.family == "qwen_edit":
@@ -97,14 +97,14 @@ class MlxTextEncoder:
                     f"quantize 改成 8 或 4；当前是 {clip.quantize}）"
                 )
             composed = pipeline.compose_h3_prompt(prompt)
-            if h3_keyframes is not None and (
-                h3_keyframes.vae.model_type != clip.model_type
-                or h3_keyframes.vae.role != "vae"
+            visual_vae = h3_keyframes.vae if h3_keyframes is not None else None
+            if visual_vae is not None and (
+                visual_vae.model_type != clip.model_type or visual_vae.role != "vae"
             ):
                 raise ValueError(
-                    "H3 关键帧必须使用当前文本条件大类的视频 VAE（role=vae）："
-                    f"关键帧是 model_type={h3_keyframes.vae.model_type!r}, "
-                    f"role={h3_keyframes.vae.role!r}，文本条件是 {clip.model_type!r}"
+                    "H3 视觉条件必须使用当前文本条件大类的视频 VAE（role=vae）："
+                    f"条件是 model_type={visual_vae.model_type!r}, "
+                    f"role={visual_vae.role!r}，文本条件是 {clip.model_type!r}"
                 )
             encoding_key = pipeline.h3_prompt_encoding_key(clip, composed, h3_keyframes)
             try:

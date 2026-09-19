@@ -127,6 +127,7 @@ ComfyUI，而不只是刷新浏览器。
 | Qwen-Image-Edit 2511 | `qwen_edit` | `qwen-image-edit-2511-8bit` | `transformer`、`text_encoder`、`tokenizer`、`vae` | `AbstractFramework/qwen-image-edit-2511-8bit` |
 | Ideogram 4 FP8 | `ideogram4` | `ideogram-4-fp8` | 上述四类，再加 `unconditional_transformer` | `ideogram-ai/ideogram-4-fp8` |
 | MiniMax-H3 视频/音频 | `minimax_h3` | `MiniMax-H3` | `transformer`、`text_encoder`、`tokenizer`、`vae`、`audio_vae` | `MiniMaxAI/MiniMax-H3` |
+| MiniMax-H3 参考生视频（Ref2VA） | `minimax_h3` | `MiniMax-H3-REF`（本地 `MiniMax-H3-ref`） | 只替换 `transformer`（snapshot 的 `transformer_ref`）；其他组件仍取 `MiniMax-H3` | `MiniMaxAI/MiniMax-H3` |
 | MiniMax-H3 预量化 Transformer | `minimax_h3` | `MiniMax-H3-MLX-8bit` | 只替换 `transformer`；其他组件仍取 `MiniMax-H3` | `pipenetwork/MiniMax-H3-MLX-8bit` |
 | YuE2-3B 音乐 | `yue2` | `YuE2-3B-MLX-4bit` | 完整变体目录分别放入 `transformer`、`vae` | `npario/YuE2-3B-MLX` |
 | Breeze-TTS-2 | `breeze_tts2` | `Breeze-TTS-2-mlx-4bit` | 完整 checkpoint 只放 `transformer` | `mlx-community/Breeze-TTS-2-mlx-4bit` |
@@ -216,11 +217,12 @@ Ideogram 4 是 gated 模型，需先在 Hugging Face 接受模型许可。
 
 ### 2.3 MiniMax-H3
 
-MiniMax-H3 的标准组件布局：
+MiniMax-H3 的标准组件布局（`transformer` 有 Base 与 REF 两条，其余组件共用）：
 
 ```text
 /Users/apple/ComfyUI-Shared/models/mlx/
-├── transformer/MiniMax-H3/       # snapshot/transformer
+├── transformer/MiniMax-H3/       # snapshot/transformer（Base：t2v / 首尾帧）
+├── transformer/MiniMax-H3-ref/   # snapshot/transformer_ref（Ref2VA：参考生视频）
 ├── text_encoder/MiniMax-H3/      # snapshot/text_encoder_back
 ├── tokenizer/MiniMax-H3/         # snapshot/tokenizer
 ├── vae/MiniMax-H3/               # snapshot/vae，视频 VAE
@@ -235,11 +237,18 @@ MLX_ROOT=/Users/apple/ComfyUI-Shared/models/mlx
 SNAPSHOT=/模型实际位置/MiniMax-H3
 
 ln -s "$SNAPSHOT/transformer"       "$MLX_ROOT/transformer/MiniMax-H3"
+ln -s "$SNAPSHOT/transformer_ref"   "$MLX_ROOT/transformer/MiniMax-H3-ref"
 ln -s "$SNAPSHOT/text_encoder_back" "$MLX_ROOT/text_encoder/MiniMax-H3"
 ln -s "$SNAPSHOT/tokenizer"         "$MLX_ROOT/tokenizer/MiniMax-H3"
 ln -s "$SNAPSHOT/vae"               "$MLX_ROOT/vae/MiniMax-H3"
 ln -s "$SNAPSHOT/audio_vae"         "$MLX_ROOT/audio_vae/MiniMax-H3"
 ```
+
+**参考生视频（多图 / 纯参考）必须把 `MlxTransformerLoader` 选成
+`MiniMax-H3-ref`**：Base 的 `transformer` 只支持 0~2 张图、只认首 / 尾两个
+锚点槽，`transformer_ref`（H3-Base-Ref2VA）才支持最多 9 张参考图；
+首 / 尾帧与视频续写仍用 Base。两份 transformer 的结构与 `config.json` 相同，
+差的只是训练权重，因此换 checkpoint 不需要改代码——但选错了采样器会直接报错。
 
 每个 H3 组件目录都必须保留自己的 `config.json` 和 `.safetensors` 权重；这包括
 Transformer、`text_encoder_back`、视频 VAE 与音频 VAE。当前实现会分别调用严格的
@@ -352,6 +361,15 @@ Whisper 完整 checkpoint 放到：
 | `workflows/ideogram-4-fp8.json` | Ideogram 4 FP8 文生图 | 1024×1024、`ideogram4_default` |
 | `workflows/minimax-h3-t2v-no-audio.json` | MiniMax-H3 文生视频 | 640×352、124 帧、50 步、无音轨 |
 | `workflows/minimax-h3-t2va.json` | MiniMax-H3 文生视频和立体声 | 在视频工作流上增加 `audio_vae` |
+| `workflows/minimax-h3-i2va-first-frame.json` | MiniMax-H3 首帧生视频（Base） | 1 张图钉成第一帧 |
+| `workflows/minimax-h3-i2va-last-frame.json` | MiniMax-H3 尾帧生视频（Base） | 1 张图钉成最后一帧 |
+| `workflows/minimax-h3-i2va-first-last-frame.json` | MiniMax-H3 首尾帧生视频（Base） | 2 张图分别钉首 / 尾帧 |
+| `workflows/minimax-h3-single-image-to-video.json` | MiniMax-H3 单图生视频（Base） | 生成器版本，1 张图钉首帧 |
+| `workflows/minimax-h3-multi-image-to-video.json` | MiniMax-H3 多图参考生视频（**H3-REF**） | 3 张参考图，第 1 张钉首帧 |
+| `workflows/minimax-h3-reference-only-to-video.json` | MiniMax-H3 纯参考生视频（**H3-REF**） | 3 张只进 presentation，不钉锚点 |
+| `workflows/minimax-h3-video-continuation-keep-audio.json` | 源视频续写并拼成片（Base） | `GetVideoComponents` + `ConcatenateVideo` + `AudioConcat` |
+| `workflows/minimax-h3-video-continuation-drop-audio.json` | 只出新片段（Base） | 丢弃原声，用 H3 生成的音轨 |
+| `workflows/minimax-h3-video-continuation-replace-audio.json` | 只出新片段 + 外部配乐（Base） | `LoadAudio` 整段替换音轨 |
 | `workflows/yue2-3b.json` | YuE2 风格+歌词生成音乐 | 32 步、最长先设约 8 秒 |
 | `workflows/breeze-tts2.json` | Breeze 内置说话人 TTS | `speaker` 模式、S0、24 kHz 单声道 |
 | `workflows/breeze-tts2-voice-clone.json` | Breeze 手工逐字稿声音克隆 | 参考音频 + 完全一致的逐字稿 |

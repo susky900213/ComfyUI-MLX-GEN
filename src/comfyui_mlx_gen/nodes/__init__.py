@@ -3,7 +3,11 @@
 from .breeze_sampler import MlxBreezeSampler
 from .clip_loader import MlxClipLoader
 from .loader import MlxTransformerLoader
-from .h3_keyframes import MlxH3KeyframeCondition
+from .h3_keyframes import (
+    MlxH3KeyframeCondition,
+    MlxH3MultiReferenceCondition,
+    MlxH3VideoCondition,
+)
 from .lora import MlxClipLoraApply, MlxModelLoraApply
 from .text_encoder import MlxTextEncoder
 from .qwen_edit import MlxQwenEditEncoder
@@ -20,6 +24,8 @@ __all__ = [
     "MlxBreezeSampler",
     "MlxClipLoader",
     "MlxH3KeyframeCondition",
+    "MlxH3MultiReferenceCondition",
+    "MlxH3VideoCondition",
     "MlxTextEncoder",
     "MlxQwenEditEncoder",
     "MlxRefImageSet",

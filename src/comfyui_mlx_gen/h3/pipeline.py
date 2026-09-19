@@ -64,6 +64,88 @@ PEAK_BYTES_PER_PACKED_ROW = 271_356
 # 超过物理内存的这个比例就很危险（有实测在 0.73 被系统 kill）
 REQUEST_BUDGET_SHARE = 0.72
 
+# --- 任务档位 ↔ transformer 权重（Base vs REF / Ref2VA）---------------------------
+# 官方 model_index 里 transformer 有两条：`transformer`（Base：t2v / 首帧 / 尾帧 /
+# 首尾帧，最多 2 张图）与 `transformer_ref`（H3-Base-Ref2VA：全景参考，
+# 图片 ≤9、视频 ≤3、音频 ≤3）。**参考生视频必须用 REF 那一套权重**
+# （`transformer/MiniMax-H3-ref` 或 `MiniMax-H3-Ref2VA-MLX-Serve-8bit.safetensors`）：
+# 用 Base 时参考图只会被当成文本里的一段描述，跟不出参考内容。
+REF_CHECKPOINT_TOKENS: tuple[str, ...] = (
+    "ref2va",
+    "ref2v",
+    "h3-ref",
+    "h3_ref",
+    "transformer_ref",
+)
+# 官方 spec：Base 一次最多 2 张图（且只认首 / 尾两个锚点槽），REF 最多 9 张
+BASE_MAX_IMAGES = 2
+REF_MAX_IMAGES = 9
+
+
+def uses_ref_checkpoint(path: str) -> bool:
+    """权重目录名 / 文件名是不是 REF（Ref2VA）那一套（如 `MiniMax-H3-ref`）。"""
+    lowered = str(path).lower().replace(" ", "").replace("/", "-")
+    return any(token in lowered for token in REF_CHECKPOINT_TOKENS)
+
+
+def checkpoint_tier_for_condition(keyframes: Any) -> str:
+    """按「图片张数 + 锚点」判断该用哪一档权重：`"base"` / `"ref"` / `"any"`。
+
+    - 没有视觉条件（纯文生视频）→ 两档都能跑，返回 `"any"`；
+    - 不钉锚点（纯参考）或图片 >2 张 → 只有 REF 学过，返回 `"ref"`；
+    - 1~2 张并钉成首 / 尾锚点 → 官方的 I2VA / FL2VA 任务，返回 `"base"`。
+    """
+    if keyframes is None:
+        return "any"
+    if not keyframes.anchors:
+        return "ref"
+    if int(keyframes.picture_count) > BASE_MAX_IMAGES:
+        return "ref"
+    return "base"
+
+
+def check_visual_condition_checkpoint(model: Any, keyframes: Any) -> str:
+    """视觉条件与选中的 transformer 是否搭调；返回要打印给用户的中文说明。
+
+    跑不通的组合（拿 Base 跑参考生视频、图片张数超过该档上限）直接抛
+    ValueError；能跑但语义不标准的组合（用 REF 跑首 / 尾锚点）只返回提示。
+    """
+    if keyframes is None:
+        return ""
+    label = keyframes.source_label or f"{keyframes.picture_count} 张图"
+    is_ref = uses_ref_checkpoint(model.model_path)
+    limit = REF_MAX_IMAGES if is_ref else BASE_MAX_IMAGES
+    if int(keyframes.picture_count) > limit:
+        tier = "REF（Ref2VA）" if is_ref else "Base"
+        hint = (
+            ""
+            if is_ref
+            else "；超过 2 张的参考图必须用 Minimax-H3-REF 才行，"
+                 "请在「MLX 模型加载器」里改选 MiniMax-H3-REF"
+                 "（或 MiniMax-H3-Ref2VA-MLX-Serve-8bit.safetensors）"
+        )
+        raise ValueError(
+            f"{label}：{tier} 权重一次最多喂 {limit} 张图，现在给了 {keyframes.picture_count} 张{hint}"
+        )
+    need = checkpoint_tier_for_condition(keyframes)
+    if need == "ref" and not is_ref:
+        raise ValueError(
+            f"{label}：参考生视频（Ref2VA）必须用 Minimax-H3-REF 的 transformer，"
+            f"当前选的是 {model.model_path}；不钉锚点的参考图只有 REF 权重学过，"
+            "用 Base 只会读到文本里的图片描述"
+        )
+    if need == "ref":
+        return (
+            f"{label}：参考生视频走 REF 权重（{model.model_path}），"
+            f"{keyframes.picture_count} 张图只进 Qwen3-VL 的 presentation，不占 latent 行"
+        )
+    if need == "base" and is_ref:
+        return (
+            f"{label}：首 / 尾锚点属于 Base 的 I2VA / FL2VA 任务，"
+            f"当前选的是 REF 权重（{model.model_path}），仍按锚点跑但效果需自行验证"
+        )
+    return ""
+
 
 @dataclass(frozen=True)
 class H3Plan:

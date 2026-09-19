@@ -210,11 +210,21 @@ vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
 
 ## MiniMax-H3 与 PipeNetwork 预量化 Transformer
 
-仓库提供两个可直接导入的 MiniMax-H3 工作流：
+仓库提供十一份可直接导入的 MiniMax-H3 工作流（后六份由 `tools/gen_h3_workflows.py`
+生成，改完脚本重跑即可覆盖）：
 
 ```text
-workflows/minimax-h3-t2va.json          # 视频 + 音频
-workflows/minimax-h3-t2v-no-audio.json # 仅视频
+workflows/minimax-h3-t2va.json                    # 文生视频 + 立体声（Base）
+workflows/minimax-h3-t2v-no-audio.json            # 文生视频，仅画面（Base）
+workflows/minimax-h3-i2va-first-frame.json        # 首帧生视频（Base）
+workflows/minimax-h3-i2va-last-frame.json         # 尾帧生视频（Base）
+workflows/minimax-h3-i2va-first-last-frame.json   # 首尾帧生视频（Base）
+workflows/minimax-h3-single-image-to-video.json   # 1 张图钉成首帧（Base）
+workflows/minimax-h3-multi-image-to-video.json    # 3 张参考图，第 1 张钉成首帧（H3-REF）
+workflows/minimax-h3-reference-only-to-video.json # 3 张纯参考，不钉锚点（H3-REF）
+workflows/minimax-h3-video-continuation-keep-audio.json     # 源视频 + 原声拼成片（Base）
+workflows/minimax-h3-video-continuation-drop-audio.json     # 只出新片段（Base）
+workflows/minimax-h3-video-continuation-replace-audio.json  # 新片段 + 外部配乐（Base）
 ```
 
 默认工作流使用 640×352、124 帧（24 fps）和 50 步。H3 的 transformer、Qwen3-VL
@@ -222,12 +232,23 @@ workflows/minimax-h3-t2v-no-audio.json # 仅视频
 
 ```text
 /Users/apple/ComfyUI-Shared/models/mlx/
-├── transformer/MiniMax-H3/
-├── text_encoder/MiniMax-H3/       # text_encoder_back
+├── transformer/MiniMax-H3/          # 或 MiniMax-H3-MLX-8bit（预量化，见下）
+├── transformer/MiniMax-H3-ref/      # 参考生视频（Ref2VA）用的 REF transformer
+├── text_encoder/MiniMax-H3/         # text_encoder_back
 ├── tokenizer/MiniMax-H3/
-├── vae/MiniMax-H3/                # 视频 VAE
-└── audio_vae/MiniMax-H3/          # 音频 VAE
+├── vae/MiniMax-H3/                  # 视频 VAE
+└── audio_vae/MiniMax-H3/            # 音频 VAE
 ```
+
+**参考生视频必须选 Minimax-H3-REF。** 官方 checkpoint 的 transformer 有两条：
+`transformer`（Base）只支持 0~2 张图、而且只认首 / 尾两个 latent 锚点槽；
+`transformer_ref`（H3-Base-Ref2VA，落到本地即 `transformer/MiniMax-H3-ref`）
+才支持最多 9 张参考图与「按参考生成」。因此「多图参考」「纯参考」这类
+工作流的 `MlxTransformerLoader` 都要选 `MiniMax-H3-ref`（或
+`MiniMax-H3-Ref2VA-MLX-Serve-8bit.safetensors`），而首 / 尾帧、视频续写这类
+锚点任务仍用 Base 的 `MiniMax-H3`。文本编码器、tokenizer 与两个 VAE 两档共用
+同一份 `MiniMax-H3`，不需要另配。条件与权重不配对时（比如拿 Base 跑 3 张
+参考图，或不钉锚点的纯参考）`MlxKSamplerMLX` 会直接报错，不会静默出垃圾。
 
 Transformer 也可以直接使用
 [`pipenetwork/MiniMax-H3-MLX-8bit`](https://huggingface.co/pipenetwork/MiniMax-H3-MLX-8bit)
@@ -404,10 +425,17 @@ MiniMax-H3、YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不�
 /opt/anaconda3/envs/py313/bin/python tests/test_qwen_image.py
 /opt/anaconda3/envs/py313/bin/python tests/test_ideogram.py
 /opt/anaconda3/envs/py313/bin/python tests/test_h3_pipenetwork.py
+/opt/anaconda3/envs/py313/bin/python tests/test_h3_keyframes.py
 /opt/anaconda3/envs/py313/bin/python tests/test_yue2.py
 /opt/anaconda3/envs/py313/bin/python tests/test_breeze.py
 /opt/anaconda3/envs/py313/bin/python tests/test_lora.py
+/opt/anaconda3/envs/py313/bin/python tools/check_workflows_against_comfyui.py
 ```
+
+`tools/check_workflows_against_comfyui.py` 会按 ComfyUI 与本插件的真实节点定义核对
+每份工作流的槽名、类型与 widget 取值（ComfyUI 自带节点只查存在性），并检查
+「视觉条件 → 该用哪一档 transformer」是否与声明一致；`tools/gen_h3_workflows.py`
+则用于重新生成后六份 H3 工作流。
 
 测试成功时退出状态为 0；任何检查失败都会汇总失败项并以状态 1 退出。
 

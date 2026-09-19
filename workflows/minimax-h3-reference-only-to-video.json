@@ -1,0 +1,839 @@
+{
+  "id": "mlx-minimax-h3-reference-only-to-video",
+  "revision": 0,
+  "last_node_id": 19,
+  "last_link_id": 15,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [
+        0,
+        -120
+      ],
+      "size": [
+        380,
+        260
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxClipLoader"
+      },
+      "title": "H3 条件编码器 + tokenizer（q8，编码完即释放）",
+      "widgets_values": [
+        "minimax_h3",
+        "text_encoder",
+        "MiniMax-H3",
+        "bfloat16",
+        8192,
+        8
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MlxTransformerLoader",
+      "pos": [
+        0,
+        180
+      ],
+      "size": [
+        380,
+        240
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxTransformerLoader"
+      },
+      "title": "H3 transformer（MiniMax-H3-ref，q8；compile 会被 H3 强制关掉）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3-ref",
+        8,
+        "bfloat16",
+        false,
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MlxVAELoader",
+      "pos": [
+        0,
+        540
+      ],
+      "size": [
+        380,
+        220
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAELoader"
+      },
+      "title": "H3 音频 VAE（role=audio_vae）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3",
+        "bfloat16",
+        8,
+        "audio_vae"
+      ]
+    },
+    {
+      "id": 17,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        800
+      ],
+      "size": [
+        360,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            13
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "参考图 1",
+      "widgets_values": [
+        "h3_ref_1.png"
+      ]
+    },
+    {
+      "id": 18,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        1240
+      ],
+      "size": [
+        360,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            14
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "参考图 2",
+      "widgets_values": [
+        "h3_ref_2.png"
+      ]
+    },
+    {
+      "id": 19,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        1680
+      ],
+      "size": [
+        360,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            15
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "参考图 3",
+      "widgets_values": [
+        "h3_ref_3.png"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "MlxTextEncoder",
+      "pos": [
+        420,
+        120
+      ],
+      "size": [
+        420,
+        360
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1,
+          "slot_index": 0
+        },
+        {
+          "name": "h3_keyframes",
+          "type": "mlx_h3_keyframes",
+          "link": 12,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "condition",
+          "type": "condition",
+          "links": [
+            2,
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxTextEncoder"
+      },
+      "title": "H3 提示词 + 3 张参考图（不钉锚点）",
+      "widgets_values": [
+        "integrated_multimodal_description: 视频共 1 个镜头，按 <Picture 1> 到 <Picture 3> 的顺序取风格：第一张的晨雾湖面、第二张的白鹭、第三张的逆光芦苇。镜头从雾中缓缓横移，白鹭从芦苇后走出并在浅滩停住，画面始终保持柔和的冷调逆光。\n\noverall_soundscape: 清晨湖面环境音、远处鸟鸣、芦苇被风吹动的沙沙声。\n\nnon_diegetic_music: 钢琴单音与弦乐长音，安静克制。"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "MlxRefImageSet",
+      "pos": [
+        820,
+        1040
+      ],
+      "size": [
+        380,
+        300
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image1",
+          "type": "IMAGE",
+          "link": 13,
+          "slot_index": 0
+        },
+        {
+          "name": "image2",
+          "type": "IMAGE",
+          "link": 14,
+          "slot_index": 1
+        },
+        {
+          "name": "image3",
+          "type": "IMAGE",
+          "link": 15,
+          "slot_index": 2
+        },
+        {
+          "name": "image4",
+          "type": "IMAGE",
+          "link": null,
+          "slot_index": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ref_source",
+          "type": "mlx_ref_image_src",
+          "links": [
+            11
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "count",
+          "type": "INT",
+          "links": [],
+          "slot_index": 1
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxRefImageSet"
+      },
+      "title": "3 张参考图 → 有序图集",
+      "widgets_values": []
+    },
+    {
+      "id": 5,
+      "type": "MlxKSamplerMLX",
+      "pos": [
+        820,
+        120
+      ],
+      "size": [
+        420,
+        420
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "link": 4,
+          "slot_index": 0
+        },
+        {
+          "name": "positive",
+          "type": "condition",
+          "link": 2,
+          "slot_index": 1
+        },
+        {
+          "name": "negative",
+          "type": "condition",
+          "link": 3,
+          "slot_index": 2
+        },
+        {
+          "name": "ref_images",
+          "type": "mlx_ref_images",
+          "link": null,
+          "slot_index": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latents",
+          "type": "latents",
+          "links": [
+            6
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxKSamplerMLX"
+      },
+      "title": "H3 采样（打包序列 + 双整流流；640×352 / 124 帧 / 50 步）",
+      "widgets_values": [
+        20260917,
+        50,
+        640,
+        352,
+        1,
+        1.0,
+        "flow_match_euler_discrete",
+        124,
+        12.0,
+        3.0,
+        "auto"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "MlxH3MultiReferenceCondition",
+      "pos": [
+        1240,
+        1040
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ref_images",
+          "type": "mlx_ref_image_src",
+          "link": 11,
+          "slot_index": 0
+        },
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "link": null,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "keyframes",
+          "type": "mlx_h3_keyframes",
+          "links": [
+            12
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxH3MultiReferenceCondition"
+      },
+      "title": "H3 多图参考（3 张只进 presentation，不占 latent 行；要用 H3-REF）",
+      "widgets_values": [
+        "none",
+        false,
+        640,
+        352
+      ]
+    },
+    {
+      "id": 6,
+      "type": "MlxVAEDecodeRawPIL",
+      "pos": [
+        820,
+        600
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "latents",
+          "type": "latents",
+          "link": 6,
+          "slot_index": 0
+        },
+        {
+          "name": "audio_vae",
+          "type": "mlx_vae",
+          "link": 5,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "links": [
+            7
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAEDecodeRawPIL"
+      },
+      "title": "H3 解码（视频 VAE 由 widget 现取；音轨靠接进来的 audio_vae）",
+      "widgets_values": [
+        "minimax_h3",
+        "MiniMax-H3",
+        "bfloat16",
+        8,
+        -1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "MlxPilToTorch",
+      "pos": [
+        1300,
+        600
+      ],
+      "size": [
+        360,
+        260
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "link": 7,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            8
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "masks",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            9
+          ],
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxPilToTorch"
+      },
+      "title": "PIL → IMAGE / MASK / AUDIO",
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "CreateVideo",
+      "pos": [
+        1700,
+        600
+      ],
+      "size": [
+        360,
+        300
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 8,
+          "slot_index": 0
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "link": null,
+          "slot_index": 1
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 9,
+          "slot_index": 2
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "link": null,
+          "slot_index": 3
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "link": null,
+          "slot_index": 4
+        },
+        {
+          "name": "codec",
+          "type": "COMBO",
+          "link": null,
+          "slot_index": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            10
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "title": "帧 + 音轨 → VIDEO（H3 是 24 fps）",
+      "widgets_values": [
+        24,
+        8,
+        "sRGB",
+        "none"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "SaveVideo",
+      "pos": [
+        2100,
+        600
+      ],
+      "size": [
+        360,
+        240
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 10,
+          "slot_index": 0
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "link": null,
+          "slot_index": 1
+        },
+        {
+          "name": "format",
+          "type": "COMBO",
+          "link": null,
+          "slot_index": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "title": "存成 mp4（video/MiniMax-H3-ref）",
+      "widgets_values": [
+        "video/MiniMax-H3-ref",
+        "mp4"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      2,
+      0,
+      5,
+      1,
+      "condition"
+    ],
+    [
+      3,
+      2,
+      0,
+      5,
+      2,
+      "condition"
+    ],
+    [
+      4,
+      3,
+      0,
+      5,
+      0,
+      "model"
+    ],
+    [
+      5,
+      4,
+      0,
+      6,
+      1,
+      "mlx_vae"
+    ],
+    [
+      6,
+      5,
+      0,
+      6,
+      0,
+      "latents"
+    ],
+    [
+      7,
+      6,
+      0,
+      7,
+      0,
+      "images"
+    ],
+    [
+      8,
+      7,
+      0,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      9,
+      7,
+      2,
+      8,
+      2,
+      "AUDIO"
+    ],
+    [
+      10,
+      8,
+      0,
+      9,
+      0,
+      "VIDEO"
+    ],
+    [
+      11,
+      13,
+      0,
+      14,
+      0,
+      "mlx_ref_image_src"
+    ],
+    [
+      12,
+      14,
+      0,
+      2,
+      1,
+      "mlx_h3_keyframes"
+    ],
+    [
+      13,
+      17,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      14,
+      18,
+      0,
+      13,
+      1,
+      "IMAGE"
+    ],
+    [
+      15,
+      19,
+      0,
+      13,
+      2,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4,
+  "extra_workflow": {
+    "title": "MiniMax-H3 纯参考图生视频（H3-REF · 3 张只作参考，不钉锚点）"
+  }
+}

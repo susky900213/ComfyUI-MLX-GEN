@@ -47,7 +47,7 @@ from . import breeze, components, image, paths, runtime, transformer_lora, weigh
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.weights import loader as h3_loader
 from .progress import SamplingProgress
-from .types import MlxH3Keyframes, MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
+from .types import MlxH3VisualCondition, MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
 from .yue2 import pipeline as yue2_pipeline
 from .yue2.model import load_model as load_yue2_model
 from .yue2.vae import load_vae as load_yue2_vae
@@ -1521,6 +1521,9 @@ def decode_latents(defn, comps, latents, height, width):
 H3_MODULE_BUCKET = "h3_module"
 H3_PROMPT_BUCKET = "h3_prompt"
 H3_LATENT_BUCKET = "h3_latents"
+# 视觉条件（首 / 尾帧锚点 + 多图参考）的有序 PIL 元组；键 = MlxH3VisualCondition.images_key，
+# 值 = tuple[PIL.Image, ...]，顺序就是 presentation 里 <Picture i> 的编号顺序
+H3_VISUAL_BUCKET = "h3_keyframe_source"
 
 
 def _ensure_image_family(entry, node: str) -> None:
@@ -2072,14 +2075,16 @@ def compose_h3_prompt(text: str) -> str:
     return h3_prompt.compose_prompt(text)
 
 
-def h3_prompt_encoding_key(clip, prompt: str, keyframes: MlxH3Keyframes | None = None) -> str:
+def h3_prompt_encoding_key(
+    clip, prompt: str, visual: MlxH3VisualCondition | None = None
+) -> str:
     """H3 条件的编码键（换大类 / 换目录 / 换精度 / 换量化 / 换文本都会换键）。"""
     return runtime.cache_key(
         {
             "kind": "h3_prompt",
             "clip": clip,
             "text": prompt,
-            "keyframes": keyframes.digest if keyframes is not None else "",
+            "visual": visual.digest if visual is not None else "",
         }
     )
 
@@ -2090,20 +2095,31 @@ def encode_h3_prompt(
     prompt: str,
     cache,
     cache_key: str,
-    keyframes: MlxH3Keyframes | None = None,
+    visual: MlxH3VisualCondition | None = None,
 ) -> tuple[Any, Any]:
-    """编码 presentation → `(embeds (1,L,hidden), tags (L,) int32)`（存进缓存）。"""
+    """编码 presentation → `(embeds (1,L,hidden), tags (L,) int32)`（存进缓存）。
+
+    接了视觉条件时，桶里那 N 张图会按顺序编成 ``<Picture 1>`` … ``<Picture N>``
+    （``h3/prompt.py`` 的 ``encode_presentation`` 已支持任意张数；上游只用过 1 张）。
+    """
 
     def build() -> tuple[Any, Any]:
-        images = None
-        if keyframes is not None:
-            images, hit = cache.get("h3_keyframe_source", keyframes.cache_key)
-            if not hit or images is None:
-                raise RuntimeError("H3 关键帧图像缓存已失效，请重新运行「MLX H3 关键帧条件」节点")
+        images: tuple[Any, ...] = ()
+        if visual is not None:
+            found, hit = cache.get(H3_VISUAL_BUCKET, visual.images_key)
+            if not hit or found is None:
+                raise RuntimeError(
+                    "H3 的参考图缓存已失效，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
+                )
+            images = tuple(found)
+            if len(images) != int(visual.picture_count):
+                raise RuntimeError(
+                    "H3 的参考图数量与 handle 不一致，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
+                )
         encode = runtime.import_object(entry.prompt_encoder)
         # comps 里是 LoadedH3Component（模块 + 量化档位 + 生效精度），而
         # encode_presentation 要的是里面那个 nn.Module（它调 text_encoder.encode(...)）
-        return encode(comps["text_encoder"].module, comps["tokenizer"], prompt, images or ())
+        return encode(comps["text_encoder"].module, comps["tokenizer"], prompt, images)
 
     return cache.get_or_create(H3_PROMPT_BUCKET, cache_key, build)[0]
 
@@ -2144,20 +2160,35 @@ def has_h3_latents(model_handle, params: dict[str, Any], cache) -> bool:
     return bool(hit)
 
 
-def encode_h3_keyframes(keyframes: MlxH3Keyframes, cache) -> tuple[Any, ...]:
-    """临时物化 Video VAE 编码关键帧；无论成功失败都立即释放 VAE。"""
-    images, hit = cache.get("h3_keyframe_source", keyframes.cache_key)
+def encode_h3_keyframes(
+    visual: MlxH3VisualCondition, cache
+) -> tuple[tuple[str, ...], tuple[Any, ...]]:
+    """按锚点顺序编码 latent 锚点，返回 `(锚点名, 对应的单帧 latent)`。
+
+    纯参考（``anchors`` 为空）时直接返回空 —— 那些图只进 Qwen3-VL 的
+    presentation，不占 latent 行，因此也不用物化 Video VAE。
+    """
+    if not visual.anchors:
+        return (), ()
+    images, hit = cache.get(H3_VISUAL_BUCKET, visual.images_key)
     if not hit or images is None:
-        raise RuntimeError("H3 关键帧图像缓存已失效，请重新运行「MLX H3 关键帧条件」节点")
-    if len(images) != len(keyframes.anchors):
         raise RuntimeError(
-            "H3 关键帧缓存与 handle 数量不一致，请重新运行「MLX H3 关键帧条件」节点"
+            "H3 的参考图缓存已失效，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
+        )
+    if len(images) < int(visual.picture_count):
+        raise RuntimeError(
+            "H3 的参考图比 handle 里记的少（缓存被挤掉了？），"
+            "请重新运行「MLX H3 关键帧 / 视觉条件」节点"
         )
     try:
-        vae = prepare_h3_vae(keyframes.vae, cache)
-        return h3_pipeline.encode_keyframe_latents(tuple(images), vae)
+        vae = prepare_h3_vae(visual.vae, cache)
+        latents = tuple(
+            h3_pipeline.encode_keyframe_latents((images[int(index)],), vae)[0]
+            for index in visual.anchor_images
+        )
     finally:
-        release_h3_vae(keyframes.vae, cache)
+        release_h3_vae(visual.vae, cache)
+    return tuple(visual.anchors), latents
 
 
 def run_h3_sampler(
