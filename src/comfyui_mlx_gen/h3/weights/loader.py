@@ -12,7 +12,9 @@
 2. 用 `nn.quantize` 先把**结构**换成量化层（此时参数仍是未求值的懒图，不占内存）；
 3. 逐个 shard：`mx.load` → 键过滤（条件编码器只留前 50 层与视觉塔）→ 改名
    （`WeightMapper`）/ 逐张量变换（3D 核转置、`weight_norm` 折叠）→ 精度转换 →
-   对量化模块调 `mx.quantize` 生成 weight/scales/biases → `model.update`；
+   对量化模块调 `mx.quantize` 生成 weight/scales/biases → `model.update` →
+   **按块 `mx.eval` 并同步**（`EVAL_CHUNK`：整条 shard 一次求值会被 macOS 的
+   GPU 看门狗掐掉，见 `_eval_in_chunks` 的注释）；
 4. 全部写完做一次形状 / 缺键校验（**必须**：`update(strict=False)` 会静默丢弃未知键）。
 """
 
@@ -44,6 +46,45 @@ _DTYPE_NAMES = {
     "float32": mx.float32,
 }
 _FLOAT_DTYPES = (mx.float32, mx.float16, mx.bfloat16)
+
+# 一次 `mx.eval` 最多塞多少张量。MLX 是惰性求值：`mx.eval(*flat)` 会把「整个 shard 的
+# 精度转换 + q8 量化」全部编进**同一个 Metal command buffer**，而一个 shard 就有近百个
+# 数组（量化模块还要 weight + scales + biases），长到超过 macOS 的 GPU 看门狗就会被掐掉，
+# 报 `kIOGPUCommandBufferCallbackErrorTimeout`；更麻烦的是超时之后整个进程的 Metal
+# 上下文就废了 —— 之后每次提交都返回 `SubmissionsIgnored`，只能重启 ComfyUI。
+# 分块求值把每个 command buffer 的工作量压到可控范围（shard 之间仍会 clear_cache）。
+EVAL_CHUNK = 8
+
+# Metal 层面的致命故障字样：出现这些就**不要重试**，必须重启进程
+_METAL_FAULT_MARKERS = (
+    "kIOGPUCommandBufferCallbackErrorTimeout",
+    "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored",
+    "Command buffer execution failed",
+)
+
+
+def _metal_fault_hint(exc: BaseException) -> str | None:
+    """Metal GPU 故障（看门狗超时 / 上下文已废）→ 返回可操作的中文提示，否则 None。"""
+    text = str(exc)
+    if not any(marker in text for marker in _METAL_FAULT_MARKERS):
+        return None
+    return (
+        "这是 macOS 的 Metal GPU 故障（看门狗超时或上下文已损坏），不是权重不匹配："
+        "① 必须先重启 ComfyUI —— 同一进程里的 Metal 上下文已经废了，继续重试必然立刻失败；"
+        "② 重启前把并行的重活塞住（ComfyUI 本体的 MPS 占用、其它大模型节点），"
+        "内存被压进 swap 时 GPU 命令更容易超时；"
+        "③ 一次只跑一个 H3 任务，别和其它视频 / 图片节点同时排队；"
+        "④ 反复出现就把 quantize 降到 q4，或先用小画布（如 256×256）冒烟一次。"
+    )
+
+
+def _eval_in_chunks(entries: list[tuple[str, mx.array]], chunk: int = EVAL_CHUNK) -> None:
+    """按块 `mx.eval` 并同步：避免单个 command buffer 过长触发 Metal 看门狗超时。"""
+    arrays = [value for _, value in entries]
+    step = max(1, int(chunk))
+    for start in range(0, len(arrays), step):
+        mx.eval(*arrays[start:start + step])
+        mx.synchronize()
 
 
 @dataclass(frozen=True)
@@ -167,19 +208,27 @@ def load(
 
     loaded: dict[str, tuple[int, ...]] = {}
     for shard in _shard_files(role, path):
-        written = _load_shard(
-            module,
-            role,
-            shard,
-            base_dtype,
-            bits,
-            quantized_modules,
-            expected,
-            loaded,
-            log,
-            recipe=recipe,
-            num_heads=num_heads,
-        )
+        try:
+            written = _load_shard(
+                module,
+                role,
+                shard,
+                base_dtype,
+                bits,
+                quantized_modules,
+                expected,
+                loaded,
+                log,
+                recipe=recipe,
+                num_heads=num_heads,
+            )
+        except RuntimeError as exc:
+            hint = _metal_fault_hint(exc)
+            if hint:
+                raise RuntimeError(
+                    f"[H3 加载] {role}: 读 {Path(shard).name} 时 Metal GPU 出错（{exc}）\n{hint}"
+                ) from exc
+            raise
         if log:
             log(f"[H3 加载] {role}: {Path(shard).name} → 写入 {written} 个张量")
         gc.collect()
@@ -187,7 +236,7 @@ def load(
 
     _validate(role, expected, loaded)
     # 写进去的张量都已 mx.eval；这里再走一次只是让结构完全物化，不产生新计算
-    mx.eval(module.parameters())
+    _eval_in_chunks(tree_flatten(module.parameters()))
     return LoadedH3Component(
         role=role,
         module=module,
@@ -395,7 +444,7 @@ def _load_shard(
     if not flat:
         return 0
     module.update(tree_unflatten(flat), strict=False)
-    mx.eval(*[value for _, value in flat])
+    _eval_in_chunks(flat)
     count = len(flat)
     del raw, mapped, flat
     return count

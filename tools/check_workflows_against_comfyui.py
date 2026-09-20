@@ -31,6 +31,15 @@ COMFY = Path("/Users/apple/ComfyUI-Installs/ComfyUI/ComfyUI")
 WIDGET_TYPES = {"INT", "FLOAT", "STRING", "COMBO", "BOOLEAN", "SECRET", "PYSEED"}
 VISUAL_NODES = {"MlxH3KeyframeCondition", "MlxH3MultiReferenceCondition", "MlxH3VideoCondition"}
 
+# ComfyUI 前端对名叫 `seed` / `noise_seed` 的 widget 会自动插一个「控制方式」伴随 widget
+# （前端源码里的 `(t === "seed" || t === "noise_seed") && (i.control_after_generate = ...)`，
+# 与节点定义里有没有声明这个选项无关），所以工作流 JSON 的 widgets_values 里 seed 后面
+# 必须紧跟它的值；漏写会让后面**所有** widget 错位一格（提交时报 `scheduler: 124` /
+# `steps: 640` 这类看起来毫无道理的校验错误，而且往往在导入后第一次排队才炸出来）。
+CONTROL_AFTER_GENERATE = "control_after_generate"
+VALUE_CONTROL_OPTIONS = ["fixed", "increment", "decrement", "randomize"]
+SEED_WIDGET_NAMES = {"seed", "noise_seed"}
+
 sys.path.insert(0, str(ROOT / "src"))
 
 from comfyui_mlx_gen import paths as ml_paths  # noqa: E402
@@ -145,6 +154,22 @@ def widget_value_ok(ntype: str, extra: dict, value) -> bool:
     return ntype in {"SECRET", "PYSEED"}  # 其余都是 socket，不该出现在 widget 里
 
 
+def frontend_widgets(widget_def: list[tuple[str, str, dict]]) -> list[tuple[str, str, dict]]:
+    """把「节点定义里的 widget 列表」补成「前端真正渲染出来的 widget 列表」。
+
+    唯一的差别是 seed / noise_seed 后面那个 `control_after_generate` 伴随 widget：
+    前端无条件插入它，所以工作流 JSON 的 widgets_values 也必须为它留一个值。
+    """
+    out: list[tuple[str, str, dict]] = []
+    for name, ntype, extra in widget_def:
+        out.append((name, ntype, extra))
+        if name in SEED_WIDGET_NAMES:
+            out.append(
+                (CONTROL_AFTER_GENERATE, "COMBO", {"options": list(VALUE_CONTROL_OPTIONS)})
+            )
+    return out
+
+
 def check_node(node, inputs, outputs) -> list[str]:
     """对照节点定义检查槽名 / 类型 / widget 数量与取值（返回错误列表）。"""
     errors: list[str] = []
@@ -162,8 +187,9 @@ def check_node(node, inputs, outputs) -> list[str]:
             f"{declared_names} vs {def_names}"
         )
 
-    widget_def = [(name, ntype, extra) for name, ntype, extra in inputs
-                  if ntype in WIDGET_TYPES]
+    widget_def = frontend_widgets(
+        [(name, ntype, extra) for name, ntype, extra in inputs if ntype in WIDGET_TYPES]
+    )
     values = node.get("widgets_values", [])
     if len(values) > len(widget_def):
         errors.append(
@@ -174,7 +200,18 @@ def check_node(node, inputs, outputs) -> list[str]:
         tail = [name for name, _, _ in widget_def][len(values):]
         print(f"  [info] 节点 {node['id']} ({node['type']}) 只序列化了 {len(values)} 个 "
               f"widget（定义 {len(widget_def)} 个，尾部 {tail} 走默认值）")
-    for (name, ntype, extra), value in zip(widget_def, values):
+    for index, ((name, ntype, extra), value) in enumerate(zip(widget_def, values)):
+        if name == CONTROL_AFTER_GENERATE:
+            # 这一格必须写前端给 seed 插的那个伴随 widget（值不是控制方式就是错位了）
+            if value not in VALUE_CONTROL_OPTIONS:
+                errors.append(
+                    f"节点 {node['id']} ({node['type']}) 的 seed 后面少了 "
+                    f"control_after_generate 的值（第 {index + 1} 个 widget 位上是 {value!r}）："
+                    "ComfyUI 前端会给 seed / noise_seed 自动插这个伴随 widget，漏写会让 "
+                    "seed 之后的所有 widget 错位一格（提交时报 scheduler / steps 之类的怪错）；"
+                    f"请在 seed 值后面补一个 {'/'.join(VALUE_CONTROL_OPTIONS)}"
+                )
+            continue
         if not widget_value_ok(ntype, extra, value):
             errors.append(
                 f"节点 {node['id']} ({node['type']}) 的 {name}={value!r} 与定义不搭"

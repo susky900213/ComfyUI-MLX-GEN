@@ -1,8 +1,8 @@
 {
-  "id": "mlx-minimax-h3-video-continuation-drop-audio",
+  "id": "mlx-minimax-h3-all-reference-to-video",
   "revision": 0,
-  "last_node_id": 12,
-  "last_link_id": 13,
+  "last_node_id": 17,
+  "last_link_id": 17,
   "nodes": [
     {
       "id": 1,
@@ -70,10 +70,10 @@
       "properties": {
         "Node name for S&R": "MlxTransformerLoader"
       },
-      "title": "H3 transformer（MiniMax-H3，q8；compile 会被 H3 强制关掉）",
+      "title": "H3 transformer（MiniMax-H3-ref，q8；compile 会被 H3 强制关掉）",
       "widgets_values": [
         "minimax_h3",
-        "MiniMax-H3",
+        "MiniMax-H3-ref",
         8,
         "bfloat16",
         false,
@@ -118,52 +118,68 @@
       ]
     },
     {
-      "id": 10,
-      "type": "MlxVAELoader",
+      "id": 17,
+      "type": "MlxModelLoraApply",
       "pos": [
-        0,
-        800
+        420,
+        560
       ],
       "size": [
         380,
-        220
+        240
       ],
       "flags": {},
-      "order": 3,
+      "order": 2,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "link": 4,
+          "slot_index": 0
+        },
+        {
+          "name": "lora",
+          "type": "COMBO",
+          "link": null,
+          "slot_index": 1
+        },
+        {
+          "name": "strength",
+          "type": "FLOAT",
+          "link": null,
+          "slot_index": 2
+        }
+      ],
       "outputs": [
         {
-          "name": "vae",
-          "type": "mlx_vae",
+          "name": "model",
+          "type": "model",
           "links": [
-            11
+            17
           ],
           "slot_index": 0
         }
       ],
       "properties": {
-        "Node name for S&R": "MlxVAELoader"
+        "Node name for S&R": "MlxModelLoraApply"
       },
-      "title": "H3 视频 VAE（锚点编码，role=vae）",
+      "title": "Ref2VA 加速 LoRA（4 步，强度 1.0）",
       "widgets_values": [
-        "minimax_h3",
-        "MiniMax-H3",
-        "bfloat16",
-        8,
-        "vae"
+        "minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors",
+        1.0
       ]
     },
     {
       "id": 11,
-      "type": "LoadVideo",
+      "type": "LoadImage",
       "pos": [
         420,
-        800
+        1320
       ],
       "size": [
-        380,
-        260
+        360,
+        400
       ],
       "flags": {},
       "order": 4,
@@ -171,20 +187,143 @@
       "inputs": [],
       "outputs": [
         {
-          "name": "VIDEO",
-          "type": "VIDEO",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            11
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "参考图 1（提示词里的 <Picture 1>）",
+      "widgets_values": [
+        "h3_ref_1.png"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        1760
+      ],
+      "size": [
+        360,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
           "links": [
             12
           ],
           "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadVideo"
+        "Node name for S&R": "LoadImage"
       },
-      "title": "源视频（只取一帧当锚点）",
+      "title": "参考图 2（提示词里的 <Picture 2>）",
       "widgets_values": [
-        "h3_source_clip.mp4"
+        "h3_ref_2.png"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        2200
+      ],
+      "size": [
+        360,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            13
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "参考图 3（提示词里的 <Picture 3>）",
+      "widgets_values": [
+        "h3_ref_3.png"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        2640
+      ],
+      "size": [
+        360,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            14
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "参考图 4（提示词里的 <Picture 4>）",
+      "widgets_values": [
+        "h3_ref_4.png"
       ]
     },
     {
@@ -211,7 +350,7 @@
         {
           "name": "h3_keyframes",
           "type": "mlx_h3_keyframes",
-          "link": 13,
+          "link": 16,
           "slot_index": 1
         }
       ],
@@ -229,65 +368,78 @@
       "properties": {
         "Node name for S&R": "MlxTextEncoder"
       },
-      "title": "H3 提示词 + 源视频续写（丢弃原声）",
+      "title": "H3 提示词 + 4 张参考图（不钉锚点）",
       "widgets_values": [
-        "integrated_multimodal_description: 以源视频的第一帧作为结尾倒推：先拍防波堤上无人的长椅、海雾逐渐变浓，最后一帧回到源视频开头的那片海面。整体冷灰调、缓慢横移，几乎没有人声。\n\noverall_soundscape: 只有风声与远处海潮；中段有一只海鸥叫了两声。\n\nnon_diegetic_music: 无旋律的环境合成器铺底。"
+        "integrated_multimodal_description: 视频共 1 个镜头，四张参考图各出一半力：<Picture 1> 是白衬衫、黑色高丸子头、圆框金属眼镜的女主角；<Picture 2> 是卡其工装外套、短寸发型的男主角；<Picture 3> 提供黄昏海边木栈桥的场景与逆光色调；<Picture 4> 提供 VHS 颗粒、粉蓝渐变与 RGB 错位这套复古质感。开场是 <Picture 3> 的栈桥尽头，<Picture 1> 的女主倚在栏杆上看海，<Picture 2> 的男主从画面右侧走来、递过两支冰棍，两人转身并肩看落日；全程保持 <Picture 4> 的低饱和粉蓝色调、轻微扫描线抖动与偶发的色彩错位，最后收在两人并肩的双人定格。\n\noverall_soundscape: 海浪反复拍岸、海鸥零星叫声、木栈桥被踩到的吱呀声；中段有冰棍包装袋的窸窣声与两人压低的轻笑，落日前留一段很长的海风。\n\nnon_diegetic_music: 复古合成器铺底配木吉他扫弦，节奏舒缓，音量克制。"
       ]
     },
     {
-      "id": 12,
-      "type": "MlxH3VideoCondition",
+      "id": 15,
+      "type": "MlxRefImageSet",
       "pos": [
         820,
-        800
+        1760
       ],
       "size": [
-        420,
-        320
+        380,
+        300
       ],
       "flags": {},
       "order": 5,
       "mode": 0,
       "inputs": [
         {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 12,
+          "name": "image1",
+          "type": "IMAGE",
+          "link": 11,
           "slot_index": 0
         },
         {
-          "name": "vae",
-          "type": "mlx_vae",
-          "link": 11,
+          "name": "image2",
+          "type": "IMAGE",
+          "link": 12,
           "slot_index": 1
+        },
+        {
+          "name": "image3",
+          "type": "IMAGE",
+          "link": 13,
+          "slot_index": 2
+        },
+        {
+          "name": "image4",
+          "type": "IMAGE",
+          "link": 14,
+          "slot_index": 3
         }
       ],
       "outputs": [
         {
-          "name": "keyframes",
-          "type": "mlx_h3_keyframes",
+          "name": "ref_source",
+          "type": "mlx_ref_image_src",
           "links": [
-            13
+            15
           ],
           "slot_index": 0
+        },
+        {
+          "name": "count",
+          "type": "INT",
+          "links": [],
+          "slot_index": 1
         },
         {
           "name": "report",
           "type": "STRING",
           "links": [],
-          "slot_index": 1
+          "slot_index": 2
         }
       ],
       "properties": {
-        "Node name for S&R": "MlxH3VideoCondition"
+        "Node name for S&R": "MlxRefImageSet"
       },
-      "title": "H3 视频条件（源视频 → 锚点）",
-      "widgets_values": [
-        "continue_from_end",
-        false,
-        640,
-        352
-      ]
+      "title": "4 张参考图 → 有序图集（占满 4 个槽位）",
+      "widgets_values": []
     },
     {
       "id": 5,
@@ -307,7 +459,7 @@
         {
           "name": "model",
           "type": "model",
-          "link": 4,
+          "link": 17,
           "slot_index": 0
         },
         {
@@ -342,20 +494,75 @@
       "properties": {
         "Node name for S&R": "MlxKSamplerMLX"
       },
-      "title": "H3 采样（打包序列 + 双整流流；640×352 / 124 帧 / 50 步）",
+      "title": "H3 采样（打包序列 + 双整流流；640×352 / 124 帧 / 4 步）",
       "widgets_values": [
         20260917,
         "randomize",
-        50,
+        4,
         640,
         352,
         1,
         1.0,
-        "flow_match_euler_discrete",
+        "minimax_h3",
         124,
         12.0,
         3.0,
         "auto"
+      ]
+    },
+    {
+      "id": 16,
+      "type": "MlxH3MultiReferenceCondition",
+      "pos": [
+        1240,
+        1760
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ref_images",
+          "type": "mlx_ref_image_src",
+          "link": 15,
+          "slot_index": 0
+        },
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "link": null,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "keyframes",
+          "type": "mlx_h3_keyframes",
+          "links": [
+            16
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxH3MultiReferenceCondition"
+      },
+      "title": "H3 多图参考（4 张只进 presentation，不占 latent 行；必须用 H3-REF）",
+      "widgets_values": [
+        "none",
+        false,
+        640,
+        352
       ]
     },
     {
@@ -578,9 +785,9 @@
       "properties": {
         "Node name for S&R": "SaveVideo"
       },
-      "title": "存成 mp4（video/MiniMax-H3）",
+      "title": "存成 mp4（video/MiniMax-H3-ref）",
       "widgets_values": [
-        "video/MiniMax-H3",
+        "video/MiniMax-H3-ref",
         "mp4"
       ]
     }
@@ -614,7 +821,7 @@
       4,
       3,
       0,
-      5,
+      17,
       0,
       "model"
     ],
@@ -668,27 +875,59 @@
     ],
     [
       11,
-      10,
+      11,
       0,
-      12,
-      1,
-      "mlx_vae"
+      15,
+      0,
+      "IMAGE"
     ],
     [
       12,
-      11,
-      0,
       12,
       0,
-      "VIDEO"
+      15,
+      1,
+      "IMAGE"
     ],
     [
       13,
-      12,
+      13,
+      0,
+      15,
+      2,
+      "IMAGE"
+    ],
+    [
+      14,
+      14,
+      0,
+      15,
+      3,
+      "IMAGE"
+    ],
+    [
+      15,
+      15,
+      0,
+      16,
+      0,
+      "mlx_ref_image_src"
+    ],
+    [
+      16,
+      16,
       0,
       2,
       1,
       "mlx_h3_keyframes"
+    ],
+    [
+      17,
+      17,
+      0,
+      5,
+      0,
+      "model"
     ]
   ],
   "groups": [],
@@ -704,6 +943,6 @@
   },
   "version": 0.4,
   "extra_workflow": {
-    "title": "MiniMax-H3 视频续写（源视频续写（丢弃原声））"
+    "title": "MiniMax-H3 全能参考生视频（H3-REF · 4 张参考图 + 4 步加速 LoRA）"
   }
 }

@@ -210,7 +210,7 @@ vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
 
 ## MiniMax-H3 与 PipeNetwork 预量化 Transformer
 
-仓库提供十一份可直接导入的 MiniMax-H3 工作流（后六份由 `tools/gen_h3_workflows.py`
+仓库提供十二份可直接导入的 MiniMax-H3 工作流（后七份由 `tools/gen_h3_workflows.py`
 生成，改完脚本重跑即可覆盖）：
 
 ```text
@@ -222,12 +222,18 @@ workflows/minimax-h3-i2va-first-last-frame.json   # 首尾帧生视频（Base）
 workflows/minimax-h3-single-image-to-video.json   # 1 张图钉成首帧（Base）
 workflows/minimax-h3-multi-image-to-video.json    # 3 张参考图，第 1 张钉成首帧（H3-REF）
 workflows/minimax-h3-reference-only-to-video.json # 3 张纯参考，不钉锚点（H3-REF）
+workflows/minimax-h3-all-reference-to-video.json  # 4 张纯参考 + 4 步加速 LoRA（H3-REF）
 workflows/minimax-h3-video-continuation-keep-audio.json     # 源视频 + 原声拼成片（Base）
 workflows/minimax-h3-video-continuation-drop-audio.json     # 只出新片段（Base）
 workflows/minimax-h3-video-continuation-replace-audio.json  # 新片段 + 外部配乐（Base）
 ```
 
-默认工作流使用 640×352、124 帧（24 fps）和 50 步。H3 的 transformer、Qwen3-VL
+默认工作流使用 640×352、124 帧（24 fps）和 50 步；只有
+`minimax-h3-all-reference-to-video.json` 例外——它把「MLX 模型 LoRA」接在
+transformer 与采样器之间，用 `minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors`
+并把 steps 改成 4（导进去前确认 `models/mlx/lora/` 里确实有这个文件；
+同目录的 `..._fl2v_...` 是首 / 尾帧（FL2VA）任务用的，`..._taomate_3step_...`
+只写了步数、没写适用任务，都别照抄参考工作流换过来）。H3 的 transformer、Qwen3-VL
 文本编码器、tokenizer、视频 VAE 与音频 VAE 是五个独立组件；常规目录布局如下：
 
 ```text
@@ -237,7 +243,8 @@ workflows/minimax-h3-video-continuation-replace-audio.json  # 新片段 + 外部
 ├── text_encoder/MiniMax-H3/         # text_encoder_back
 ├── tokenizer/MiniMax-H3/
 ├── vae/MiniMax-H3/                  # 视频 VAE
-└── audio_vae/MiniMax-H3/            # 音频 VAE
+├── audio_vae/MiniMax-H3/            # 音频 VAE
+└── lora/                            # H3 加速适配器（ref2v 4 步、fl2v 4/8 步、taomate 3 步）
 ```
 
 **参考生视频必须选 Minimax-H3-REF。** 官方 checkpoint 的 transformer 有两条：
@@ -434,8 +441,11 @@ MiniMax-H3、YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不�
 
 `tools/check_workflows_against_comfyui.py` 会按 ComfyUI 与本插件的真实节点定义核对
 每份工作流的槽名、类型与 widget 取值（ComfyUI 自带节点只查存在性），并检查
-「视觉条件 → 该用哪一档 transformer」是否与声明一致；`tools/gen_h3_workflows.py`
-则用于重新生成后六份 H3 工作流。
+「视觉条件 → 该用哪一档 transformer」是否与声明一致；其中 `widgets_values` 会按
+**前端真正渲染出来的 widget 列表**比对 —— `seed` 后面那个前端自动插的
+`control_after_generate` 也必须写进 JSON，漏写就会让整排 widget 错位一格
+（详见 `USAGE_ZH.md` §8.8）；`tools/gen_h3_workflows.py`
+则用于重新生成后七份 H3 工作流。
 
 测试成功时退出状态为 0；任何检查失败都会汇总失败项并以状态 1 退出。
 

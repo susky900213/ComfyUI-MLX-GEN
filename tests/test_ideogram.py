@@ -427,9 +427,9 @@ sampler_node = next(node for node in nodes if node["type"] == "MlxKSamplerMLX")
 check("Transformer 保留原生 FP8（quantize=0）", transformer_values[2] == 0, str(transformer_values))
 check("VAE 不做在线量化（quantize=0）", vae_values[3] == 0, str(vae_values))
 check(
-    "采样器使用 1024² + 官方 default 预设",
-    sampler_node["widgets_values"][:7]
-    == [42, 20, 1024, 1024, 1, 7.0, "ideogram4_default"],
+    "采样器使用 1024² + 官方 default 预设（seed 后面跟 control_after_generate）",
+    sampler_node["widgets_values"][:8]
+    == [42, "randomize", 20, 1024, 1024, 1, 7.0, "ideogram4_default"],
     str(sampler_node["widgets_values"]),
 )
 check(

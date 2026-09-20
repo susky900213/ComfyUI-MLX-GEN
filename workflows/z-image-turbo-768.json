@@ -206,7 +206,7 @@
         "Node name for S&R": "MlxKSamplerMLX"
       },
       "widgets_values": [
-        1,
+        1, "randomize",
         6,
         768,
         768,

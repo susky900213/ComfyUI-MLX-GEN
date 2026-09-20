@@ -367,6 +367,7 @@ Whisper 完整 checkpoint 放到：
 | `workflows/minimax-h3-single-image-to-video.json` | MiniMax-H3 单图生视频（Base） | 生成器版本，1 张图钉首帧 |
 | `workflows/minimax-h3-multi-image-to-video.json` | MiniMax-H3 多图参考生视频（**H3-REF**） | 3 张参考图，第 1 张钉首帧 |
 | `workflows/minimax-h3-reference-only-to-video.json` | MiniMax-H3 纯参考生视频（**H3-REF**） | 3 张只进 presentation，不钉锚点 |
+| `workflows/minimax-h3-all-reference-to-video.json` | MiniMax-H3 全能参考生视频（**H3-REF**） | 4 张只进 presentation + Ref2VA 的 4 步加速 LoRA |
 | `workflows/minimax-h3-video-continuation-keep-audio.json` | 源视频续写并拼成片（Base） | `GetVideoComponents` + `ConcatenateVideo` + `AudioConcat` |
 | `workflows/minimax-h3-video-continuation-drop-audio.json` | 只出新片段（Base） | 丢弃原声，用 H3 生成的音轨 |
 | `workflows/minimax-h3-video-continuation-replace-audio.json` | 只出新片段 + 外部配乐（Base） | `LoadAudio` 整段替换音轨 |
@@ -722,6 +723,24 @@ Qwen 编辑的参考 latent 与目标宽高强绑定。把 `MlxVAEEncoder` 的 `
 - 不要同时排队多个大模型工作流；
 - 切换大型模型后，必要时重启 ComfyUI 以释放进程缓存。
 
+如果报的是 Metal 层面的故障，按下面处理：
+
+```text
+[METAL] Command buffer execution failed: Caused GPU Timeout Error
+        (00000002:kIOGPUCommandBufferCallbackErrorTimeout)
+[METAL] Command buffer execution failed: Ignored (for causing prior/excessive GPU errors)
+        (00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)
+```
+
+1. **第一条出现后必须重启 ComfyUI**，光重新排队没有用：Metal 上下文已经废了，之后每一次
+   提交都会立刻返回上面那条 `Ignored (...SubmissionsIgnored)`（插件现在会把这两条翻译成
+   中文提示并强调「先重启」，见 `h3/weights/loader.py` 的 `_metal_fault_hint`）。
+2. 重启前把并行的重活关掉（ComfyUI 本体的 MPS 占用、其它大模型节点），内存被压进 swap 时
+   GPU 命令更容易超时。
+3. 插件的 H3 权重加载已按块 `mx.eval`（`EVAL_CHUNK`，默认 8 个张量一批）——整条 shard
+   一次性求值会被 macOS 的 GPU 看门狗掐掉，这是 2026-09-20 修掉的老问题。
+4. 反复超时就降档：`quantize` 用 q4、画布先用 640×352 甚至 256×256 冒烟。
+
 ### 8.7 为什么负向提示词没有效果
 
 - FLUX.2 Klein 和 Z-Image Turbo 示例使用 guidance 1.0，通常不会启用额外 CFG 分支；
@@ -734,6 +753,18 @@ Qwen 编辑的参考 latent 与目标宽高强绑定。把 `MlxVAEEncoder` 的 `
 
 先确认 ComfyUI 加载的是当前仓库，而不是另一个同名插件副本。重启后重新导入
 `workflows/` 中的最新 JSON；仍有问题时删除异常节点并从 `MLX/Gen` 菜单重新添加。
+
+如果错位表现为**提交时报 `scheduler: 124` / `steps: 640` / `guidance: minimax_h3`
+这类毫无道理的校验错误**，那是 seed 的伴随 widget 少了值：
+
+- ComfyUI 前端对任何名叫 `seed` / `noise_seed` 的 widget 都会自动插一个
+  `control_after_generate` 伴随 widget（与节点定义里有没有声明无关）；
+- 所以工作流 JSON 的 `widgets_values` 必须在 seed 后面写上它的值
+  （`fixed` / `increment` / `decrement` / `randomize`），漏写就会让后面**所有**
+  widget 错位一格；
+- 仓库里的工作流（含 `MlxKSamplerMLX` 的 22 份）已按这个规则序列化，
+  `python tools/check_workflows_against_comfyui.py` 会挡住漏写的版本；
+- 自己早先保存的工作流若报这个错，重新导入/保存一次（前端会自己补齐）即可。
 
 ### 8.9 同一个工作流突然慢了一倍以上（Z-Image 1024² 从 ~2s/步 变成 ~5s/步）
 

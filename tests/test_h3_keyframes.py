@@ -19,7 +19,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from comfyui_mlx_gen import image, pipeline  # noqa: E402
+from comfyui_mlx_gen import image, paths, pipeline  # noqa: E402
 from comfyui_mlx_gen.cache import CACHE, Cache  # noqa: E402
 from comfyui_mlx_gen.h3 import pipeline as h3_pipeline  # noqa: E402
 from comfyui_mlx_gen.h3.latent_creator.h3_layout import (  # noqa: E402
@@ -1128,7 +1128,7 @@ for workflow_name, expected_mode in workflow_modes.items():
         and sorted(item["widgets_values"][4] for item in vae_workflow_nodes)
         == ["audio_vae", "vae"]
         and keyframe_workflow_node["widgets_values"] == [640, 352]
-        and sampler_workflow_node["widgets_values"][2:4] == [640, 352]
+        and sampler_workflow_node["widgets_values"][3:5] == [640, 352]
         and text_workflow_node["inputs"][1]["name"] == "h3_keyframes"
         and keyframe_text_link[1:5]
         == [keyframe_workflow_node["id"], 0, text_workflow_node["id"], 1]
@@ -1136,7 +1136,7 @@ for workflow_name, expected_mode in workflow_modes.items():
     check(f"工作流 {workflow_name} 的节点、link、slot 与关键帧模式有效", valid)
 
 
-# --------------------------------------- 8. 六份新工作流（多图 / 视频 / 纯参考）契约
+# ------------------------------------ 8. 七份新工作流（多图 / 视频 / 纯参考 / 加速 LoRA）
 def workflow_is_valid(workflow):
     """核对工作流的节点、link、slot 是否自洽（links 数组与节点槽位双向对得上）。"""
     nodes = {item["id"]: item for item in workflow["nodes"]}
@@ -1194,6 +1194,14 @@ WORKFLOW_CONTRACTS = {
         False,
         "MiniMax-H3-ref",
     ),
+    # 全能参考（4 张图 + Ref2VA 的 4 步加速 LoRA）：跟「纯参考」同一条契约，
+    # 只是多了一颗必须挂在 transformer → 采样器之间的 LoRA
+    "minimax-h3-all-reference-to-video.json": (
+        {"MlxRefImageSet", "MlxH3MultiReferenceCondition", "MlxModelLoraApply",
+         "MlxKSamplerMLX"},
+        False,
+        "MiniMax-H3-ref",
+    ),
     "minimax-h3-video-continuation-keep-audio.json": (
         {"LoadVideo", "MlxH3VideoCondition", "GetVideoComponents", "CreateVideo",
          "ConcatenateVideo", "AudioConcat", "SaveVideo"},
@@ -1245,7 +1253,10 @@ for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW
         and len(condition_links) == 2
         and all(item[1] == text["id"] for item in condition_links)
         # 视觉条件的画布必须与采样器一致，否则采样器会直接报错
-        and visual["widgets_values"][-2:] == sampler["widgets_values"][2:4]
+        # （采样器 widgets：0 seed / 1 control_after_generate / 2 steps / 3 width / 4 height）
+        and visual["widgets_values"][-2:] == sampler["widgets_values"][3:5]
+        # seed 后面必须写前端插的 control_after_generate，否则整排 widget 会错位一格
+        and sampler["widgets_values"][1] in {"fixed", "increment", "decrement", "randomize"}
         # 没有锚点时不该接视频 VAE；有锚点时必须接
         and (visual["inputs"][1]["link"] is not None) == has_anchor
         # 参考生视频（不钉锚点 / 2 张以上）必须落在 REF 权重上，
@@ -1261,6 +1272,43 @@ for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW
         and bool(workflow["extra_workflow"]["title"])
     )
     check(f"工作流 {workflow_name} 的节点、link、slot 与视觉条件契约有效", valid)
+
+
+# ------------------------------------ 9. 加速 LoRA 的链路与步数（唯一走 4 步的工作流）
+accel_workflow = json.loads(
+    (ROOT / "workflows" / "minimax-h3-all-reference-to-video.json").read_text(encoding="utf-8")
+)
+accel_valid, accel_nodes, _ = workflow_is_valid(accel_workflow)
+accel_sampler_id = next(i for i, node in accel_nodes.items() if node["type"] == "MlxKSamplerMLX")
+accel_lora_id = next(i for i, node in accel_nodes.items() if node["type"] == "MlxModelLoraApply")
+accel_transformer_id = next(
+    i for i, node in accel_nodes.items() if node["type"] == "MlxTransformerLoader"
+)
+# 模型链必须是「transformer → 加速 LoRA → 采样器」，中间不能有人绕过 LoRA
+accel_model_chain = {
+    tuple(item[1:5])
+    for item in accel_workflow["links"]
+    if item[5] == "model" and item[3] in (accel_lora_id, accel_sampler_id)
+}
+check(
+    "工作流 minimax-h3-all-reference-to-video 走 Ref2VA 的 4 步加速 LoRA",
+    accel_valid
+    and accel_model_chain
+    == {
+        (accel_transformer_id, 0, accel_lora_id, 0),
+        (accel_lora_id, 0, accel_sampler_id, 0),
+    }
+    # 步数按适配器标称填 4（填 50 步等于白装）；H3 不看 scheduler，
+    # 但写 minimax_h3 才不会让采样节点打印「已忽略 scheduler」的提示
+    # （widgets：0 seed / 1 control_after_generate / 2 steps / … / 7 scheduler）
+    and accel_nodes[accel_sampler_id]["widgets_values"][2] == 4
+    and accel_nodes[accel_sampler_id]["widgets_values"][7] == "minimax_h3"
+    and accel_nodes[accel_lora_id]["widgets_values"]
+    == ["minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors",
+        1.0]
+    # 文件名必须是 lora/ 里真存在的那颗（任务标记是 ref2v；fl2v 与未标任务的别换）
+    and accel_nodes[accel_lora_id]["widgets_values"][0] in paths.scan_loras(),
+)
 
 
 if FAILED:

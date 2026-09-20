@@ -77,7 +77,20 @@ class MlxKSamplerMLX:
                 "model": (model, {}),
                 "positive": (condition, {}),
                 "negative": (condition, {}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2**63 - 1}),
+                # 必须声明 control_after_generate：ComfyUI 前端对任何名叫 seed /
+                # noise_seed 的 widget 都会自动插一个「控制方式」伴随 widget
+                # （fixed / increment / decrement / randomize），工作流 JSON 的
+                # widgets_values 也必须在 seed 后面写上它的值 —— 漏写会让后面所有
+                # widget 错位一格（提交时报 scheduler=124 / steps=640 这类怪错）。
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 2**63 - 1,
+                        "control_after_generate": True,
+                    },
+                ),
                 "steps": ("INT", {"default": entry.default_steps, "min": 1, "max": 100}),
                 "width": (WIDTH_OPTIONS, {"default": 512}),
                 "height": (HEIGHT_OPTIONS, {"default": 512}),

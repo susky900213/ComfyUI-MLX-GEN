@@ -329,6 +329,31 @@ with tempfile.TemporaryDirectory() as temporary:
     )
 
 
+# --- 分块求值 / Metal 故障提示（整条 shard 一次 mx.eval 会被 macOS 的 GPU 看门狗掐掉）
+chunk_probe = [("a", mx.array([1.0])), ("b", mx.array([2.0])), ("c", mx.array([3.0]))]
+loader._eval_in_chunks(chunk_probe, 2)
+check(
+    "分块求值：小批 mx.eval 后张量已物化，块大小非法也不报错",
+    loader.EVAL_CHUNK >= 1
+    and float(chunk_probe[2][1][0]) == 3.0
+    and loader._eval_in_chunks(chunk_probe, 0) is None,
+    str([float(value[0]) for _, value in chunk_probe]),
+)
+metal_exc = RuntimeError(
+    "[METAL] Command buffer execution failed: Ignored (for causing prior/excessive GPU errors) "
+    "(00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)."
+)
+check(
+    "Metal GPU 故障（超时 / 上下文已废）会被翻译成「重启 ComfyUI」的可操作提示",
+    (loader._metal_fault_hint(metal_exc) or "").find("重启 ComfyUI") >= 0
+    and loader._metal_fault_hint(RuntimeError(
+        "Command buffer execution failed: Caused GPU Timeout Error"
+        " (00000002:kIOGPUCommandBufferCallbackErrorTimeout)."
+    )) is not None
+    and loader._metal_fault_hint(ValueError("键名和 H3 的映射对不上")) is None,
+)
+
+
 if FAILED:
     raise SystemExit(f"\n{len(FAILED)} 项失败：{', '.join(FAILED)}")
 print("\n全部 MiniMax-H3 PipeNetwork 合成检查通过。")

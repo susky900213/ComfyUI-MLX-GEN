@@ -1,4 +1,4 @@
-"""生成 MiniMax-H3 的六份示例工作流（纯标准库，可重复运行）。
+"""生成 MiniMax-H3 的七份示例工作流（纯标准库，可重复运行）。
 
 写法说明：工作流里每个节点只声明「输入槽名 + 输出槽名 + widget 值」，
 链接用 (源节点, 源槽, 目标节点, 目标槽, 类型) 描述；slot_index、
@@ -62,6 +62,31 @@ PROMPT_VIDEO_REPLACE = (
     "音轨整体替换成配乐（见工作流的「Load Audio」连线）。\n\n"
     "non_diegetic_music: 温暖的钢琴与弦乐，适合作为一段小纪录片的结尾。"
 )
+
+
+# --- 7. 全能参考（4 张参考图 + 加速 LoRA）用的提示词 -------------------------------
+# H3 训练时用的是三段带标签的文本（`integrated_multimodal_description` /
+# `overall_soundscape` / `non_diegetic_music`），并且靠 `<Picture N>` 引用第 N 张参考图
+# （这些标签由「MLX 参考图集 → MLX H3 多图参考条件」自动插进 presentation，
+# 所以提示词里必须写对编号，否则模型不知道哪张是哪张）。
+PROMPT_ALL_REF = (
+    "integrated_multimodal_description: 视频共 1 个镜头，四张参考图各出一半力："
+    "<Picture 1> 是白衬衫、黑色高丸子头、圆框金属眼镜的女主角；<Picture 2> 是卡其工装"
+    "外套、短寸发型的男主角；<Picture 3> 提供黄昏海边木栈桥的场景与逆光色调；"
+    "<Picture 4> 提供 VHS 颗粒、粉蓝渐变与 RGB 错位这套复古质感。开场是 <Picture 3> 的"
+    "栈桥尽头，<Picture 1> 的女主倚在栏杆上看海，<Picture 2> 的男主从画面右侧走来、"
+    "递过两支冰棍，两人转身并肩看落日；全程保持 <Picture 4> 的低饱和粉蓝色调、"
+    "轻微扫描线抖动与偶发的色彩错位，最后收在两人并肩的双人定格。\n\n"
+    "overall_soundscape: 海浪反复拍岸、海鸥零星叫声、木栈桥被踩到的吱呀声；"
+    "中段有冰棍包装袋的窸窣声与两人压低的轻笑，落日前留一段很长的海风。\n\n"
+    "non_diegetic_music: 复古合成器铺底配木吉他扫弦，节奏舒缓，音量克制。"
+)
+
+# 参考生视频（Ref2VA）的加速适配器；文件名里的 `ref2v` 就是它对应的任务（配
+# `<Picture N>` 那套参考提示词），因此要连 REF 权重（`MiniMax-H3-ref`）+ 4 步。
+# 同目录里 `..._fl2v_...` 是首 / 尾帧（FL2VA）用的，`..._taomate_3step_...`
+# 文件名只写了步数、没写适用任务，混到 Ref2VA 这条链上任务对不上（别照抄参考工作流）。
+LORA_H3_REF_4STEP = "minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors"
 
 
 # --- 声明式构造工具 ---------------------------------------------------------------
@@ -147,12 +172,17 @@ CKPT_REF = "MiniMax-H3-ref"
 
 
 def base_nodes(prompt, *, sampler_wh=(640, 352), checkpoint=CKPT_BASE,
-               visual_id=None, visual_label="视觉条件"):
+               visual_id=None, visual_label="视觉条件",
+               steps=50, scheduler="flow_match_euler_discrete"):
     """返回骨架节点（1 CLIP、2 文本、3 transformer、4 音频 VAE、5 采样、6 解码、
     7 PIL→张量、8 CreateVideo、9 SaveVideo）；visual_id 为 None 时是纯文生视频。
 
     `checkpoint` 只影响 `MlxTransformerLoader` / `MlxVAEDecodeRawPIL` / 输出前缀：
     参考生视频（Ref2VA）传 `CKPT_REF`，其余任务保持 `CKPT_BASE`。
+
+    `steps` / `scheduler` 只写进「MLX 采样器」的 widget：装了加速 LoRA 的
+    工作流要按适配器的步数填（否则等于白装），并且 scheduler 必须写
+    `minimax_h3`，不然采样阶段会打印「H3 不看 scheduler / guidance」的提示。
     """
     prefix = f"video/{checkpoint}"
     text_inputs = [["clip", "CLIP"]]
@@ -179,12 +209,15 @@ def base_nodes(prompt, *, sampler_wh=(640, 352), checkpoint=CKPT_BASE,
                   text_inputs, [["condition", "condition"]],
                   [prompt], [420, 120], [420, 360], 5),
         node_spec(5, "MlxKSamplerMLX",
-                  f"H3 采样（打包序列 + 双整流流；{sampler_wh[0]}×{sampler_wh[1]} / 124 帧 / 50 步）",
+                  f"H3 采样（打包序列 + 双整流流；{sampler_wh[0]}×{sampler_wh[1]} / 124 帧 / {steps} 步）",
                   [["model", "model"], ["positive", "condition"], ["negative", "condition"],
                    ["ref_images", "mlx_ref_images"]],
                   [["latents", "latents"]],
-                  [20260917, 50, sampler_wh[0], sampler_wh[1], 1, 1.0,
-                   "flow_match_euler_discrete", 124, 12.0, 3.0, "auto"],
+                  # seed 后面必须紧跟 control_after_generate 的值：ComfyUI 前端会给
+                  # 名叫 seed 的 widget 自动插一个伴随 widget，工作流里漏写这个值
+                  # 会让后面所有 widget 错位一格（提交时报 scheduler=124 这类怪错）
+                  [20260917, "randomize", steps, sampler_wh[0], sampler_wh[1], 1, 1.0,
+                   scheduler, 124, 12.0, 3.0, "auto"],
                   [820, 120], [420, 420], 6),
         node_spec(6, "MlxVAEDecodeRawPIL",
                   "H3 解码（视频 VAE 由 widget 现取；音轨靠接进来的 audio_vae）",
@@ -405,6 +438,75 @@ def workflow_video_continuation(mode):
                    links)
 
 
+# --- 7. 全能参考生视频（4 张参考图 + 加速 LoRA，Ref2VA）---------------------------
+def workflow_all_reference():
+    """对照社区那份「3 步加速 Lora + 全能参考」的工作流，做一份只靠本插件节点的版本。
+
+    与那份参考工作流的差别（都是节点能力决定的，不是偷懒）：
+
+    * 参考图：本插件最多 4 个槽位（`MlxRefImageSet` 只有 image1..image4），
+      参考工作流里的 9 张 / 3 段参考视频 / 3 段参考音频都塞不进同一条链 ——
+      H3 只有一条 keyframes 链（`MlxH3KeyframeCondition` /
+      `MlxH3MultiReferenceCondition` / `MlxH3VideoCondition` 三选一），
+      且只有「多图参考」这一路能吃多张图；想换源视频续写请用
+      `minimax-h3-video-continuation-*.json`，想把音轨换成外部配乐
+      请用 `minimax-h3-video-continuation-replace-audio.json`。
+    * 采样：不需要参考工作流里的 `KSamplerSelect` / `BasicScheduler` /
+      `BasicGuider` / `SamplerCustomAdvanced` 四件套 —— 「MLX 采样器」自己
+      写采样循环，加速适配器只要在「MLX 模型 LoRA」上选对文件、
+      再把 steps 改成适配器标称的步数即可。
+    * 加速 LoRA 选 `..._ref2v_lightx2v_turbo_4step_...`（文件名标明 Ref2VA，4 步）；
+      不照抄参考工作流里的 `..._taomate_3step_...`（文件名只写步数、没写任务）
+      与 `..._fl2v_...`（那是首 / 尾帧任务的），免得任务跟 REF 权重对不上。
+    """
+    nodes = base_nodes(
+        PROMPT_ALL_REF,
+        sampler_wh=(640, 352),
+        checkpoint=CKPT_REF,
+        visual_id=16,
+        visual_label="4 张参考图（不钉锚点）",
+        steps=4,
+        scheduler="minimax_h3",
+    ) + [
+        node_spec(17, "MlxModelLoraApply", "Ref2VA 加速 LoRA（4 步，强度 1.0）",
+                  [["model", "model"], ["lora", "COMBO"], ["strength", "FLOAT"]],
+                  [["model", "model"]],
+                  [LORA_H3_REF_4STEP, 1.0], [420, 560], [380, 240], 2),
+    ]
+    for index, filename in enumerate(
+        ("h3_ref_1.png", "h3_ref_2.png", "h3_ref_3.png", "h3_ref_4.png"), start=1
+    ):
+        nodes.append(
+            node_spec(10 + index, "LoadImage", f"参考图 {index}（提示词里的 <Picture {index}>）",
+                      [], [["IMAGE", "IMAGE"], ["MASK", "MASK"]],
+                      [filename], [420, 880 + 440 * index], [360, 400], 4)
+        )
+    nodes += [
+        node_spec(15, "MlxRefImageSet", "4 张参考图 → 有序图集（占满 4 个槽位）",
+                  [[f"image{index}", "IMAGE"] for index in range(1, 5)],
+                  [["ref_source", "mlx_ref_image_src"], ["count", "INT"], ["report", "STRING"]],
+                  [], [820, 1760], [380, 300], 5),
+        node_spec(16, "MlxH3MultiReferenceCondition",
+                  "H3 多图参考（4 张只进 presentation，不占 latent 行；必须用 H3-REF）",
+                  [["ref_images", "mlx_ref_image_src"], ["vae", "mlx_vae"]],
+                  [["keyframes", "mlx_h3_keyframes"], ["report", "STRING"]],
+                  ["none", False, 640, 352], [1240, 1760], [420, 320], 6),
+    ]
+    links = [
+        # 模型链改走加速 LoRA：transformer → LoRA → 采样器（其余连线沿用骨架）
+        *[link for link in BASE_LINKS if link != (3, 0, 5, 0, "model")],
+        (3, 0, 17, 0, "model"),
+        (17, 0, 5, 0, "model"),
+        *[(11 + index, 0, 15, index, "IMAGE") for index in range(4)],
+        # 图集必须真的接到条件的 ref_images（必填入口，漏接等于图片白 load）
+        (15, 0, 16, 0, "mlx_ref_image_src"),
+        (16, 0, 2, 1, "mlx_h3_keyframes"),
+    ]
+    write_workflow("minimax-h3-all-reference-to-video", "mlx-minimax-h3-all-reference-to-video",
+                   "MiniMax-H3 全能参考生视频（H3-REF · 4 张参考图 + 4 步加速 LoRA）",
+                   nodes, links)
+
+
 if __name__ == "__main__":
     workflow_single_image()
     workflow_multi_image()
@@ -412,4 +514,5 @@ if __name__ == "__main__":
     workflow_video_continuation("keep")
     workflow_video_continuation("drop")
     workflow_video_continuation("replace")
-    print("[gen] 六份 H3 工作流已生成")
+    workflow_all_reference()
+    print("[gen] 七份 H3 工作流已生成")

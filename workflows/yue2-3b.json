@@ -106,7 +106,7 @@
       ],
       "properties": {"Node name for S&R": "MlxKSamplerMLX"},
       "title": "YuE2：32 步 / full ABC / 最长约 8 秒",
-      "widgets_values": [42, 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0, "auto", "full", 200]
+      "widgets_values": [42, "randomize", 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0, "auto", "full", 200]
     },
     {
       "id": 7,

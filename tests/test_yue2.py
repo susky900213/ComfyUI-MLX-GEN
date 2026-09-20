@@ -424,9 +424,10 @@ check(
     and lyrics_node["outputs"][0]["links"] == [5],
 )
 check(
-    "采样器序列化 32 步 midpoint / batch 1 / guidance 1 / full CoT / 200 token",
+    "采样器序列化 32 步 midpoint / batch 1 / guidance 1 / full CoT / 200 token"
+    "（seed 后面跟 control_after_generate）",
     sampler_node["widgets_values"]
-    == [42, 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0,
+    == [42, "randomize", 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0,
         "auto", "full", 200],
     str(sampler_node["widgets_values"]),
 )
