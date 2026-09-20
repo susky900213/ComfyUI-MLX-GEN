@@ -1,3 +1,4 @@
 docs
 output
 .vscode
+__pycache__
