@@ -12,13 +12,18 @@
 - `config.py` / `prompt.py` / `pipeline.py` / `video.py`：构造参数、提示词组装与
   编码、联合采样与解码、音频载荷（mp4 由 ComfyUI 自带的 CreateVideo + SaveVideo 落盘）。
 
-导入本包时就会调用 `disable_tf32()`：MLX 在第一次 fp32 GEMM 派发时读
-`MLX_ENABLE_TF32`，必须在任何 fp32 matmul 之前设置（否则音频解码的 7 级抗混叠
-上采样会把 1e-4 的误差放大到 0.26）。
+导入本包**不再**在导入时全局关 TF32。MLX 在 fp32 GEMM 派发时读 `MLX_ENABLE_TF32`，
+H3 的那些 fp32 计算必须在它们之前设置（否则音频解码的 7 级抗混叠上采样会把 1e-4 的
+误差放大到 0.26）；但 MLX 0.32.2 上进程级关掉它会让 bf16 出图链路慢 2.5 倍（见
+`h3_precision`）。因此改成按需开关：`comfyui_mlx_gen/pipeline.py` 里四处 H3 计算入口
+用 `exact_fp32()` 包住，H3 算完立刻还原。
 """
 
-from comfyui_mlx_gen.h3.model.h3_precision import disable_tf32  # noqa: F401  (先跑再谈其它)
+from comfyui_mlx_gen.h3.model.h3_precision import (  # noqa: F401
+    disable_tf32,
+    exact_fp32,
+    restore_tf32,
+    tf32_status,
+)
 
-disable_tf32()
-
-__all__ = ["disable_tf32"]
+__all__ = ["disable_tf32", "exact_fp32", "restore_tf32", "tf32_status"]

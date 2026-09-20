@@ -544,7 +544,7 @@ MlxPilToTorch.audio ──────→ PreviewAudio / SaveAudio
 
 | 节点 | 主要输入与关键参数 | 输出 | 用途与限制 |
 | --- | --- | --- | --- |
-| **MLX 模型加载** `MlxTransformerLoader` | `model_type`、`model_path`、`quantize`、`precision`、`compile`、`compile_cache_limit` | `model` handle | 登记 Transformer 配置，真正采样时才物化权重。目录名用于匹配模型配置。H3 的 `quantize` 只能选 4/8，且会自动关闭 `compile`；音频家族也会自动关闭 `compile`。Ideogram 4 的原生 FP8 checkpoint 应选 `quantize=0`。 |
+| **MLX 模型加载** `MlxTransformerLoader` | `model_type`、`model_path`、`quantize`、`precision`、`compile`、`compile_cache_limit` | `model` handle | 登记 Transformer 配置，真正采样时才物化权重。目录名用于匹配模型配置。H3 的 `quantize` 只能选 4/8，且会自动关闭 `compile`；音频家族也会自动关闭 `compile`。Ideogram 4 的原生 FP8 checkpoint 应选 `quantize=0`。`compile_cache_limit` 单位是 **GB**，由 `MlxKSamplerMLX` 在物化权重前调 `mx.set_cache_limit` 真正设上（0 = 沿用 MLX 默认、不设置；改档位会改缓存键，模型会重新加载一次）。它约束的是 MLX 的 free-buffer 缓存，与 `compile` 开关无关，`compile` 关闭时同样会设。 |
 | **MLX CLIP 加载** `MlxClipLoader` | `model_type`、`component`（`text_encoder`/`tokenizer`）、`path`、`precision`、`max_length`、`quantize` | `CLIP` handle | 登记条件编码器配置，编码时才加载。一般保持 `component=text_encoder`。H3 的条件编码器必须量化，`quantize` 只能选 4/8；YuE2/Breeze 没有独立编码器时可选择 `transformer/` 下的完整 checkpoint。 |
 | **MLX VAE 加载** `MlxVAELoader` | `model_type`、`model_path`、`precision`、`quantize`、`role` | `vae` handle | 供编码器和解码器按需物化 VAE。同一个 handle 同时接编码与解码节点时复用实例。普通链路用 `role=vae`；H3 声音另建一个 `role=audio_vae` 的 Loader。Breeze 会从同名 `transformer/` 完整 checkpoint 回退解析。 |
 
@@ -571,7 +571,7 @@ conditional 与 unconditional 两套 Transformer。
 | --- | --- | --- | --- |
 | **MLX 参考图集（多图）** `MlxRefImageSet` | 必填 `image1`，可选 `image2`–`image4`；每槽也可接一个原生 `IMAGE` 批次 | `ref_source`、图片数 `count`、文字 `report` | FLUX.2 多尺寸参考图专用。按槽位和批次顺序展开，保留各图原始尺寸；`report` 可接文本预览核对次序。随后把 `ref_source` 接到 `MlxVAEEncoder`，不要先经过会统一尺寸的原生 `Batch Images`。Qwen Edit 暂不支持该来源。 |
 | **MLX VAE 编码** `MlxVAEEncoder` | `vae`，以及二选一的原生 `images` 批次或 `ref_source`；`max_reference_images`、`resize_mode`、目标 `width`/`height` | `ref_images`、实际/建议 `width`、`height` | 将参考图编码后接 `MlxKSamplerMLX.ref_images`。FLUX.2 默认 `aspect_area_crop`，可用多尺寸 `ref_source`；Qwen Edit 默认 `stretch`，只接受 `images`，并把参考图编码到目标尺寸，故输出宽高应与采样器一致。两个图片来源同时连接会报错。 |
-| **MLX 采样器** `MlxKSamplerMLX` | 必填 `model`、正负 `condition`、`seed`、`steps`、`width`、`height`、`batch_size`、`guidance`、`scheduler`；可选 `ref_images`、`kv_cache`、YuE2 `cot`/`max_tokens`；H3 另用 `num_frames`/两种 shift | `latents` handle | Z-Image、FLUX.2、Qwen、Ideogram 4、H3 与 YuE2 的通用采样节点。不同家族只读取相关参数：H3 忽略负向文本、scheduler 和 guidance；YuE2 的 negative 是歌词且 batch 必须为 1；Ideogram 4 忽略负向文本；Qwen 文生图禁止参考图，Qwen Edit 必须连接参考图。 |
+| **MLX 采样器** `MlxKSamplerMLX` | 必填 `model`、正负 `condition`、`seed`、`steps`、`width`、`height`、`batch_size`、`guidance`、`scheduler`；可选 `ref_images`、`kv_cache`、YuE2 `cot`/`max_tokens`；H3 另用 `num_frames`/两种 shift | `latents` handle | Z-Image、FLUX.2、Qwen、Ideogram 4、H3 与 YuE2 的通用采样节点。不同家族只读取相关参数：H3 忽略负向文本、scheduler 和 guidance；YuE2 的 negative 是歌词且 batch 必须为 1；Ideogram 4 忽略负向文本；Qwen 文生图禁止参考图，Qwen Edit 必须连接参考图。编译缓存上限取自 Loader 的 `compile_cache_limit`，在加载权重前生效（它管的是 MLX 的 free-buffer 缓存，与 `compile` 开关无关，关闭编译也会设；0 = 不设置）。 |
 | **MLX Breeze-TTS-2 采样器** `MlxBreezeSampler` | `model`、外部 `STRING text`、`seed`、`mode`、`speaker`、temperature/top-p/top-k、`cfg_scale`、`max_tokens`、重复惩罚；克隆/设计模式另接 `ref_audio`、外部 `ref_text` 或 `instruction` | `latents` handle | 仅用于 `breeze_tts2`。文本输入都是 socket，节点内部没有文本框；需连接 `PrimitiveStringMultiline` 等 STRING 节点。`speaker` 用内置 S0–S9；`voice_clone` 要参考音频及逐字稿；`voice_design` 要 instruction。一次生成一条语音。 |
 
 ### 5.4 解码、格式转换与保存节点
@@ -734,6 +734,33 @@ Qwen 编辑的参考 latent 与目标宽高强绑定。把 `MlxVAEEncoder` 的 `
 
 先确认 ComfyUI 加载的是当前仓库，而不是另一个同名插件副本。重启后重新导入
 `workflows/` 中的最新 JSON；仍有问题时删除异常节点并从 `MLX/Gen` 菜单重新添加。
+
+### 8.9 同一个工作流突然慢了一倍以上（Z-Image 1024² 从 ~2s/步 变成 ~5s/步）
+
+先查这一个环境变量，它是历史坑的元凶：
+
+```bash
+echo "$MLX_ENABLE_TF32"        # 期望：空（未设置 = MLX 默认开 TF32，快）
+
+# 若要在 Python 里确认「插件导入是否动了环境」（在插件仓库根目录跑）
+cd <插件目录>
+PYTHONPATH=src python -c "import comfyui_mlx_gen, os; print(os.environ.get('MLX_ENABLE_TF32'))"   # 期望：None
+```
+
+注意：真正决定快慢的是 **ComfyUI 进程自己的环境**（shell 里的 `export`、
+launchd/桌面启动器的环境、或 ComfyUI-Manager 里配的环境变量），
+所以先确认 ComfyUI 是怎么启动的、有没有在它的环境里设过这个变量。
+
+- M5 上 MLX **默认开 TF32**，而 TF32 关掉后 bf16/q8 的出图链路会慢 ~2.5 倍
+  （Z-Image 1024²：2.0 → 5.1 s/步）。插件**不再**在导入时关它；只有 MiniMax-H3 的
+  计算窗口内才会临时关（并打印 `[H3]` 取开关的日志）；
+- 若你在 ComfyUI 启动环境里显式设了 `MLX_ENABLE_TF32=0`，出图就会一直慢——去掉它；
+  想要 H3 音频最准而又不影响出图，请把 H3 放在独立进程 / 独立一次会话里跑；
+- 若两条链路（本插件 vs `mlx-gen` CLI）**同窗口背靠背**跑都慢、且比例接近 1:1，
+  那是机器状态（变频/温度）波动，不是插件问题。
+
+完整复盘（含实测数据、5 分钟自检、复现命令）：
+[`docs/TF32_SLOWDOWN_EXPLAINED.md`](docs/TF32_SLOWDOWN_EXPLAINED.md)。
 
 ## 9. 推荐检查清单
 

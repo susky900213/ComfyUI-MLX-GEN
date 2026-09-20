@@ -41,6 +41,10 @@ class MlxTransformerLoader:
                 "quantize": (QUANTIZE_OPTIONS, {"default": 8}),
                 "precision": (["bfloat16", "float16", "float32"], {"default": "bfloat16"}),
                 "compile": ([True, False], {"default": True}),
+                # 编译缓存上限（GB）：0 = 不设置（沿用 MLX 默认），正数按十进制 GB
+                # 计（与 mflux 的 --mlx-cache-limit-gb 一致）。由 MlxKSamplerMLX 在
+                # 物化权重前调 mx.set_cache_limit；它约束的是 MLX 的 free-buffer
+                # 缓存，与 compile 开关无关，故 compile=False 时也会设。
                 "compile_cache_limit": ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32, 64], {"default": 2}),
             }
         }

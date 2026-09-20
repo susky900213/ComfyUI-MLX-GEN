@@ -37,6 +37,7 @@ MlxVaeHandle 物化（编码与解码共用同一份实例）。采样器按 han
 from __future__ import annotations
 
 import json
+import time
 from inspect import signature
 from pathlib import Path
 from typing import Any, Sequence
@@ -46,6 +47,7 @@ import mlx.core as mx
 from . import breeze, components, image, paths, runtime, transformer_lora, weights
 from .compiled_predict import CompiledPredictCache
 from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
+from .h3.model.h3_precision import exact_fp32 as h3_exact_fp32
 from .h3.weights import loader as h3_loader
 from .progress import SamplingProgress
 from .types import MlxH3VisualCondition, MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
@@ -908,7 +910,14 @@ def _sample_z_image(defn, comps, params, cache, model_config, guidance, on_progr
             timestep = mx.ones_like(sigma_t) - sigma_t
             noise = predict(current, timestep, scheduler.sigmas, encodings, negative, guidance)
             current = scheduler.step(noise=noise, timestep=t, latents=current)
+            # 计时必须跨过 mx.eval：MLX 惰性求值，eval 之前只建了计算图，
+            # 时间都在 eval 物化时才花掉（在 eval 前取时间只会打出约 0）
+            started = time.perf_counter()
             mx.eval(current)
+            print(
+                f"[Z-Image 采样] step {t + 1}/{params['steps']} "
+                f"耗时 {time.perf_counter() - started:.2f}s"
+            )
             if on_progress is not None:
                 on_progress()
         final.append(current)
@@ -2120,6 +2129,9 @@ def encode_h3_prompt(
 
     接了视觉条件时，桶里那 N 张图会按顺序编成 ``<Picture 1>`` … ``<Picture N>``
     （``h3/prompt.py`` 的 ``encode_presentation`` 已支持任意张数；上游只用过 1 张）。
+
+    编码器前向用 `exact_fp32()` 包住（H3 的输入/输出头与时间步 MLP 是 fp32，见
+    `h3/model/h3_precision.py`）：TF32 只在 H3 计算期间关，出图链路仍走快路径。
     """
 
     def build() -> tuple[Any, Any]:
@@ -2138,7 +2150,8 @@ def encode_h3_prompt(
         encode = runtime.import_object(entry.prompt_encoder)
         # comps 里是 LoadedH3Component（模块 + 量化档位 + 生效精度），而
         # encode_presentation 要的是里面那个 nn.Module（它调 text_encoder.encode(...)）
-        return encode(comps["text_encoder"].module, comps["tokenizer"], prompt, images)
+        with h3_exact_fp32():
+            return encode(comps["text_encoder"].module, comps["tokenizer"], prompt, images)
 
     return cache.get_or_create(H3_PROMPT_BUCKET, cache_key, build)[0]
 
@@ -2201,10 +2214,11 @@ def encode_h3_keyframes(
         )
     try:
         vae = prepare_h3_vae(visual.vae, cache)
-        latents = tuple(
-            h3_pipeline.encode_keyframe_latents((images[int(index)],), vae)[0]
-            for index in visual.anchor_images
-        )
+        with h3_exact_fp32():
+            latents = tuple(
+                h3_pipeline.encode_keyframe_latents((images[int(index)],), vae)[0]
+                for index in visual.anchor_images
+            )
     finally:
         release_h3_vae(visual.vae, cache)
     return tuple(visual.anchors), latents
@@ -2244,17 +2258,18 @@ def run_h3_sampler(
             keyframe_count=len(params.get("keyframe_anchors", ())),
             log=print,
         )
-        video_rows, audio_rows, _layout = h3_pipeline.sample(
-            loaded.module,
-            embeds,
-            tags,
-            plan,
-            int(params["seed"]),
-            keyframe_latents=keyframe_latents,
-            keyframe_anchors=tuple(params.get("keyframe_anchors", ())),
-            log=print,
-            on_progress=progress.update_absolute,
-        )
+        with h3_exact_fp32():
+            video_rows, audio_rows, _layout = h3_pipeline.sample(
+                loaded.module,
+                embeds,
+                tags,
+                plan,
+                int(params["seed"]),
+                keyframe_latents=keyframe_latents,
+                keyframe_anchors=tuple(params.get("keyframe_anchors", ())),
+                log=print,
+                on_progress=progress.update_absolute,
+            )
         return video_rows, audio_rows, plan
 
     key = h3_latent_cache_key(params, model_handle)
@@ -2304,12 +2319,16 @@ def decode_h3_latents(latents, vae_handle, cache, batch_index: int) -> MlxPilIma
     """
     video_rows, audio_rows, plan = h3_state(cache, latents.cache_key)
     vae = prepare_h3_vae(vae_handle, cache)
+    # 解码也走 fp32（音频 VAE 的 7 级抗混叠上采样是 TF32 最敏感的地方），
+    # 因此与编码 / 采样一样用 exact_fp32() 包住
     if vae_handle.role == "vae":
-        frames = h3_pipeline.decode_video(video_rows, plan, vae)
+        with h3_exact_fp32():
+            frames = h3_pipeline.decode_video(video_rows, plan, vae)
         pils = image.to_pil_uint8(frames, batch_index=batch_index)
         return MlxPilImage(images=pils, batch_index=batch_index, fps=float(plan.fps), audio=None)
     if vae_handle.role == "audio_vae":
-        track = h3_pipeline.decode_audio(audio_rows, plan, vae)
+        with h3_exact_fp32():
+            track = h3_pipeline.decode_audio(audio_rows, plan, vae)
         return MlxPilImage(images=(), batch_index=batch_index, fps=float(plan.fps), audio=track)
     raise ValueError(f"未知 VAE role：{vae_handle.role}")
 

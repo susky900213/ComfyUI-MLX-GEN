@@ -107,3 +107,65 @@ def flush_caches() -> None:
         mx.clear_cache()
     except Exception:  # noqa: BLE001
         pass
+
+
+# --- MLX free-cache 上限（对应 MlxTransformerLoader 的 compile_cache_limit）----
+# 语义与 mflux 对齐：正数按**十进制** GB 计（int(gb * 1000**3)，与 mflux
+# 的 --mlx-cache-limit-gb / RuntimeMemory.apply_mlx_cache_limit 一致），
+# 设完顺手 mx.clear_cache()，让新上限立刻对后续分配生效。
+# 0 = 「不设置」：本进程若先前设过上限，则恢复第一次记录下来的原值
+# （≈ MLX 默认，随内存规模缩放，等价于「不设上限」）；没设过就什么都不动。
+# mx.set_cache_limit 没有 getter，但它的返回值就是「上一轮的上限」，
+# 因此第一次调用时把原值记下来，之后就能原样还原。
+_ORIGINAL_CACHE_LIMIT: list[int | None] = [None]
+
+
+def apply_cache_limit(limit_gb: float, *, label: str = "") -> None:
+    """按 widget 档位设 MLX 的 free-cache 上限（GB，0 = 沿用默认 / 还原原值）。"""
+    prefix = f"{label} " if label else ""
+    try:
+        import mlx.core as mx  # type: ignore
+
+        if not hasattr(mx, "set_cache_limit"):
+            return
+        gb = float(limit_gb or 0)
+        if gb > 0:
+            target = int(gb * 1000**3)
+            note = f"{gb:g} GB"
+        elif _ORIGINAL_CACHE_LIMIT[0] is None:
+            print(f"[runtime] {prefix}编译缓存上限 0 → 不设置，沿用 MLX 默认")
+            return
+        else:
+            target = int(_ORIGINAL_CACHE_LIMIT[0])
+            note = f"{target / 1000**3:.1f} GB（恢复默认）"
+
+        previous = int(mx.set_cache_limit(target))
+        if _ORIGINAL_CACHE_LIMIT[0] is None:
+            _ORIGINAL_CACHE_LIMIT[0] = previous
+        mx.clear_cache()
+        print(
+            f"[runtime] {prefix}MLX cache 上限 → {note}（上一轮 {previous / 1000**3:.1f} GB）"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[runtime] 设置 MLX cache 上限失败，已忽略：{exc}")
+
+
+def memory_snapshot() -> str:
+    """当前内存水位（活跃 / cache 占用 / 峰值，十进制 GB；MLX 不可用给 n/a）。
+
+    与 mflux 的 MemorySaver 用的是同一组读数接口（``mx.get_active_memory`` /
+    ``mx.get_cache_memory`` / ``mx.get_peak_memory``），用来核对 cache 上限
+    是否真的压住了 cache 占用。
+    """
+    try:
+        import mlx.core as mx  # type: ignore
+
+        active = int(mx.get_active_memory())
+        cached = int(mx.get_cache_memory())
+        peak = int(mx.get_peak_memory())
+        return (
+            f"活跃 {active / 1000**3:.1f} GB / cache {cached / 1000**3:.1f} GB"
+            f" / 峰值 {peak / 1000**3:.1f} GB"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"n/a（{exc}）"

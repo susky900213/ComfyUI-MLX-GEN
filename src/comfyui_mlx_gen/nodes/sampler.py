@@ -43,7 +43,7 @@ flux2-klein-9b-*.json` 已填好）；steps 取 4、guidance 保持 1.0（Klein 
 
 from __future__ import annotations
 
-from .. import pipeline
+from .. import pipeline, runtime
 from ..cache import CACHE
 from ..h3 import pipeline as h3_pipeline
 from ..h3.latent_creator.h3_layout import valid_frame_counts
@@ -344,6 +344,9 @@ class MlxKSamplerMLX:
             "scheduler_name": scheduler,
             # qwen_edit 的 transformer 入参含 Config 对象与 int 步号 → 不支持 mx.compile
             "compile_model": bool(model.compile) and entry.supports_compile,
+            # 编译缓存上限（GB）：进 latent 缓存键 → 改档位必然重新采样，
+            # 真正生效在下面的 runtime.apply_cache_limit（权重加载之前）
+            "cache_limit_gb": int(model.compile_cache_limit),
             # edit 用：进 latent 缓存键 → 换参考图必然重新采样
             "ref_cache_key": ref_key,
             "ref_count": ref_count,
@@ -372,6 +375,10 @@ class MlxKSamplerMLX:
             if negative.text.strip():
                 print("[MlxKSamplerMLX] Ideogram 4 固定使用空无条件分支，已忽略 negative 文本")
         # 只加载 transformer；编码按 key 从 cache.py 取，VAE 由编码/解码节点按 handle 物化
+        # 先在权重物化之前把 MLX 的 free-cache 上限设好：这件事与 mx.compile 无关
+        # （mflux 也是在建模型前调 apply_runtime_memory_options，编不编译都设），
+        # 所以 compile 关闭时照样设。0 = 沿用默认不动，之前设过则还原。
+        runtime.apply_cache_limit(model.compile_cache_limit, label=entry.family)
         comps = pipeline.prepare_sampler_components(entry, model, CACHE)
         handle = pipeline.run_sampler(entry, model, comps, params, CACHE)
         return (handle,)
