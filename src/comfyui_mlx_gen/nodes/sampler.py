@@ -27,6 +27,10 @@ Qwen-Image-Edit 多图编辑（edit）：同样接 `ref_images`，但条件必�
 入参含 Config 对象与步号 int，不支持 `mx.compile`（`entry.supports_compile=False`
 会强制关掉编译开关），CFG 用 `qwen_guided_noise`（普通 CFG 之后再按条件范数重标定）。
 
+Qwen-Image 2.1 原生统一编辑：三个加载器选择 `qwen_image_21`，同一个
+`MlxVAEEncoder.ref_images` 必须接到正向/负向 `MlxTextEncoder.ref_images` 和本节点；
+参考 latent 按视觉槽插入单流 DiT，首步执行 block-causal prefill，后续复用 prefix KV。
+
 Ideogram 4 本地文生图：三个加载器选 `ideogram4` + `ideogram-4-fp8`，仍沿用本节点
 的 model / positive / negative 三条标准连线；负向文本会被忽略，scheduler 必须选择
 ideogram4_default / quality / turbo 之一，步数和 guidance schedule 由预设决定。
@@ -47,7 +51,7 @@ from .. import pipeline, runtime
 from ..cache import CACHE
 from ..h3 import pipeline as h3_pipeline
 from ..h3.latent_creator.h3_layout import valid_frame_counts
-from ..types import condition, entry_for, model, model_types, ref_images
+from ..types import condition, entry_for, model, model_types, ref_images, validate_model_family
 
 SCHEDULERS = [
     "linear",
@@ -176,6 +180,7 @@ class MlxKSamplerMLX:
         #     )
         # 配置由「大类 + 权重目录名」现取；未知大类直接报错（不静默回退）
         entry = entry_for(model.model_type)
+        validate_model_family(model.model_type, model.model_path)
         if not entry.supported:
             raise NotImplementedError(f"{model.model_type} 尚未实现：{entry.notes}")
 
@@ -305,6 +310,13 @@ class MlxKSamplerMLX:
                 "qwen_edit 必须有参考图：请用「MLX VAE 编码」产出 ref_images，"
                 "并把它接到本节点的 ref_images 入口（条件也要用「MLX Qwen 编辑条件」节点）"
             )
+        if ref_images is None and entry.family == "qwen_image_21" and (
+            positive.ref_cache_key or negative.ref_cache_key
+        ):
+            raise ValueError(
+                "Qwen-Image 2.1 文本条件已经带参考图，但采样器没有连接 ref_images；"
+                "请把同一个「MLX VAE 编码」输出也接到采样器，或从正/负文本编码器断开它"
+            )
         if ref_images is not None:
             if entry.family == "ideogram4":
                 raise NotImplementedError(
@@ -323,7 +335,26 @@ class MlxKSamplerMLX:
                     f"参考图是用 {ref_images.model_type} 编码的，"
                     f"与采样器的 {model.model_type} 不匹配"
                 )
-            if entry.family == "qwen_edit":
+            if entry.family == "qwen_image_21":
+                if ref_images.edit_kind != "qwen_image_21":
+                    raise ValueError("参考图不是按 Qwen-Image 2.1 原生统一编辑语义编码的")
+                if positive.ref_cache_key != ref_images.cache_key:
+                    raise ValueError(
+                        "Qwen-Image 2.1 正向条件没有连接同一个 ref_images："
+                        "请把「MLX VAE 编码」输出同时接到正向文本编码器和采样器"
+                    )
+                if negative.ref_cache_key != ref_images.cache_key:
+                    raise ValueError(
+                        "Qwen-Image 2.1 负向条件没有连接同一个 ref_images："
+                        "请把「MLX VAE 编码」输出同时接到负向文本编码器和采样器"
+                    )
+                if (int(ref_images.width), int(ref_images.height)) != (int(width), int(height)):
+                    print(
+                        f"[MlxKSamplerMLX] Qwen-Image 2.1 第一张参考图是 "
+                        f"{ref_images.width}×{ref_images.height}，目标画布是 {int(width)}×{int(height)}；"
+                        "模型允许不同尺寸，但保持同一宽高比通常能减少编辑构图偏移"
+                    )
+            elif entry.family == "qwen_edit":
                 if ref_images.edit_kind != "qwen_edit":
                     raise ValueError(
                         "参考图不是按 qwen_edit 语义编码的（请把「MLX VAE 编码」的 model_type "
@@ -338,7 +369,7 @@ class MlxKSamplerMLX:
                     )
             elif entry.family != "flux2":
                 raise NotImplementedError(
-                    f"{model.model_type} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit）"
+                    f"{model.model_type} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit / qwen_image_21）"
                 )
             elif ref_images.edit_kind != "flux2":
                 raise ValueError("参考图不是按 flux2 语义编码的")
@@ -388,6 +419,12 @@ class MlxKSamplerMLX:
             if negative.text.strip():
                 print("[MlxKSamplerMLX] Ideogram 4 固定使用空无条件分支，已忽略 negative 文本")
         # 只加载 transformer；编码按 key 从 cache.py 取，VAE 由编码/解码节点按 handle 物化
+        if entry.family == "qwen_image_21":
+            # 正/负条件共享同一份 Qwen3-VL-8B；两条都编码完以后、加载 7B DiT 之前
+            # 再统一释放，避免每条提示词各重载一次，又不让文本塔与 DiT 同时常驻。
+            pipeline.release_encoder(positive.clip, CACHE)
+            if negative.clip.cache_key != positive.clip.cache_key:
+                pipeline.release_encoder(negative.clip, CACHE)
         # 先在权重物化之前把 MLX 的 free-cache 上限设好：这件事与 mx.compile 无关
         # （mflux 也是在建模型前调 apply_runtime_memory_options，编不编译都设），
         # 所以 compile 关闭时照样设。0 = 沿用默认不动，之前设过则还原。

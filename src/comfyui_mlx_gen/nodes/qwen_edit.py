@@ -15,7 +15,14 @@ from __future__ import annotations
 from .. import image as image_mod
 from .. import pipeline, runtime
 from ..cache import CACHE
-from ..types import CLIP, MlxClipHandle, MlxConditioning, condition, entry_for
+from ..types import (
+    CLIP,
+    MlxClipHandle,
+    MlxConditioning,
+    condition,
+    entry_for,
+    validate_model_family,
+)
 
 
 class MlxQwenEditEncoder:
@@ -46,6 +53,7 @@ class MlxQwenEditEncoder:
         if images is None:
             raise ValueError("必须连接图片（用 ComfyUI 自带的「Load Image」+「Batch Images」）")
         entry = entry_for(clip.model_type)
+        validate_model_family(clip.model_type, clip.path)
         if not entry.supported:
             raise NotImplementedError(f"{clip.model_type} 尚未实现：{entry.notes}")
         if entry.family != "qwen_edit":

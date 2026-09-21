@@ -13,7 +13,9 @@ handle（MlxRefImageSource）只带「张数 + 每张尺寸 + 有序摘要 + 缓
 真正的 VAE 编码仍由 MlxVAEEncoder（ref_source 入口）做，因此编码语义、VAE 实例、
 ref_encoding 缓存键口径都只有一个来源。
 
-槽位：image1 必填，image2..image4 可选；每个槽位本身也可以是批次（按批次顺序展开）。
+槽位：image1 必填，image2..image10 可选；每个槽位本身也可以是批次（按批次顺序展开）。
+Qwen-Image 2.1 可直接使用全部 10 个槽；legacy 图片家族仍由下游 VAE 编码节点执行
+各自的参考图数量上限。
 
 用法（与 qwen 的「Picture N」不同，FLUX.2 的文本里没有图像 token，**顺序只能靠接线表达**）：
 提示词里说「第一张 / 第二张」时，请按 image1 → image2 → … 的顺序对齐；
@@ -27,7 +29,7 @@ from .. import pipeline
 from ..cache import CACHE
 from ..types import MlxRefImageSource, ref_source
 
-SLOTS = ("image1", "image2", "image3", "image4")
+SLOTS = tuple(f"image{index}" for index in range(1, 11))
 T_COORD_BASE = 10  # 与 pipeline.REFERENCE_T_COORD_BASE 一致：第 i 张的 t = 10 + 10 * i
 T_COORD_STEP = 10
 
@@ -45,9 +47,36 @@ class MlxRefImageSet:
     FUNCTION = "pack"
     CATEGORY = "MLX/Gen"
 
-    def pack(self, image1, image2=None, image3=None, image4=None):
-        values = {name: value for name, value in
-                  zip(SLOTS, (image1, image2, image3, image4))}
+    def pack(
+        self,
+        image1,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
+        image6=None,
+        image7=None,
+        image8=None,
+        image9=None,
+        image10=None,
+    ):
+        values = dict(
+            zip(
+                SLOTS,
+                (
+                    image1,
+                    image2,
+                    image3,
+                    image4,
+                    image5,
+                    image6,
+                    image7,
+                    image8,
+                    image9,
+                    image10,
+                ),
+            )
+        )
         pils = []
         for name in SLOTS:
             value = values[name]

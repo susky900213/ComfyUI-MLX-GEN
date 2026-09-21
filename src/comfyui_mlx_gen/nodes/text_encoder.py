@@ -21,7 +21,10 @@ from ..types import (
     MlxClipHandle,
     MlxConditioning,
     MlxH3VisualCondition,
+    MlxReferenceImages,
     h3_keyframes as h3_keyframes_type,
+    ref_images as ref_images_type,
+    validate_model_family,
 )
 
 
@@ -36,14 +39,17 @@ class MlxTextEncoder:
                 ),
                 "clip": (CLIP, {}),
             },
-            "optional": {"h3_keyframes": (h3_keyframes_type, {})},
+            "optional": {
+                "h3_keyframes": (h3_keyframes_type, {}),
+                "ref_images": (ref_images_type, {}),
+            },
         }
 
     RETURN_TYPES = (condition,)
     FUNCTION = "encode"
     CATEGORY = "MLX/Gen"
 
-    def encode(self, text, clip, h3_keyframes=None):
+    def encode(self, text, clip, h3_keyframes=None, ref_images=None):
         if clip is None:
             raise ValueError("必须先连接 MlxClipLoader 的输出")
         if not isinstance(clip, MlxClipHandle):
@@ -53,12 +59,23 @@ class MlxTextEncoder:
             )
         # 配置由 handle 里的大类决定；未验证的大类直接报错（不静默回退）
         entry = entry_for(clip.model_type)
+        validate_model_family(clip.model_type, clip.path)
         if not entry.supported:
             raise NotImplementedError(f"{clip.model_type} 尚未实现：{entry.notes}")
         if h3_keyframes is not None and not isinstance(h3_keyframes, MlxH3VisualCondition):
             raise ValueError("h3_keyframes 必须连接「MLX H3 关键帧 / 多图参考 / 视频条件」的输出")
         if h3_keyframes is not None and entry.family != "minimax_h3":
             raise ValueError(f"h3_keyframes 只支持 minimax_h3，当前条件大类是 {entry.family}")
+        if ref_images is not None and not isinstance(ref_images, MlxReferenceImages):
+            raise ValueError("ref_images 必须连接「MLX VAE 编码」的输出")
+        if ref_images is not None and entry.family != "qwen_image_21":
+            raise ValueError(
+                f"MlxTextEncoder 的 ref_images 只供 qwen_image_21 原生编辑使用，当前是 {entry.family}"
+            )
+        if ref_images is not None and (
+            ref_images.model_type != clip.model_type or ref_images.edit_kind != "qwen_image_21"
+        ):
+            raise ValueError("参考图不是由当前 qwen_image_21 VAE 原生编码的")
         if entry.family == "qwen_edit":
             raise ValueError(
                 "Qwen-Image-Edit 的条件必须带参考图，请用「MLX Qwen 编辑条件」"
@@ -129,15 +146,34 @@ class MlxTextEncoder:
             )
             return (cond,)
 
+        ref_key = ref_images.cache_key if ref_images is not None else ""
+        reference_pils = (
+            pipeline.cached_qwen21_reference(CACHE, ref_key)["images"] if ref_key else ()
+        )
+
         # 1) 按需创建 text_encoder + tokenizer（同一 handle 第二次执行直接命中缓存）
+        # 参考缓存先读取：若已经淘汰，应在加载 8B 条件编码器之前快速失败。
         comps_key = runtime.cache_key({"kind": "module", "clip": clip})
         comps = pipeline.prepare_encoder(entry, clip, CACHE, comps_key)
 
         # 2) 编码本条提示词；数组只进缓存，handle 里只留键
-        encoding_key = pipeline.prompt_encoding_key(clip, prompt)
-        pipeline.encode_text(entry, comps, prompt, CACHE, encoding_key)
+        encoding_key = pipeline.prompt_encoding_key(clip, prompt, ref_key)
+        pipeline.encode_text(
+            entry,
+            comps,
+            prompt,
+            CACHE,
+            encoding_key,
+            reference_images=reference_pils,
+            max_length=clip.max_length,
+        )
 
         # 3) 交给 MlxKSamplerMLX 的 positive / negative 入口
-        cond = MlxConditioning(clip=clip, text=prompt, encoding_key=encoding_key)
+        cond = MlxConditioning(
+            clip=clip,
+            text=prompt,
+            encoding_key=encoding_key,
+            ref_cache_key=ref_key,
+        )
         return (cond,)
 

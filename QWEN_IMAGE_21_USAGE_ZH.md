@@ -1,0 +1,350 @@
+# Qwen-Image 2.1 下载、安装与使用指南
+
+本文说明如何在 **Apple Silicon + ComfyUI-MLX-GEN** 中使用官方
+[`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) 权重进行：
+
+- 文生图；
+- 单张参考图编辑；
+- 最多 10 张、有顺序且尺寸可以不同的参考图编辑；
+- RGBA 透明图片生成和保存。
+
+这里的 `qwen_image_21` 是 Qwen-Image 2.1 的原生统一生成/编辑链路，不是旧版
+`qwen_image`（Qwen-Image 2512 文生图）或 `qwen_edit`（Qwen-Image-Edit 2511）。三个
+Loader 的 `model_type` 必须全部选择 `qwen_image_21`。
+
+## 1. 前置条件
+
+- Apple Silicon Mac（M 系列芯片）；
+- 已安装并可启动 ComfyUI；
+- 本插件位于：
+
+  ```text
+  <ComfyUI>/custom_nodes/ComfyUI-MLX-GEN
+  ```
+
+- 已使用 **ComfyUI 实际运行的 Python** 安装插件依赖：
+
+  ```bash
+  cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
+  /你的/ComfyUI/.venv/bin/python -m pip install -r requirements.txt
+  ```
+
+官方仓库采用 Qwen Research License。下载和使用前请阅读模型页上的许可证条款。官方
+BF16 仓库下载后约占 **31 GB**：Transformer 约 13 GB、Qwen3-VL 文本/视觉编码器约
+16 GB、VAE 约 1.3 GB，另外还有 processor 配置文件。请预留额外空间给下载缓存和输出。
+
+## 2. 模型根目录
+
+插件现在使用相对于插件目录的模型根目录，不再包含开发者机器上的绝对路径：
+
+```text
+<ComfyUI-MLX-GEN>/models/mlx
+```
+
+例如插件直接安装在 ComfyUI 中时，完整路径是：
+
+```text
+<ComfyUI>/custom_nodes/ComfyUI-MLX-GEN/models/mlx
+```
+
+代码使用 `Path(__file__).resolve()` 定位插件根目录，因此无论从哪个工作目录启动
+ComfyUI，都会找到同一个模型目录。模型数据也可以放在外置磁盘；只需让下文的四个组件
+目录使用绝对软链接指向外置磁盘，无需再修改 `paths.py`。
+
+## 3. 下载官方模型
+
+### 3.1 使用 Hugging Face CLI（推荐）
+
+先安装 Hugging Face CLI。可以使用普通终端 Python，也可以使用 ComfyUI 的 Python：
+
+```bash
+python3 -m pip install -U huggingface_hub
+```
+
+如果下载时提示需要身份验证，先登录；公开访问正常时可以跳过这一步：
+
+```bash
+hf auth login
+```
+
+把完整仓库下载到一个有至少 35 GB 可用空间的位置。下面以用户目录为例：
+
+```bash
+mkdir -p "$HOME/Models/Qwen-Image-2.1"
+hf download Qwen/Qwen-Image-2.1 \
+  --local-dir "$HOME/Models/Qwen-Image-2.1"
+```
+
+下载中断后可以直接重新执行相同命令；CLI 会复用已经完成的文件。
+
+### 3.2 不使用 CLI：Python 下载
+
+如果终端找不到 `hf` 命令，可以使用同一个包的 Python API：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+destination = Path.home() / "Models" / "Qwen-Image-2.1"
+snapshot_download(
+    repo_id="Qwen/Qwen-Image-2.1",
+    local_dir=destination,
+)
+print(f"模型已下载到：{destination}")
+PY
+```
+
+### 3.3 检查下载是否完整
+
+至少应存在以下文件。权重 shard 名称和数量以官方仓库当前版本为准，不要只下载
+`config.json` 或 Git/Xet 指针文件：
+
+```text
+Qwen-Image-2.1/
+├── transformer/
+│   ├── config.json
+│   ├── diffusion_pytorch_model-00001-of-00002.safetensors
+│   ├── diffusion_pytorch_model-00002-of-00002.safetensors
+│   └── diffusion_pytorch_model.safetensors.index.json
+├── text_encoder/
+│   ├── config.json
+│   ├── model-00001-of-00004.safetensors
+│   ├── ...
+│   └── model.safetensors.index.json
+├── processor/
+│   ├── tokenizer.json
+│   ├── tokenizer_config.json
+│   └── ...
+└── vae/
+    ├── config.json
+    └── diffusion_pytorch_model.safetensors
+```
+
+可用下面的命令快速检查：
+
+```bash
+MODEL="$HOME/Models/Qwen-Image-2.1"
+test -f "$MODEL/transformer/config.json" && \
+test -f "$MODEL/text_encoder/config.json" && \
+test -f "$MODEL/processor/tokenizer.json" && \
+test -f "$MODEL/vae/config.json" && \
+echo "Qwen-Image 2.1 目录检查通过"
+du -sh "$MODEL"
+```
+
+## 4. 把模型放到插件能扫描的位置
+
+插件按组件扫描四个目录，四处显示的模型名必须同为 `Qwen-Image-2.1`：
+
+```text
+<ComfyUI-MLX-GEN>/models/mlx/
+├── transformer/Qwen-Image-2.1/ -> <下载目录>/transformer
+├── text_encoder/Qwen-Image-2.1/ -> <下载目录>/text_encoder
+├── tokenizer/Qwen-Image-2.1/ -> <下载目录>/processor
+└── vae/Qwen-Image-2.1/ -> <下载目录>/vae
+```
+
+> **注意：**官方仓库把 tokenizer 文件放在 `processor/`，而插件的组件目录名是
+> `tokenizer/`。因此第三个链接必须是“本地 `tokenizer` → 官方 `processor`”，不能链接到
+> 一个不存在的官方 `tokenizer/` 目录。
+
+推荐使用软链接，约 31 GB 的权重只保留一份。请把 `PLUGIN_ROOT` 改成你的实际插件路径：
+
+```bash
+PLUGIN_ROOT="/你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN"
+MLX_ROOT="$PLUGIN_ROOT/models/mlx"
+SNAPSHOT="$HOME/Models/Qwen-Image-2.1"
+
+mkdir -p "$MLX_ROOT"/{transformer,text_encoder,tokenizer,vae}
+
+# 先把源目录规范成绝对路径，避免移动工作目录后软链接失效。
+SNAPSHOT="$(cd "$SNAPSHOT" && pwd)"
+
+ln -sfn "$SNAPSHOT/transformer"  "$MLX_ROOT/transformer/Qwen-Image-2.1"
+ln -sfn "$SNAPSHOT/text_encoder" "$MLX_ROOT/text_encoder/Qwen-Image-2.1"
+ln -sfn "$SNAPSHOT/processor"    "$MLX_ROOT/tokenizer/Qwen-Image-2.1"
+ln -sfn "$SNAPSHOT/vae"          "$MLX_ROOT/vae/Qwen-Image-2.1"
+```
+
+检查四个链接：
+
+```bash
+for component in transformer text_encoder tokenizer vae; do
+  test -e "$MLX_ROOT/$component/Qwen-Image-2.1" \
+    && echo "OK: $component" \
+    || echo "缺失或软链接断开: $component"
+done
+```
+
+也可以把四个真实组件目录复制到对应位置，但不要把整个 snapshot 只复制成
+`models/mlx/Qwen-Image-2.1`；Loader 不会扫描这个层级。放好模型后要**完整重启
+ComfyUI**，浏览器刷新不会重新生成 Loader 下拉列表。
+
+## 5. 文生图
+
+1. 启动 ComfyUI。
+2. 导入：
+
+   ```text
+   workflows/qwen-image-2.1.json
+   ```
+
+3. 检查三个 Loader：
+
+   | 节点 | 关键设置 |
+   | --- | --- |
+   | MLX CLIP 加载 | `model_type=qwen_image_21`、`component=text_encoder`、`path=Qwen-Image-2.1`、`quantize=8` |
+   | MLX 模型加载 | `model_type=qwen_image_21`、`model_path=Qwen-Image-2.1`、`quantize=8`、`compile=false` |
+   | MLX VAE 加载 | `model_type=qwen_image_21`、`model_path=Qwen-Image-2.1`、`quantize=0`、`role=vae` |
+
+   官方下载的是 BF16 权重。这里的 `quantize=8` 表示插件在加载文本编码器和 Transformer
+   时逐 shard 在线转换为 MLX q8，以降低统一内存占用；不会改写磁盘上的官方文件。VAE 是
+   卷积网络，保持 `quantize=0`。
+
+4. 在正向 `MLX 文本编码器` 中填写提示词。负向节点可以保留单个空格；当
+   `guidance=1.0` 时负向条件不会参与采样。
+5. 先保持示例参数进行验证：
+   - 1024×1024；
+   - 40 步；
+   - `guidance=1.0`；
+   - `scheduler=flow_match_euler_discrete`；
+   - batch 1；
+   - `compile=false`。
+6. 点击 **Queue Prompt/执行**。
+
+官方模型卡以 2048×2048、40 步为示例，并列出 4:3、3:4、3:2、2:3、16:9 和 9:16 等
+比例；本插件工作流为了先控制 Apple 统一内存占用，默认从 1024×1024 开始。确认正常后再
+逐步提高分辨率。
+
+### 5.1 生成透明 RGBA 图片
+
+官方推荐在提示词中明确声明透明图，例如：
+
+```text
+This is an RGBA image with transparency. A cute cartoon dragon sticker.
+The image has alpha channel and the background is transparent.
+```
+
+要保留 alpha 通道，请使用工作流中的 `MLX 保存图片（MlxSaveImage）` 输出 PNG。普通
+ComfyUI `IMAGE` 预览链路主要用于 RGB 预览；透明度还可从 `MlxPilToTorch.MASK` 输出取得。
+
+## 6. 单图编辑
+
+1. 导入：
+
+   ```text
+   workflows/qwen-image-2.1-edit.json
+   ```
+
+2. 在 `Load Image` 中选择参考图。
+3. 在正向 `MLX 文本编码器` 中写编辑指令，例如：
+
+   ```text
+   保持主体身份和服装细节不变，把背景替换为日落时的海滩，电影感光线。
+   ```
+
+4. 确认 `MLX VAE 编码.ref_images` 的**同一个输出**同时连接到：
+
+   ```text
+   MLX VAE 编码.ref_images ─┬→ 正向 MLX 文本编码器.ref_images
+                            ├→ 负向 MLX 文本编码器.ref_images
+                            └→ MLX 采样器.ref_images
+   ```
+
+5. 保持 40 步、guidance 1.0、flow-match 和 1024×1024，先执行一次。
+
+Qwen-Image 2.1 与 legacy `qwen_edit` 不同：参考图允许和目标画布尺寸不同。`MLX VAE
+编码`的 `auto` 模式会保持参考图比例、按目标面积缩放并对齐到 32 像素倍数；目标画布使用
+接近参考图的宽高比，通常能减少构图偏移。
+
+正向和负向文本编码器都要看到参考图，因为 Qwen3-VL 视觉条件属于提示词 prefix；采样器
+还需要同一份参考 VAE latent。插件会比较三个缓存键，连错、漏连或换成另一批图时会在加载
+DiT 前报错。
+
+## 7. 多参考图编辑（最多 10 张）
+
+参考图尺寸不同时，不要使用 ComfyUI 的 `Batch Images`，因为它会把后续图片调整到第一张
+的尺寸。使用 `MLX 参考图集（MlxRefImageSet）`：
+
+```text
+Load Image 1 ─┐
+Load Image 2 ─┼→ MlxRefImageSet.ref_source → MlxVAEEncoder.ref_source
+Load Image 3 ─┘
+```
+
+然后仍把 `MlxVAEEncoder.ref_images` 同时接到正向条件、负向条件和采样器。注意：
+
+- `image1 → image2 → ... → image10` 就是提示词中的第一张、第二张……，顺序不会重排；
+- 每个输入槽也可以是同尺寸图片批次，批次内部按原顺序展开；
+- 总数最多 10 张；`MlxVAEEncoder.max_reference_images` 应不小于实际张数；
+- 使用 `ref_source` 时不要再连接 `MlxVAEEncoder.images`，两个入口只能二选一；
+- 每张图分别保持宽高比并编码，不要求参考图之间尺寸相同；
+- 提示词应明确各图用途，例如“保持第一张的人物身份，使用第二张的服装和第三张的背景”。
+
+## 8. 内存与速度建议
+
+- 首次从官方 BF16 checkpoint 加载并在线 q8 会逐 shard 读取，耗时比后续缓存命中更长；
+- Transformer 和 CLIP 先用 `quantize=8`，VAE 用 `0`；内存仍不足时可尝试 q4，但质量与
+  性能需要自行评估；
+- 从 1024×1024、batch 1 开始，不要一开始直接使用官方 2048 示例；
+- 参考图越多、分辨率越高，Qwen3-VL 条件 token 和 DiT prefix 越长；多图编辑应逐张增加；
+- `compile` 保持关闭；
+- 本项目的 32×32 q8 端到端开发冒烟测试峰值约 15.3 GB，但这**不是** 1024×1024 的
+  内存需求；正常分辨率会使用更多激活内存，请按机器容量逐步测试。
+
+## 9. 常见问题
+
+### Loader 显示 `<无可用权重>`
+
+确认模型不在 ComfyUI 的 `models/checkpoints`，而在插件自己的：
+
+```text
+<ComfyUI-MLX-GEN>/models/mlx/<组件>/Qwen-Image-2.1
+```
+
+确认四个组件链接存在且没有断开，然后完整重启 ComfyUI。
+
+### tokenizer 加载失败
+
+本地目录应为：
+
+```text
+models/mlx/tokenizer/Qwen-Image-2.1 -> <官方 snapshot>/processor
+```
+
+不是指向 snapshot 根目录，也不是指向不存在的 `<snapshot>/tokenizer`。
+
+### 报“模型大类不匹配”
+
+三个 Loader 必须全部选择 `qwen_image_21`。不要混用：
+
+- `qwen_image`：旧 Qwen-Image 2512 文生图；
+- `qwen_edit`：旧 Qwen-Image-Edit 2511；
+- `qwen_image_21`：本指南使用的 2.1 原生统一生成/编辑模型。
+
+### 编辑时报“没有连接同一个 ref_images”
+
+不要创建三套 VAE 编码节点。把**同一个** `MlxVAEEncoder.ref_images` 输出分叉连接到正向
+文本编码器、负向文本编码器和采样器。
+
+### 报 `max_length` 不够
+
+编辑条件包含提示词和每张参考图的视觉 token。缩短提示词/减少参考图，或提高
+`MLX CLIP 加载.max_length`。示例文生图使用 512，编辑工作流使用 4096。
+
+### 报缺少权重、shape 不符或只下载了几 MB
+
+这通常表示下载不完整，或拿到的是 Git LFS/Xet 指针而不是真实 safetensors。重新执行
+`hf download`，并确认完整目录约 31 GB。不要只手工下载配置文件。
+
+## 10. 快速核对清单
+
+- [ ] 官方 `Qwen/Qwen-Image-2.1` 完整下载约 31 GB；
+- [ ] `transformer`、`text_encoder`、`processor`、`vae` 均完整；
+- [ ] 四个组件分别链接到 `models/mlx` 对应目录；
+- [ ] 本地 `tokenizer` 链接指向官方 `processor`；
+- [ ] 三个 Loader 都是 `qwen_image_21 + Qwen-Image-2.1`；
+- [ ] Transformer/CLIP q8，VAE q0，compile 关闭；
+- [ ] 编辑时同一个 `ref_images` 连接正向、负向和采样器；
+- [ ] 放置模型后已完整重启 ComfyUI。

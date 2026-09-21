@@ -20,6 +20,9 @@ VAE 由「MLX VAE 加载器」提供，本节点按 handle 物化 VAE 并编码�
   用的宽高（参考图 latent 与目标尺寸强绑定，不一致会被采样器直接拒绝）。
   qwen_edit 暂不支持 `ref_source` 入口（它的参考图要按目标尺寸拉伸，文本条件也要带
   同一批图 —— 见 docs/FLUX2_MULTI_IMAGE_EDIT_IMPLEMENTATION.md §3.2 第 5 条）。
+- qwen_image_21：每张图保持比例缩放到目标面积并对齐 32 倍数，同一份 RGBA 像素
+  经原生 VAE encoder 变成 64 通道参考 latent，白底 RGB 副本交给 Qwen3-VL；最多
+  10 张，支持 `ref_source` 保留异尺寸图的顺序。
 
 数组存进 cache.py 的 "ref_encoding" 桶，输出 MlxReferenceImages（只带键）。
 输出类型 `mlx_ref_images` 只能接到 MlxKSamplerMLX 的可选入口 `ref_images`；
@@ -42,6 +45,7 @@ from ..types import (
     entry_for,
     ref_images,
     ref_source,
+    validate_model_family,
     vae,
 )
 
@@ -56,7 +60,11 @@ def resolve_resize_mode(family: str, resize_mode: str) -> str:
     """
     if resize_mode != "auto":
         return resize_mode
-    return "aspect_area_crop" if family == "flux2" else "stretch"
+    if family == "flux2":
+        return "aspect_area_crop"
+    if family == "qwen_image_21":
+        return "auto"
+    return "stretch"
 
 
 def resolve_reference_images(
@@ -80,13 +88,14 @@ def resolve_reference_images(
     if ref_source_handle is not None:
         if not isinstance(ref_source_handle, MlxRefImageSource):
             raise ValueError("ref_source 必须接「MLX 参考图集」（MlxRefImageSet）的输出")
-        if entry.family != "flux2":
+        if entry.family not in ("flux2", "qwen_image_21"):
             raise NotImplementedError(
-                f"{entry.family} 还不支持 ref_source 入口（目前只有 flux2）："
+                f"{entry.family} 还不支持 ref_source 入口（目前只有 flux2 / qwen_image_21）："
                 "qwen_edit 的参考图要按目标尺寸拉伸、文本条件也要带同一批图，"
                 "请继续用「Batch Images」→ images 批次"
             )
-        limit = max(1, int(max_reference_images))
+        family_limit = 10 if entry.family == "qwen_image_21" else 8
+        limit = min(family_limit, max(1, int(max_reference_images)))
         if int(ref_source_handle.count) > limit:
             raise ValueError(
                 f"参考图集里有 {ref_source_handle.count} 张，但本节点的 "
@@ -100,8 +109,9 @@ def resolve_reference_images(
             "必须连接参考图：同尺寸的一批图用「Load Image」+「Batch Images」接 images；"
             "尺寸各不相同的多张图用「MLX 参考图集」（MlxRefImageSet）接 ref_source"
         )
-    pils = list(image_mod.to_pil_batch(images))
-    count = min(len(pils), max(1, int(max_reference_images)))
+    pils = list(image_mod.to_pil_batch(images, preserve_alpha=entry.family == "qwen_image_21"))
+    family_limit = 10 if entry.family == "qwen_image_21" else 8
+    count = min(len(pils), max(1, int(max_reference_images)), family_limit)
     if count <= 0:
         raise ValueError("参考图为空")
     return pils[:count], image_mod.digest(images), count
@@ -113,7 +123,7 @@ class MlxVAEEncoder:
         return {
             "required": {
                 "vae": (vae, {}),
-                "max_reference_images": ("INT", {"default": 2, "min": 1, "max": 8}),
+                "max_reference_images": ("INT", {"default": 2, "min": 1, "max": 10}),
                 "resize_mode": (list(RESIZE_MODES), {"default": "auto"}),
                 # qwen_edit 用：0 = 用首张参考图尺寸（等价 mflux 的 DimensionResolver）。
                 # 采样器的 width/height 必须与这里输出的宽高一致（不接就把采样器填成同值）。
@@ -152,9 +162,9 @@ class MlxVAEEncoder:
                 "ComfyUI 原生 VAE（torch 权重）不能被 MLX 节点使用"
             )
         entry = entry_for(vae.model_type)
+        validate_model_family(vae.model_type, vae.path)
         if not entry.supported:
             raise NotImplementedError(f"{vae.model_type} 尚未实现：{entry.notes}")
-
         # 1) 参考图来源（批次 / 图集）→ 有序 PIL 列表 + 摘要 + 张数
         pils, digest, count = resolve_reference_images(
             entry, images, ref_source, max_reference_images
@@ -162,6 +172,44 @@ class MlxVAEEncoder:
         resolved_mode = resolve_resize_mode(entry.family, resize_mode)
         # 按 handle 物化 VAE：与 MlxVAEDecoder 接同一个 handle 时就是同一份实例
         vae_module = pipeline.vae_component(vae, CACHE)
+
+        if entry.family == "qwen_image_21":
+            params = {
+                "count": count,
+                "resize_mode": resolved_mode,
+                "family": "qwen_image_21",
+                "width": int(width),
+                "height": int(height),
+            }
+            cache_key = pipeline.reference_image_cache_key(vae, digest, params)
+            encoded = pipeline.encode_qwen21_reference_images(
+                vae_module,
+                pils,
+                CACHE,
+                cache_key,
+                count,
+                int(width),
+                int(height),
+                resolved_mode,
+            )
+            handle = MlxReferenceImages(
+                model_type=vae.model_type,
+                vae_path=vae.path,
+                count=count,
+                height=int(encoded["height"]),
+                width=int(encoded["width"]),
+                cache_key=cache_key,
+                vae_cache_key=vae.cache_key,
+                precision=vae.precision,
+                quantize=vae.quantize,
+                edit_kind="qwen_image_21",
+                seq_len=int(encoded["latents"].shape[1]),
+            )
+            print(
+                f"[MlxVAEEncoder] qwen_image_21 | {count} 张参考图 → "
+                f"seq={encoded['latents'].shape[1]}，建议画布 {handle.width}×{handle.height}"
+            )
+            return (handle, handle.width, handle.height)
 
         if entry.family == "flux2":
             if resolved_mode not in ("aspect_area_crop", "keep_resolution"):

@@ -14,7 +14,14 @@ from __future__ import annotations
 
 from .. import image, paths, pipeline, runtime
 from ..cache import CACHE
-from ..types import MlxPilImage, MlxVaeHandle, entry_for, model_types, vae
+from ..types import (
+    MlxPilImage,
+    MlxVaeHandle,
+    entry_for,
+    model_types,
+    vae,
+    validate_model_family,
+)
 
 NO_PATH = "<无可用权重>"
 
@@ -154,6 +161,7 @@ class MlxVAEDecodeRawPIL:
     def decode(self, latents, model_type, model_path, precision, quantize, batch_index,
                audio_vae=None):
         entry = entry_for(model_type)
+        validate_model_family(model_type, model_path)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
         if latents.model and latents.model != model_type:
@@ -207,6 +215,7 @@ class MlxVAEDecoder:
                 "ComfyUI 原生 VAE（torch 权重）不能被 MLX 节点使用"
             )
         entry = entry_for(vae.model_type)
+        validate_model_family(vae.model_type, vae.path)
         if not entry.supported:
             raise NotImplementedError(f"{vae.model_type} 尚未实现：{entry.notes}")
         # latent 由哪个大类产的就该用哪个大类的 VAE 解（不静默降级）

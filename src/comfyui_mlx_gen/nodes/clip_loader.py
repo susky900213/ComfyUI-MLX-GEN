@@ -13,7 +13,7 @@ ModelConfig 由 weights.config_for_path 按目录名匹配）。
 from __future__ import annotations
 
 from .. import paths, runtime
-from ..types import CLIP, MlxClipHandle, entry_for, model_types
+from ..types import CLIP, MlxClipHandle, entry_for, model_types, validate_model_family
 
 COMPONENTS = ["text_encoder", "tokenizer"]
 PRECISIONS = ["bfloat16", "float16", "float32"]
@@ -63,6 +63,7 @@ class MlxClipLoader:
     def load(self, model_type, component, path, precision, max_length, quantize):
         # 未知大类 → 直接报错；已知但未验证的大类提示还没实现
         entry = entry_for(model_type)
+        validate_model_family(model_type, path)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
         if component not in COMPONENTS:

@@ -17,7 +17,8 @@ _TYPE_CAPS: dict[str, int] = {
     "ideogram4_prompt": 1,
     "component_weights": 2,
     "image": 6,
-    # 参考图条件（flux2：packed + grid ids + 宽高；qwen_edit：packed + ids + patch 尺寸），
+    # 参考图条件（flux2：packed + grid ids；qwen_edit：packed + ids；
+    # qwen_image_21：预处理 PIL + 64 通道 latent + 各图网格），
     # 换图 / 换尺寸才会有第二条
     "ref_encoding": 2,
     # 参考图集（MlxRefImageSet 的有序 PIL 元组，uint8 ≈ 3MB/MP）：当前用的一份 + 刚换掉的一份

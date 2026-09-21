@@ -4,6 +4,7 @@
 Transformer、文本编码器和 VAE 只在实际消费它们的节点中延迟加载。
 
 完整的安装、模型目录、节点和示例工作流说明见：[中文使用手册](USAGE_ZH.md)。
+Qwen-Image 2.1 用户可直接阅读：[Qwen-Image 2.1 下载、安装与使用指南](QWEN_IMAGE_21_USAGE_ZH.md)。
 
 ## Breeze-TTS-2 本地语音生成
 
@@ -48,7 +49,7 @@ Load Audio ─┬→ MlxWhisperTranscribe → STRING → MlxBreezeSampler.ref_te
 示例默认使用：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/transformer/whisper-large-v3-mlx
+<ComfyUI-MLX-GEN>/models/mlx/transformer/whisper-large-v3-mlx
 ```
 
 `MlxWhisperTranscribe` 只扫描本地 `transformer/` 中同时包含 `config.json` 和
@@ -72,7 +73,7 @@ checkpoint 目录**放入或软链接到 transformer 目录。目录必须保留
 `model_type` 应为 `breeze_tts`：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+<ComfyUI-MLX-GEN>/models/mlx/
 └── transformer/Breeze-TTS-2-mlx-4bit -> <完整 Hugging Face snapshot>
 ```
 
@@ -87,7 +88,8 @@ Breeze runtime 固定为 `mlx-audio==0.5.1`，ASR runtime 固定为
 环境**中安装本仓库依赖并重启 ComfyUI：
 
 ```bash
-python -m pip install -r /Users/apple/workspace/python/ComfyUI-MLX-GEN/requirements.txt
+cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
+python -m pip install -r requirements.txt
 ```
 
 ### 三种生成模式
@@ -161,7 +163,7 @@ vae.safetensors
 `YuE2-3B-MLX-4bit`：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+<ComfyUI-MLX-GEN>/models/mlx/
 ├── transformer/YuE2-3B-MLX-4bit -> <HF snapshot>/4bit
 └── vae/YuE2-3B-MLX-4bit         -> <HF snapshot>/4bit
 ```
@@ -210,8 +212,8 @@ vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
 
 ## MiniMax-H3 与 PipeNetwork 预量化 Transformer
 
-仓库提供十二份可直接导入的 MiniMax-H3 工作流（后七份由 `tools/gen_h3_workflows.py`
-生成，改完脚本重跑即可覆盖）：
+仓库提供十四份可直接导入的 MiniMax-H3 工作流（后七份由 `tools/gen_h3_workflows.py`
+生成，最后两份由 `tools/gen_h3_two_stage_workflow.py` 生成，改完脚本重跑即可覆盖）：
 
 ```text
 workflows/minimax-h3-t2va.json                    # 文生视频 + 立体声（Base）
@@ -226,7 +228,22 @@ workflows/minimax-h3-all-reference-to-video.json  # 4 张纯参考 + 4 步加速
 workflows/minimax-h3-video-continuation-keep-audio.json     # 源视频 + 原声拼成片（Base）
 workflows/minimax-h3-video-continuation-drop-audio.json     # 只出新片段（Base）
 workflows/minimax-h3-video-continuation-replace-audio.json  # 新片段 + 外部配乐（Base）
+workflows/minimax-h3-two-stage-upscale.json       # 二阶段：低分采样 → latent 放大 → 高分精修
+workflows/minimax-h3-two-stage-upscale-lora.json  # 同上 + 8 步加速 LoRA（总步数 4+4=8）
 ```
+
+最后两份是**二阶段放大**链路，用到三个专用节点（既有节点一行都不用改）：
+`MlxH3FirstPassSampler`（低分辨率跑到母网格第 k 步）→ `MlxH3LatentUpscaler`
+（只给倍率，目标画布由上一段推导，3D 网络在 latent 空间放大）→
+`MlxH3SecondPassSampler`（在目标分辨率上跑完剩余 σ，含音频三模式）。
+实测 `640×352 → 1280×704` 的 2× 放大约 4 秒，整体比直出高分辨率省约 35–40% 时间。
+
+带 `-lora` 的那份在**一阶段与二阶段共用的那条 model 线**上插了一个 `MlxModelLoraApply`
+（8 步 FL2VA 适配器，`strength=1.0`），并把两段配成 `4 + 4 = 8`、切点取母网格第 4 点
+（σ=0.9231）—— 这样两段合起来仍是适配器训练时的完整 8 步轨迹，只是后半段在 2× 分辨率上跑。
+**换 4 步适配器时务必把两段一起改成 `2 + 2`**（详见
+[`USAGE_ZH.md`](USAGE_ZH.md) §4.5 与
+[`docs/MINIMAX_H3_VIDEO_IMPLEMENTATION.md`](docs/MINIMAX_H3_VIDEO_IMPLEMENTATION.md) 附录 E）。
 
 默认工作流使用 640×352、124 帧（24 fps）和 50 步；只有
 `minimax-h3-all-reference-to-video.json` 例外——它把「MLX 模型 LoRA」接在
@@ -237,7 +254,7 @@ transformer 与采样器之间，用 `minimax_h3_ref2v_lightx2v_turbo_4step_v0.1
 文本编码器、tokenizer、视频 VAE 与音频 VAE 是五个独立组件；常规目录布局如下：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+<ComfyUI-MLX-GEN>/models/mlx/
 ├── transformer/MiniMax-H3/          # 或 MiniMax-H3-MLX-8bit（预量化，见下）
 ├── transformer/MiniMax-H3-ref/      # 参考生视频（Ref2VA）用的 REF transformer
 ├── text_encoder/MiniMax-H3/         # text_encoder_back
@@ -262,7 +279,7 @@ Transformer 也可以直接使用
 的原生 MLX 预量化 checkpoint，而不需要先反量化再重新量化。它只替换上面第一项：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/transformer/
+<ComfyUI-MLX-GEN>/models/mlx/transformer/
 └── MiniMax-H3-MLX-8bit -> <HF cache>/models--pipenetwork--MiniMax-H3-MLX-8bit
 ```
 
@@ -305,7 +322,7 @@ workflows/ideogram-4-fp8.json
 `ideogram-4-fp8`。官方 checkpoint 有五个本地组件：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+<ComfyUI-MLX-GEN>/models/mlx/
 ├── transformer/ideogram-4-fp8/               # conditional transformer
 ├── unconditional_transformer/ideogram-4-fp8/ # unconditional transformer
 ├── text_encoder/ideogram-4-fp8/
@@ -332,6 +349,49 @@ workflows/ideogram-4-fp8.json
 当前本地 MFLUX 实现只支持 Ideogram 4 **文生图**，不支持 Remix、参考图或蒙版编辑；
 也不包含云端 Magic Prompt。模型是 gated 权重，需先在 Hugging Face 接受许可并自行下载。
 
+## Qwen-Image 2.1 原生文生图与图片编辑
+
+Qwen-Image 2.1 使用独立的 `qwen_image_21` 大类，不会回退到旧版 2512/2511 架构。
+模型下载、约 31 GB 完整性检查、四组件软链接命令和图文操作步骤见
+**[Qwen-Image 2.1 下载、安装与使用指南](QWEN_IMAGE_21_USAGE_ZH.md)**。
+
+官方模型地址：<https://huggingface.co/Qwen/Qwen-Image-2.1>。下载后需要建立以下组件布局；
+官方仓库的 tokenizer 位于 `processor/`，因此本地 `tokenizer/Qwen-Image-2.1` 应指向它：
+
+```text
+<ComfyUI-MLX-GEN>/models/mlx/
+├── transformer/Qwen-Image-2.1 -> <官方模型>/transformer
+├── text_encoder/Qwen-Image-2.1 -> <官方模型>/text_encoder
+├── tokenizer/Qwen-Image-2.1 -> <官方模型>/processor
+└── vae/Qwen-Image-2.1 -> <官方模型>/vae
+```
+
+仓库提供两份可直接导入的工作流：
+
+```text
+workflows/qwen-image-2.1.json       # 纯文生图
+workflows/qwen-image-2.1-edit.json  # 原生参考图编辑
+```
+
+三个加载器统一选择 `qwen_image_21` 和 `Qwen-Image-2.1`。默认使用 40 步、
+`flow_match_euler_discrete`、guidance 1.0，并支持 RGBA 解码。
+
+编辑路径不是 legacy `qwen_edit` latent 的兼容层，而是官方 2.1 统一契约：同一批预处理
+像素同时送入 Qwen3-VL 视觉塔和 2.1 VAE encoder；DiT 将参考 latent 插入视觉槽，使用
+block-causal attention 和 prefix KV cache。单图工作流的关键连线为：
+
+```text
+LoadImage ───────────────→ MlxVAEEncoder.images
+MlxVAELoader ────────────→ MlxVAEEncoder.vae
+MlxVAEEncoder.ref_images ├→ 正向 MlxTextEncoder.ref_images
+                          ├→ 负向 MlxTextEncoder.ref_images
+                          └→ MlxKSamplerMLX.ref_images
+```
+
+正向、负向和采样器必须连接**同一个** `ref_images`，插件会在加载 DiT 前校验缓存键。
+代码最多支持 10 张参考图；异尺寸多图可用 `MlxRefImageSet → MlxVAEEncoder.ref_source`。
+`auto` 会保持每张图宽高比并缩放到约 `width × height` 的面积，再对齐到 32 像素倍数。
+
 ## Qwen-Image 2512 文生图
 
 仓库提供可直接导入 ComfyUI 的示例工作流：
@@ -353,7 +413,7 @@ workflows/qwen-image-2512.json
 四类组件应放在插件使用的模型根目录下，并使用相同的权重集目录名：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+<ComfyUI-MLX-GEN>/models/mlx/
 ├── transformer/qwen-image-2512-8bit/
 ├── vae/qwen-image-2512-8bit/
 ├── text_encoder/qwen-image-2512-8bit/
@@ -407,7 +467,7 @@ python -m pip show mlx mflux
 ## Transformer LoRA
 
 `MlxModelLoraApply` 已接入真实推理链路。LoRA 文件放在
-`/Users/apple/ComfyUI-Shared/models/mlx/lora/`，可串联多个节点后再接
+`<ComfyUI-MLX-GEN>/models/mlx/lora/`，可串联多个节点后再接
 `MlxKSamplerMLX.model`。支持以下模型家族：
 
 - Z-Image：`ZImageLoRAMapping`；

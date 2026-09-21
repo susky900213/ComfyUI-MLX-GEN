@@ -8,6 +8,11 @@ from .h3_keyframes import (
     MlxH3MultiReferenceCondition,
     MlxH3VideoCondition,
 )
+from .h3_two_stage import (
+    MlxH3FirstPassSampler,
+    MlxH3LatentUpscaler,
+    MlxH3SecondPassSampler,
+)
 from .lora import MlxClipLoraApply, MlxModelLoraApply
 from .text_encoder import MlxTextEncoder
 from .qwen_edit import MlxQwenEditEncoder
@@ -26,6 +31,9 @@ __all__ = [
     "MlxH3KeyframeCondition",
     "MlxH3MultiReferenceCondition",
     "MlxH3VideoCondition",
+    "MlxH3FirstPassSampler",
+    "MlxH3LatentUpscaler",
+    "MlxH3SecondPassSampler",
     "MlxTextEncoder",
     "MlxQwenEditEncoder",
     "MlxRefImageSet",

@@ -1,6 +1,6 @@
 """路径解析与扫描（独立于 ComfyUI 默认模型目录）。
 
-模型根目录：/Users/apple/ComfyUI-Shared/models/mlx
+模型根目录：``<插件根目录>/models/mlx``，不依赖启动 ComfyUI 时的当前工作目录。
 子目录：transformer/ unconditional_transformer/ vae/ text_encoder/ tokenizer/ lora/
 每个子目录下可以有多个「模型文件夹」，也可以是单个 .safetensors 文件。
 """
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# 模型根目录（D-3）
-MODEL_ROOT = Path("/Users/apple/ComfyUI-Shared/models/mlx")
+# paths.py 位于 <插件根目录>/src/comfyui_mlx_gen/paths.py。
+# 必须先 resolve 再拼 models/mlx；直接写 Path("models/mlx") 会随 ComfyUI 的启动目录变化。
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+MODEL_ROOT = PLUGIN_ROOT / "models" / "mlx"
 
 COMPONENT_DIRS: tuple[str, ...] = (
     "transformer",

@@ -2,3 +2,5 @@ docs
 output
 .vscode
 __pycache__
+/models/
+src/comfyui_mlx_gen/__pycache__

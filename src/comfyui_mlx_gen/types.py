@@ -18,7 +18,10 @@ Z-Image 权重，"flux2" 覆盖 flux.2-klein-*）。这里**不登记具体模�
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
+import re
 from typing import Any
 
 # --- 自定义类型名（ComfyUI 连线用的类型标识） ---
@@ -34,6 +37,119 @@ ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 
 ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留原尺寸；MlxRefImageSet → MlxVAEEncoder）
 # H3 视觉条件（首 / 尾帧锚点 + 多图参考；图片本体留在缓存，handle 只带键、顺序与画布）
 h3_keyframes = "mlx_h3_keyframes"
+
+
+# --- Qwen family detection -------------------------------------------------
+#
+# Qwen-Image 2.1 没有经过验证的实现，最危险的行为是让它沿用旧的
+# ``qwen_image``（2512）组件。这里的检测故意只识别明确的 Qwen-Image 名称或
+# 本地 config.json 内容；未知名称不会猜测成 2.1，宁可继续由调用方按原有路径
+# 报「找不到权重」。
+QWEN_IMAGE_21_FAMILY = "qwen_image_21"
+QWEN_IMAGE_FAMILY = "qwen_image"
+QWEN_EDIT_FAMILY = "qwen_edit"
+
+_QWEN_IMAGE_21_RE = re.compile(
+    r"(?<![a-z0-9])qwen[\s._/-]*image[\s._/-]*(?:v?2[\s._/-]*1|21)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_QWEN_IMAGE_21_ARCH_RE = re.compile(
+    r"qwenimage(?:v?2[_-]?1|21)",
+    re.IGNORECASE,
+)
+_QWEN_IMAGE_EDIT_RE = re.compile(
+    r"(?<![a-z0-9])qwen[\s._/-]*image[\s._/-]*edit(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_QWEN_IMAGE_RE = re.compile(
+    r"(?<![a-z0-9])qwen[\s._/-]*image(?![\s._/-]*edit)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _family_from_text(value: str) -> str | None:
+    """从一个路径、repo id 或 config 文本中识别明确的 Qwen family。"""
+    text = str(value)
+    # 2.1 必须先于 generic qwen-image 检查，否则会被旧 T2I family 吞掉。
+    if _QWEN_IMAGE_21_RE.search(text) or _QWEN_IMAGE_21_ARCH_RE.search(text):
+        return QWEN_IMAGE_21_FAMILY
+    if _QWEN_IMAGE_EDIT_RE.search(text):
+        return QWEN_EDIT_FAMILY
+    if _QWEN_IMAGE_RE.search(text):
+        return QWEN_IMAGE_FAMILY
+    return None
+
+
+def _config_candidates(value: str | Path) -> tuple[Path, ...]:
+    """返回本地模型目录可能携带的少量 config.json 位置。
+
+    不递归扫描、不联网；这样一个普通的模型选择值不会因为检测而产生额外 I/O，
+    而 HF snapshot、transformer 子目录和单文件权重仍能提供显式 config。
+    """
+    try:
+        path = Path(value).expanduser()
+    except (OSError, ValueError):
+        return ()
+    if path.is_dir():
+        roots = (path, path / "transformer")
+    elif path.is_file():
+        roots = (path.parent, path.parent.parent)
+    else:
+        return ()
+    return tuple(dict.fromkeys(root / "config.json" for root in roots))
+
+
+def detect_model_family(name_or_path: str | Path) -> str | None:
+    """检测明确的 Qwen-Image family。
+
+    返回值目前是 ``qwen_image_21``、``qwen_image``、``qwen_edit`` 或 ``None``。
+    2.1 支持 ``Qwen-Image-2.1`` / ``qwen_image_2_1`` / ``Qwen-Image-21`` 等
+    明确写法；对于没有明确名称的本地 checkpoint，只读取其根目录附近的
+    ``config.json``，且不把未知架构猜成 legacy Qwen。
+    """
+    detected = _family_from_text(str(name_or_path))
+    if detected is not None:
+        return detected
+    for config_path in _config_candidates(name_or_path):
+        try:
+            if not config_path.is_file() or config_path.stat().st_size > 4 * 1024 * 1024:
+                continue
+            config_text = config_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        # 直接在 JSON 文本上检查，覆盖 model_type、architectures、_name_or_path
+        # 等不同实现可能使用的字段；先验证 JSON，避免把任意二进制/日志文件当配置。
+        try:
+            json.loads(config_text)
+        except (TypeError, ValueError):
+            continue
+        detected = _family_from_text(config_text)
+        if detected is not None:
+            return detected
+    return None
+
+
+def validate_model_family(model_type: str, name_or_path: str | Path) -> str | None:
+    """校验选择的 family 与明确检测出的 Qwen 权重是否一致。
+
+    未识别的普通路径保持现有行为；但 ``qwen_image_21`` 不接受未能明确确认的
+    路径。这样新 family 不会成为一个可以随意套在 legacy 权重上的别名。
+    """
+    detected = detect_model_family(name_or_path)
+    if detected is None:
+        if model_type == QWEN_IMAGE_21_FAMILY:
+            raise ValueError(
+                "model_type=qwen_image_21 只能使用名称或 config.json 明确标识为 "
+                "Qwen-Image 2.1 的 checkpoint；当前权重无法确认，已拒绝加载"
+            )
+        return None
+    if detected != model_type:
+        raise ValueError(
+            f"权重 {name_or_path!s} 被检测为 {detected}，但当前选择的是 {model_type}；"
+            "不会把 Qwen-Image 2.1 路由到 legacy qwen_image/qwen_edit，"
+            "请让 family 与 checkpoint/config.json 一致"
+        )
+    return detected
 
 
 # --- 纯数据 handle ---
@@ -89,6 +205,10 @@ class MlxConditioning:
     encoding_key: str = ""  # 编码数组的缓存键（数组本身留在 cache.py）
     # MlxH3VisualCondition；仅 MiniMax-H3 的正向「带图」条件使用（纯文生视频时为空）
     h3_keyframes: Any = None
+    # Qwen-Image 2.1 编辑条件引用的 MlxReferenceImages.cache_key；正/负条件与
+    # 采样器必须完全一致，防止视觉塔看到一批图而 DiT 收到另一批 latent。
+    # 放在 h3_keyframes 之后，保持旧版四个位置参数的字段顺序不变。
+    ref_cache_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -257,11 +377,13 @@ class MlxReferenceImages:
     - qwen_edit（多图编辑）：`(packed, ids, cond_h_patches, cond_w_patches)` —— 参考图
       latent（按目标尺寸编码）+ 官方 ids（当前 mflux 的 transformer 不读它）+
       `cond_image_grid` 的 patch 尺寸。
+    - qwen_image_21（最多十图）：缓存值同时保存预处理后的 PIL、每张归一化 64 通道
+      latent 与 latent 网格；同一份数据供 Qwen3-VL 条件和 block-causal DiT 使用。
 
     采样器按 `edit_kind` 分派取用方式，两个大类的缓存键互不干扰。
     """
 
-    model_type: str  # 产出它的模型大类（"flux2" | "qwen_edit"）
+    model_type: str  # 产出它的模型大类（"flux2" | "qwen_edit" | "qwen_image_21"）
     vae_path: str  # 编码它的 VAE 权重集目录名（信息性）
     count: int  # 实际参与编码的参考图张数
     height: int  # qwen_edit：目标编辑高度（= 采样器该用的高度）；flux2：建议生成高度
@@ -270,7 +392,7 @@ class MlxReferenceImages:
     vae_cache_key: str = ""  # 与 MlxVaeHandle.cache_key 同源（诊断用）
     precision: str = ""
     quantize: int = 0
-    edit_kind: str = "flux2"  # "flux2" | "qwen_edit"
+    edit_kind: str = "flux2"  # "flux2" | "qwen_edit" | "qwen_image_21"
     cond_grid: tuple[int, int, int] | None = None  # qwen_edit：(1, height//16, width//16)
     seq_len: int = 0  # 参考图 token 数（诊断/打印用）
 
@@ -483,6 +605,33 @@ QWEN_IMAGE = MlxModelEntry(
 )
 
 
+# --- Qwen-Image 2.1（独立 MLX 文生图；不复用 2512 架构）-------------------
+QWEN_IMAGE_21 = MlxModelEntry(
+    family="qwen_image_21",
+    weight_def="",
+    components=_components(
+        transformer="comfyui_mlx_gen.qwen_image_21.transformer:QwenImage21Transformer",
+        vae="comfyui_mlx_gen.qwen_image_21.vae:QwenImage21VAE",
+        text_encoder="comfyui_mlx_gen.qwen_image_21.text_encoder:QwenImage21TextEncoder",
+        tokenizer_name="qwen_image_21",
+    ),
+    default_config="",
+    default_steps=40,
+    default_scheduler="flow_match_euler_discrete",
+    default_guidance=1.0,
+    supports_compile=False,
+    prompt_encoder="comfyui_mlx_gen.qwen_image_21.text_encoder:encode_prompt",
+    latent_creator="comfyui_mlx_gen.qwen_image_21.sampling",
+    supported=True,
+    notes=(
+        "独立 MLX 统一文生图/多图编辑实现：Qwen3-VL-8B 最后一层 pre-norm 条件、32 层 block-causal "
+        "DiT、prefix KV cache、64 通道 latent、动态 FlowMatch Euler 与 16× RGBA VAE；"
+        "默认 40 步 / guidance 1.0；编辑最多支持 10 张参考图。不会回退到 legacy "
+        "qwen_image（2512）或 qwen_edit（2511）路径。"
+    ),
+)
+
+
 # --- Ideogram 4 FP8（本地文生图；条件 / 无条件各一套 transformer）------------
 IDEOGRAM4 = MlxModelEntry(
     family="ideogram4",
@@ -619,6 +768,7 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
     "flux2": FLUX2_KLEIN,
     "qwen_edit": QWEN_EDIT,
     "qwen_image": QWEN_IMAGE,
+    "qwen_image_21": QWEN_IMAGE_21,
     "ideogram4": IDEOGRAM4,
     # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
     "minimax_h3": MINIMAX_H3,

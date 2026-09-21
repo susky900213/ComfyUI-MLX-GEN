@@ -18,7 +18,7 @@ def denormalize(arr: Any) -> Any:
 
 
 def to_pil(arr: Any, batch_index: int = -1) -> tuple[Image.Image, ...]:
-    """VAE 解码结果（[N,3,H,W] / [N,H,W,3] / [N,3,1,H,W]，值域 [-1,1]）→ PIL 元组。"""
+    """VAE 解码结果（RGB 或 RGBA，值域 [-1,1]）→ PIL 元组。"""
     import mlx.core as mx
 
     data = np.array(mx.array(denormalize(arr)).astype(mx.float32))
@@ -26,14 +26,15 @@ def to_pil(arr: Any, batch_index: int = -1) -> tuple[Image.Image, ...]:
         data = data[:, :, 0, :, :]  # [N,3,1,H,W] → [N,3,H,W]
     if data.ndim == 3:
         data = data[None, ...]
-    if data.shape[1] == 3 and data.shape[-1] != 3:
-        data = np.transpose(data, (0, 2, 3, 1))  # → [N,H,W,3]
+    if data.shape[1] in (3, 4) and data.shape[-1] not in (3, 4):
+        data = np.transpose(data, (0, 2, 3, 1))  # → [N,H,W,C]
     if batch_index >= 0:
         data = data[[batch_index % data.shape[0]]]
     out: list[Image.Image] = []
     for i in range(data.shape[0]):
         arr8 = np.rint(np.clip(data[i], 0.0, 1.0) * 255).astype(np.uint8)
-        out.append(Image.fromarray(arr8, mode="RGB"))
+        mode = "RGBA" if arr8.shape[-1] == 4 else "RGB"
+        out.append(Image.fromarray(arr8, mode=mode))
     return tuple(out)
 
 
@@ -59,11 +60,13 @@ def to_mask_batch(images: Sequence[Image.Image]) -> torch.Tensor:
     for img in images:
         if img.size != ref:
             raise ValueError(f"图片尺寸不一致: {img.size} 与 {ref}")
-        stack.append(np.asarray(img.convert("L"), dtype=np.float32) / 255.0)
+        # Qwen-Image 2.1 原生输出 RGBA：MASK 应携带 alpha，而不是 RGBA 合成后的亮度。
+        channel = img.getchannel("A") if "A" in img.getbands() else img.convert("L")
+        stack.append(np.asarray(channel, dtype=np.float32) / 255.0)
     return torch.from_numpy(np.stack(stack, axis=0))
 
 
-def to_pil_batch(images: Any) -> tuple[Image.Image, ...]:
+def to_pil_batch(images: Any, *, preserve_alpha: bool = False) -> tuple[Image.Image, ...]:
     """ComfyUI IMAGE（torch [B,H,W,C] float32 0..1）→ PIL 元组（参考图编码用）。"""
     data = images
     if hasattr(data, "detach"):
@@ -71,14 +74,14 @@ def to_pil_batch(images: Any) -> tuple[Image.Image, ...]:
     data = np.asarray(data, dtype=np.float32)
     if data.ndim == 3:
         data = data[None, ...]
-    if data.shape[-1] == 4:
+    if data.shape[-1] == 4 and not preserve_alpha:
         data = data[..., :3]
-    if data.shape[-1] != 3:
+    if data.shape[-1] not in (3, 4):
         raise ValueError(f"IMAGE 通道数不是 3/4: {data.shape}")
     out: list[Image.Image] = []
     for i in range(data.shape[0]):
         arr8 = np.rint(np.clip(data[i], 0.0, 1.0) * 255.0).astype(np.uint8)
-        out.append(Image.fromarray(arr8, mode="RGB"))
+        out.append(Image.fromarray(arr8, mode="RGBA" if arr8.shape[-1] == 4 else "RGB"))
     return tuple(out)
 
 

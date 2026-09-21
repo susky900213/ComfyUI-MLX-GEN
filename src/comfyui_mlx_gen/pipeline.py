@@ -22,6 +22,10 @@ encoder、scheduler、vae 等），采样循环与权重加载由我们自己实
   `QwenLatentCreator.create_noise` 纯噪声起（`[1, seq, 64]`，**不接参考图**），
   默认 20 步 + flow_match_euler_discrete + guidance 4.0（见 `_sample_qwen_image`；
   latent 形状与 edit 一致，因此解码仍走同一个 `decode_latents`）。
+- qwen_image_21 统一生成/编辑：Qwen3-VL 条件为 `(pre_norm_embeds, attention_mask,
+  image_pad_mask)`；编辑时每个视觉槽扩展为 2×2 个参考 VAE latent token，文本和各参考图
+  组成 block-causal prefix，目标图块双向注意并在后续步骤复用 prefix KV cache；不接
+  `ref_images` 时同一前向自然退化为 T2I。
 - ideogram4 本地文生图：采样器拿到目标宽高后才编码 JSON caption；文本编码器用完
   立即释放，再加载 conditional / unconditional 两套 FP8 transformer，按官方
   Ideogram4Scheduler 预设执行双模型 CFG；latent 用 Ideogram4LatentCreator 解包并
@@ -37,6 +41,7 @@ MlxVaeHandle 物化（编码与解码共用同一份实例）。采样器按 han
 from __future__ import annotations
 
 import json
+import math
 import time
 from inspect import signature
 from pathlib import Path
@@ -50,7 +55,17 @@ from .h3 import pipeline as h3_pipeline, prompt as h3_prompt
 from .h3.model.h3_precision import exact_fp32 as h3_exact_fp32
 from .h3.weights import loader as h3_loader
 from .progress import SamplingProgress
-from .types import MlxH3VisualCondition, MlxLatentHandle, MlxModelEntry, MlxPilImage, entry_for
+from .qwen_image_21 import loader as qwen21_loader, sampling as qwen21_sampling
+from .qwen_image_21.text_encoder import encode_prompt as encode_qwen21_prompt
+from .qwen_image_21.transformer import QwenImage21KVCache
+from .types import (
+    MlxH3VisualCondition,
+    MlxLatentHandle,
+    MlxModelEntry,
+    MlxPilImage,
+    entry_for,
+    validate_model_family,
+)
 from .yue2 import pipeline as yue2_pipeline
 from .yue2.model import load_model as load_yue2_model
 from .yue2.vae import load_vae as load_yue2_vae
@@ -69,9 +84,12 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
     同一个「权重集名」在各组件目录下同名（如 z-image-turbo-8bit 同时存在于
     transformer/ 与 vae/ 等目录下），因此 handle 里只存目录名就够了。
     """
-    comp = entry.components[role]
     if not selection:
         raise ValueError(f"没有为 {role} 指定权重目录（请在节点上重新选择）")
+    validate_model_family(entry.family, selection)
+    if not entry.supported:
+        raise NotImplementedError(f"{entry.family} 尚未实现：{entry.notes}")
+    comp = entry.components[role]
     kind, resolved = paths.resolve(comp.source, selection, role)
     # Ideogram 4 的权重根目录有 transformer/ 与 unconditional_transformer/ 两个
     # 同级目录。现有 ComfyUI 模型目录只要求用户给 transformer 建一个软链；若没有
@@ -140,12 +158,18 @@ def prepare_components(
     selections: dict[str, str],
     quantize: int | None = None,
     max_length: int | None = None,
+    precision: str = "bfloat16",
 ) -> dict[str, Any]:
     """只加载 roles 里列出的组件（命中缓存则复用整组实例）。
 
     selections 是「role -> 权重集目录名」；目录不写在配置里，因此配置里
     不用为每个变体登记路径，新权重目录丢进磁盘就能用。
     """
+
+    # 这个入口也可能被测试或扩展节点直接调用；不能只依赖上层节点的 guard。
+    validate_model_family(entry.family, next(iter(selections.values()), ""))
+    if not entry.supported:
+        raise NotImplementedError(f"{entry.family} 尚未实现：{entry.notes}")
 
     def build() -> dict[str, Any]:
         raw: dict[tuple, dict] = {}
@@ -155,7 +179,17 @@ def prepare_components(
             kind, path = component_path(entry, role, selection)
             if kind == "missing":
                 raise FileNotFoundError(f"未找到 {role} 权重: {path}")
-            if role == "tokenizer":
+            if entry.family == "qwen_image_21":
+                if role == "tokenizer":
+                    comps[role] = qwen21_loader.load_tokenizer(path)
+                else:
+                    comps[role] = qwen21_loader.load(
+                        role,
+                        path,
+                        quantize=quantize,
+                        precision=precision,
+                    ).module
+            elif role == "tokenizer":
                 comps[role] = components.load_tokenizer(entry, role, kind, path, max_length)
             else:
                 # 构造组件需要的 class_kwargs（如 flux2 的 transformer/text_encoder
@@ -189,7 +223,14 @@ def prepare_encoder(entry, clip, cache, cache_key: str) -> dict[str, Any]:
     # 两个 role 都用 handle 里的那个权重集名（各组件目录下同名）
     selections = {role: clip.path for role in ENCODER_ROLES}
     comps = prepare_components(
-        entry, ENCODER_ROLES, cache, cache_key, selections, max_length=clip.max_length
+        entry,
+        ENCODER_ROLES,
+        cache,
+        cache_key,
+        selections,
+        quantize=clip.quantize,
+        max_length=clip.max_length,
+        precision=clip.precision,
     )
     # qwen_edit 的条件编码还要 VL 那两层；命中缓存时 bundle 里已经有了（幂等）
     if entry.family == "qwen_edit" and "vl_encoder" not in comps:
@@ -247,12 +288,22 @@ def vae_component(handle, cache) -> Any:
     MiniMax-H3 的两个 VAE 由 prepare_h3_vae 物化（媒体守卫会在这里挡住它）。
     """
     entry = entry_for(handle.model_type)
+    validate_model_family(handle.model_type, handle.path)
+    if not entry.supported:
+        raise NotImplementedError(f"{entry.family} 尚未实现：{entry.notes}")
     _ensure_image_family(entry, "MLX VAE 编码 / 解码")
     kind, resolved = paths.resolve("local", handle.path, "vae")
     if kind == "missing":
         raise FileNotFoundError(f"未找到 vae 权重: {resolved}")
 
     def build():
+        if entry.family == "qwen_image_21":
+            return qwen21_loader.load(
+                "vae",
+                resolved,
+                quantize=None,
+                precision=handle.precision,
+            ).module
         instance, _bits = components.create_and_load(
             entry, "vae", kind, resolved, int(handle.quantize) or None
         )
@@ -271,8 +322,15 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
     MiniMax-H3（media="video"）走 prepare_h3_sampler_components，不查 mflux 的
     ModelConfig 注册表（0.19.1 里没有 minimax-h3，兜底配置也是图片模型的那套）。
     """
+    validate_model_family(entry.family, model_handle.model_path)
+    if not entry.supported:
+        raise NotImplementedError(f"{entry.family} 尚未实现：{entry.notes}")
     _ensure_image_family(entry, "MLX 采样器")
-    model_config = weights.config_for_path(model_handle.model_path, entry.default_config)
+    model_config = (
+        None
+        if entry.family == "qwen_image_21"
+        else weights.config_for_path(model_handle.model_path, entry.default_config)
+    )
 
     def build_transformer(role: str = "transformer"):
         kind, path = component_path(entry, role, model_handle.model_path)
@@ -280,14 +338,22 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
             raise FileNotFoundError(f"未找到 {role} 权重: {path}")
         # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例），
         # 但 overrides 里还混着运行时开关（qwen_edit_plus 之类）→ 要按签名过滤
-        instance, _bits = components.create_and_load(
-            entry,
-            role,
-            kind,
-            path,
-            model_handle.quantize or None,
-            class_kwargs=component_class_kwargs(entry, role, path, model_config),
-        )
+        if entry.family == "qwen_image_21":
+            instance = qwen21_loader.load(
+                role,
+                path,
+                quantize=model_handle.quantize or None,
+                precision=model_handle.precision,
+            ).module
+        else:
+            instance, _bits = components.create_and_load(
+                entry,
+                role,
+                kind,
+                path,
+                model_handle.quantize or None,
+                class_kwargs=component_class_kwargs(entry, role, path, model_config),
+            )
         transformer_lora.apply_transformer_loras(
             entry.family,
             instance,
@@ -319,6 +385,11 @@ def create_latents(defn, seed, height, width, batch_size) -> list[Any]:
       与「是否接参考图」无关 —— edit 那边另外还要参考图 latent，见
       `_sample_qwen_edit`）。
     """
+    if defn.family == "qwen_image_21":
+        return [
+            qwen21_sampling.create_noise(seed + i, height, width)
+            for i in range(batch_size)
+        ]
     latent_creator = runtime.import_object(defn.latent_creator)
     if defn.family == "flux2":
         return [
@@ -330,12 +401,27 @@ def create_latents(defn, seed, height, width, batch_size) -> list[Any]:
     return [latent_creator.create_noise(seed + i, height, width) for i in range(batch_size)]
 
 
-def prompt_encoding_key(clip, text: str) -> str:
+def prompt_encoding_key(clip, text: str, ref_cache_key: str = "") -> str:
     """某条提示词的编码缓存键（同一 handle + 同一文本 → 同一键，可命中缓存）。"""
-    return runtime.cache_key({"kind": "prompt_encoding", "clip": clip, "text": text})
+    return runtime.cache_key(
+        {"kind": "prompt_encoding", "clip": clip, "text": text, "ref": ref_cache_key}
+    )
 
 
-def encode_text(defn, comps, text: str, cache, cache_key: str) -> Any:
+def release_encoder(clip, cache) -> None:
+    """释放一条普通图片文本编码器 bundle；编码结果仍留在 prompt cache。"""
+    cache.evict("module", runtime.cache_key({"kind": "module", "clip": clip}))
+
+
+def encode_text(
+    defn,
+    comps,
+    text: str,
+    cache,
+    cache_key: str,
+    reference_images: Sequence[Any] = (),
+    max_length: int | None = None,
+) -> Any:
     """用已加载的 tokenizer + text_encoder 编码一条文本（M1 不支持 prompt_cache）。
 
     - z_image：`encode_prompt` 返回单个 `cap_feats` 数组；
@@ -350,6 +436,14 @@ def encode_text(defn, comps, text: str, cache, cache_key: str) -> Any:
     """
 
     def build():
+        if defn.family == "qwen_image_21":
+            return encode_qwen21_prompt(
+                comps["text_encoder"],
+                comps["tokenizer"],
+                text,
+                max_length=max_length,
+                images=reference_images,
+            )
         prompt_encoder = runtime.import_object(defn.prompt_encoder)
         if defn.family == "flux2":
             args = {k: v for k, v in defn.prompt_encoder_args.items() if k != "cache"}
@@ -671,6 +765,101 @@ def cached_reference(cache, key: str):
     value, hit = cache.get("ref_encoding", key)
     if not hit or value is None:
         raise RuntimeError("参考图条件已失效，请重新运行「MLX VAE 编码」节点")
+    return value
+
+
+QWEN21_REFERENCE_MULTIPLE = 32
+QWEN21_REFERENCE_DEFAULT_AREA = 1024 * 1024
+
+
+def _qwen21_reference_dimensions(pil, width: int, height: int, keep_resolution: bool) -> tuple[int, int]:
+    """Official 2.1 aspect-preserving reference resize, rounded to 32-pixel multiples."""
+    if keep_resolution:
+        use_w = round(int(pil.width) / QWEN21_REFERENCE_MULTIPLE) * QWEN21_REFERENCE_MULTIPLE
+        use_h = round(int(pil.height) / QWEN21_REFERENCE_MULTIPLE) * QWEN21_REFERENCE_MULTIPLE
+    else:
+        area = (
+            int(width) * int(height)
+            if int(width) > 0 and int(height) > 0
+            else QWEN21_REFERENCE_DEFAULT_AREA
+        )
+        ratio = float(pil.width) / float(pil.height)
+        use_w = round(math.sqrt(area * ratio) / QWEN21_REFERENCE_MULTIPLE) * QWEN21_REFERENCE_MULTIPLE
+        use_h = round(math.sqrt(area / ratio) / QWEN21_REFERENCE_MULTIPLE) * QWEN21_REFERENCE_MULTIPLE
+    from comfyui_mlx_gen.h3.model.h3_text_encoder.qwen3_vl_vision_model import smart_resize
+
+    # The Qwen3-VL processor enforces 256²..4096² pixels. Apply the same rule here so
+    # its merged visual slots remain exactly one quarter of the VAE latent token count.
+    use_h, use_w = smart_resize(
+        max(QWEN21_REFERENCE_MULTIPLE, use_h),
+        max(QWEN21_REFERENCE_MULTIPLE, use_w),
+        QWEN21_REFERENCE_MULTIPLE,
+        65536,
+        16777216,
+    )
+    return use_w, use_h
+
+
+def encode_qwen21_reference_images(
+    vae,
+    images: Sequence[Any],
+    cache,
+    cache_key: str,
+    max_images: int,
+    width: int,
+    height: int,
+    resize_mode: str,
+):
+    """Encode 2.1 reference pixels once for both Qwen3-VL and the block-causal DiT."""
+    from PIL import Image as PILImage
+    import numpy as np
+
+    selected = list(images)[: min(10, max(1, int(max_images)))]
+    if not selected:
+        raise ValueError("Qwen-Image 2.1 参考图为空")
+    if resize_mode not in ("auto", "aspect_area_crop", "keep_resolution"):
+        raise ValueError(
+            "qwen_image_21 只支持 auto / aspect_area_crop（保持比例、按面积缩放）或 "
+            f"keep_resolution（只对齐 32 倍数），收到 {resize_mode}"
+        )
+
+    def build():
+        prepared: list[Any] = []
+        packed: list[Any] = []
+        shapes: list[tuple[int, int]] = []
+        for source in selected:
+            use_w, use_h = _qwen21_reference_dimensions(
+                source, width, height, resize_mode == "keep_resolution"
+            )
+            image_rgba = source.convert("RGBA")
+            if image_rgba.size != (use_w, use_h):
+                image_rgba = image_rgba.resize((use_w, use_h), PILImage.Resampling.LANCZOS)
+            pixels = np.asarray(image_rgba, dtype=np.float32) / 127.5 - 1.0
+            encoded = vae.encode(mx.array(pixels)[None])
+            latent_h, latent_w = int(encoded.shape[2]), int(encoded.shape[3])
+            packed.append(encoded.transpose(0, 2, 3, 1).reshape(1, latent_h * latent_w, 64))
+            shapes.append((latent_h, latent_w))
+            white = PILImage.new("RGB", image_rgba.size, (255, 255, 255))
+            white.paste(image_rgba, mask=image_rgba.getchannel("A"))
+            prepared.append(white)
+        latents = mx.concatenate(packed, axis=1)
+        mx.eval(latents)
+        return {
+            "latents": latents,
+            "shapes": tuple(shapes),
+            "images": tuple(prepared),
+            "width": int(prepared[0].width),
+            "height": int(prepared[0].height),
+        }
+
+    value, _hit = cache.get_or_create("ref_encoding", cache_key, build)
+    return value
+
+
+def cached_qwen21_reference(cache, key: str) -> dict[str, Any]:
+    value = cached_reference(cache, key)
+    if not isinstance(value, dict) or not {"latents", "shapes", "images"}.issubset(value):
+        raise ValueError("参考图缓存不是 Qwen-Image 2.1 原生编辑条件")
     return value
 
 
@@ -1335,6 +1524,91 @@ def _sample_qwen_image(defn, comps, params, cache, model_config, guidance, on_pr
     return stacked
 
 
+def _sample_qwen_image_21(defn, comps, params, cache, guidance, on_progress=None):
+    """Qwen-Image 2.1 unified T2I/edit sampling with block-causal prefix KV cache.
+
+    条件编码缓存是 ``(pre_norm_embeds, attention_mask, image_pad_mask)``。T2I 的
+    T2I 的 ``image_pad_mask`` 全 False；编辑条件中的视觉槽与参考 VAE latent 来自同一
+    个 ref cache。每个视觉槽在 DiT 中扩展成一个 2×2 latent block。
+    """
+    if params["scheduler_name"] != "flow_match_euler_discrete":
+        raise ValueError(
+            "Qwen-Image 2.1 只能使用 flow_match_euler_discrete scheduler，"
+            f"收到 {params['scheduler_name']!r}"
+        )
+    height, width = qwen21_sampling.validate_dimensions(params["height"], params["width"])
+    latent_h, latent_w = height // 16, width // 16
+    positive = cached_encoding(cache, params["positive_encoding_key"], "正")
+    negative = (
+        cached_encoding(cache, params["negative_encoding_key"], "负")
+        if guidance > 1.0
+        else None
+    )
+    transformer = comps["transformer"]
+    reference = (
+        cached_qwen21_reference(cache, params["ref_cache_key"])
+        if params.get("ref_cache_key")
+        else None
+    )
+    reference_latents = reference["latents"] if reference is not None else None
+    reference_shapes = reference["shapes"] if reference is not None else ()
+    sigmas = qwen21_sampling.sigma_schedule(params["steps"], latent_h * latent_w)
+    use_kv = params.get("kv_cache", "auto") != "off"
+    final = []
+    for batch_index in range(int(params["batch_size"])):
+        current = qwen21_sampling.create_noise(
+            int(params["seed"]) + batch_index, height, width
+        )
+        positive_cache = QwenImage21KVCache(transformer.num_layers) if use_kv else None
+        negative_cache = (
+            QwenImage21KVCache(transformer.num_layers) if use_kv and negative is not None else None
+        )
+        for step in range(int(params["steps"])):
+            mode = ("extract" if step == 0 else "cached") if use_kv else None
+            timestep = mx.full((1,), float(sigmas[step]), dtype=mx.float32)
+            noise = transformer(
+                hidden_states=current,
+                encoder_hidden_states=positive[0],
+                timestep=timestep,
+                height=latent_h,
+                width=latent_w,
+                kv_cache=positive_cache,
+                kv_cache_mode=mode,
+                reference_latents=reference_latents,
+                reference_shapes=reference_shapes,
+                image_pad_mask=positive[2],
+            )
+            if negative is not None:
+                negative_noise = transformer(
+                    hidden_states=current,
+                    encoder_hidden_states=negative[0],
+                    timestep=timestep,
+                    height=latent_h,
+                    width=latent_w,
+                    kv_cache=negative_cache,
+                    kv_cache_mode=mode,
+                    reference_latents=reference_latents,
+                    reference_shapes=reference_shapes,
+                    image_pad_mask=negative[2],
+                )
+                noise = negative_noise + float(guidance) * (noise - negative_noise)
+            current = qwen21_sampling.euler_step(
+                noise, current, float(sigmas[step]), float(sigmas[step + 1])
+            )
+            started = time.perf_counter()
+            mx.eval(current)
+            print(
+                f"[Qwen-Image 2.1 采样] step {step + 1}/{params['steps']} "
+                f"耗时 {time.perf_counter() - started:.2f}s"
+            )
+            if on_progress is not None:
+                on_progress()
+        final.append(current)
+    result = mx.concatenate(final, axis=0)
+    mx.eval(result)
+    return result
+
+
 def _sample_ideogram4(defn, comps, params, cache, on_progress=None):
     """Ideogram 4 FP8 文生图；与 MFLUX Ideogram4.generate_image 的去噪语义一致。"""
     preset = ideogram4_preset(params["scheduler_name"])
@@ -1445,12 +1719,21 @@ def run_sampler(defn, model_handle, comps, params, cache):
     z-image-turbo，z-image-8bit 命中 z_image，因此新增权重目录不用改这里；
     步数 / 调度器 / guidance 由工作流的 widget 决定。
     """
+    validate_model_family(defn.family, model_handle.model_path)
     if not defn.supported:
         raise NotImplementedError(f"{defn.family} 尚未实现：{defn.notes}")
-    model_config = weights.config_for_path(model_handle.model_path, defn.default_config)
+    model_config = (
+        None
+        if defn.family == "qwen_image_21"
+        else weights.config_for_path(model_handle.model_path, defn.default_config)
+    )
     # 只有**明确声明**不支持 CFG（False，如 z-image-turbo）才清零；
     # None（qwen-image-edit）表示「未声明」，保留 widget 上的值 —— Qwen 编辑必须有 CFG。
-    guidance = float(params["guidance"]) if model_config.supports_guidance is not False else 0.0
+    guidance = (
+        float(params["guidance"])
+        if model_config is None or model_config.supports_guidance is not False
+        else 0.0
+    )
     progress_steps = (
         int(ideogram4_preset(params["scheduler_name"]).num_steps)
         if defn.family == "ideogram4"
@@ -1470,8 +1753,13 @@ def run_sampler(defn, model_handle, comps, params, cache):
                 return _sample_qwen_edit(
                     defn, comps, params, cache, model_config, guidance, progress.update
                 )
+            if defn.family == "qwen_image_21":
+                return _sample_qwen_image_21(
+                    defn, comps, params, cache, guidance, progress.update
+                )
             raise NotImplementedError(
-                f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit 的 edit 路径）"
+                f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit / "
+                "qwen_image_21 的 edit 路径）"
             )
         if defn.family == "flux2":
             return _sample_flux2(
@@ -1481,6 +1769,10 @@ def run_sampler(defn, model_handle, comps, params, cache):
             return _sample_qwen_image(
                 defn, comps, params, cache, model_config, guidance, progress.update
             )
+        if defn.family == "qwen_image_21":
+            return _sample_qwen_image_21(
+                defn, comps, params, cache, guidance, progress.update
+            )
         if defn.family == "ideogram4":
             return _sample_ideogram4(defn, comps, params, cache, progress.update)
         return _sample_z_image(
@@ -1488,7 +1780,11 @@ def run_sampler(defn, model_handle, comps, params, cache):
         )
 
     key = runtime.cache_key(
-        {"kind": "noise", "params": params, "config": model_config.model_name}
+        {
+            "kind": "noise",
+            "params": params,
+            "config": "qwen-image-2.1" if model_config is None else model_config.model_name,
+        }
     )
     latents, hit = cache.get_or_create("component_weights", key, sample)
     if hit:
@@ -1521,12 +1817,17 @@ def decode_latents(defn, comps, latents, height, width):
       （QwenVAE 内部处理 mean/std 与 5D 维度）；两条 Qwen 链路的 latent 都是
       打包形式，因此 unpack 分支共用；
     """
+    if not defn.supported:
+        raise NotImplementedError(f"{defn.family} 尚未实现：{defn.notes}")
     latent_creator = runtime.import_object(defn.latent_creator)
     vae = comps["vae"]
     if defn.family == "ideogram4":
         if latents.ndim == 2:
             latents = latents[None, ...]
         unpacked = latent_creator.unpack_latents(latents, height, width)
+        return vae.decode(unpacked)
+    if defn.family == "qwen_image_21":
+        unpacked = qwen21_sampling.unpack_latents(latents, height, width)
         return vae.decode(unpacked)
     if defn.family == "flux2":
         if latents.ndim == 2:

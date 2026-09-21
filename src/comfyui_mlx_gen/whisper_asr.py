@@ -119,7 +119,7 @@ def transcribe(
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "无法导入 mlx-whisper；请在 ComfyUI 的 Python 环境执行 "
-            "pip install -r /Users/apple/workspace/python/ComfyUI-MLX-GEN/requirements.txt"
+            "pip install -r <ComfyUI-MLX-GEN>/requirements.txt"
         ) from exc
 
     print(

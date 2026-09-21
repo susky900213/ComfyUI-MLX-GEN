@@ -10,13 +10,15 @@ transformer/ 目录后即可直接选用，不必改代码。
 Qwen-Image 2512 文生图时，三个加载器的 model_type 都选 `qwen_image`、权重目录
 都选 `qwen-image-2512-8bit`；这是没有视觉塔的纯文本链路，不要连接采样器的
 `ref_images`。需要参考图编辑时改用 `qwen_edit` + `qwen-image-edit-2511-8bit`。
+Qwen-Image 2.1 则统一选择 `qwen_image_21` + `Qwen-Image-2.1`，原生支持文生图与
+参考图编辑，不复用上述两套 legacy 契约。
 LoRA 请单独连接 MlxModelLoraApply，不要在本节点上配置。
 """
 
 from __future__ import annotations
 
 from .. import paths, runtime
-from ..types import MlxModelHandle, entry_for, model_types
+from ..types import MlxModelHandle, entry_for, model_types, validate_model_family
 
 # 0 = 保留磁盘精度（Ideogram 4 官方 checkpoint 已是 FP8，不应再做一次在线量化）。
 QUANTIZE_OPTIONS = [0, 4, 8, 16]
@@ -57,6 +59,9 @@ class MlxTransformerLoader:
         # 未知大类 → 直接报错（不静默回退，避免加载到错的类）；
         # 已知但尚未验证的大类（MODEL_DEFS 里 supported=False）提示还没实现
         entry = entry_for(model_type)
+        # 先校验权重身份，再允许 supported=False 的 family 进入统一错误路径；
+        # 这样 qwen-image-2.1 永远不会被旧 qwen_image 当作 2512 加载。
+        validate_model_family(model_type, model_path)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
         kind, resolved = paths.resolve("local", model_path, "transformer")

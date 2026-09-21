@@ -1,4 +1,4 @@
-"""按「真实节点定义」校验 workflows/ 下的 MiniMax-H3 工作流（不加载大权重）。
+"""按「真实节点定义」校验 workflows/ 下的工作流（不加载大权重）。
 
 对每份 JSON 检查：
 
@@ -217,8 +217,11 @@ def check_node(node, inputs, outputs) -> list[str]:
                 f"节点 {node['id']} ({node['type']}) 的 {name}={value!r} 与定义不搭"
                 f"（{ntype}, options={extra.get('options')}）"
             )
-    for item, (name, ntype, _extra) in zip(declared_inputs, inputs):
-        if item["name"] == name and item["type"] != ntype:
+    input_types = {name: ntype for name, ntype, _extra in inputs}
+    for item in declared_inputs:
+        name = item["name"]
+        ntype = input_types.get(name)
+        if ntype is not None and item["type"] != ntype:
             errors.append(
                 f"节点 {node['id']} ({node['type']}) 槽 {name} 类型 {item['type']} "
                 f"与定义 {ntype} 不一致"
@@ -327,9 +330,17 @@ def check_workflow(path: Path, plugin_classes, core_types) -> None:
 def main() -> None:
     plugin_classes = plugin_node_classes()
     core_types = core_node_types()
-    targets = [Path(arg) for arg in sys.argv[1:]] or sorted(
-        (ROOT / "workflows").glob("minimax-h3-*.json")
-    )
+    targets = [
+        (Path(arg) if Path(arg).is_absolute() else ROOT / arg).resolve()
+        for arg in sys.argv[1:]
+    ]
+    if not targets:
+        targets = sorted(
+            {
+                *(ROOT / "workflows").glob("minimax-h3-*.json"),
+                *(ROOT / "workflows").glob("qwen-image-2.1*.json"),
+            }
+        )
     for path in targets:
         check_workflow(path, plugin_classes, core_types)
     if FAILURES:

@@ -13,7 +13,7 @@ handle.cache_key 物化并缓存 —— 因此「同一个 VAE handle 同时接�
 from __future__ import annotations
 
 from .. import paths, runtime
-from ..types import MlxVaeHandle, entry_for, model_types, vae
+from ..types import MlxVaeHandle, entry_for, model_types, validate_model_family, vae
 
 NO_WEIGHTS = "<无可用权重>"
 PRECISIONS = ["bfloat16", "float16", "float32"]
@@ -56,6 +56,7 @@ class MlxVAELoader:
     def load(self, model_type, model_path, precision, quantize, role="vae"):
         # 未知大类 → 直接报错；已知但未验证的大类提示还没实现（与 MlxTransformerLoader 一致）
         entry = entry_for(model_type)
+        validate_model_family(model_type, model_path)
         if not entry.supported:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
         if precision not in PRECISIONS:

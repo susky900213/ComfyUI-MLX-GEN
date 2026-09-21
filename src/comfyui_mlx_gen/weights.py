@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 from . import paths, runtime
-from .types import MlxModelEntry
+from .types import MlxModelEntry, QWEN_IMAGE_21_FAMILY, detect_model_family
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,15 @@ def config_for_path(name_or_path: str, fallback_key: str) -> Any:
     z-image-8bit → z-image、z-image-turbo-4bit → 仍是 z-image-turbo。
     全都匹配不上时退回该大类的兜底配置（fallback_key = ModelConfig 工厂方法名）。
     """
+    # 2.1 不使用 mflux ModelConfig；它由 qwen_image_21.loader 从 checkpoint 的
+    # config.json 构造。若调用方误把 2.1 丢进这个 legacy 入口，仍要硬拦截。
+    detected_family = detect_model_family(name_or_path)
+    if detected_family == QWEN_IMAGE_21_FAMILY:
+        raise NotImplementedError(
+            "检测到 qwen_image_21（Qwen-Image 2.1）权重；该模型必须走独立的 "
+            "qwen_image_21 配置/加载路径，不会回退到 legacy qwen_image ModelConfig"
+        )
+
     registry = available_configs()
     key = normalize_model_key(Path(name_or_path).name)
     if key:
