@@ -26,6 +26,13 @@ PrimitiveStringMultiline（要朗读的目标文本）
 workflows/breeze-tts2.json
 ```
 
+语音设计示例把独立的自然语言音色描述连接到 `instruction`，默认启用
+`voice_design` 并使用 `cfg_scale=1.5`，不需要参考音频：
+
+```text
+workflows/breeze-tts2-voice-design.json
+```
+
 声音克隆示例已经预先连接目标台词、参考音频逐字稿和 `Load Audio`：
 
 ```text
@@ -49,7 +56,7 @@ Load Audio ─┬→ MlxWhisperTranscribe → STRING → MlxBreezeSampler.ref_te
 示例默认使用：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/transformer/whisper-large-v3-mlx
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/whisper-large-v3-mlx
 ```
 
 `MlxWhisperTranscribe` 只扫描本地 `transformer/` 中同时包含 `config.json` 和
@@ -73,7 +80,7 @@ checkpoint 目录**放入或软链接到 transformer 目录。目录必须保留
 `model_type` 应为 `breeze_tts`：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 └── transformer/Breeze-TTS-2-mlx-4bit -> <完整 Hugging Face snapshot>
 ```
 
@@ -163,7 +170,7 @@ vae.safetensors
 `YuE2-3B-MLX-4bit`：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/YuE2-3B-MLX-4bit -> <HF snapshot>/4bit
 └── vae/YuE2-3B-MLX-4bit         -> <HF snapshot>/4bit
 ```
@@ -248,13 +255,13 @@ workflows/minimax-h3-two-stage-upscale-lora.json  # 同上 + 8 步加速 LoRA（
 默认工作流使用 640×352、124 帧（24 fps）和 50 步；只有
 `minimax-h3-all-reference-to-video.json` 例外——它把「MLX 模型 LoRA」接在
 transformer 与采样器之间，用 `minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors`
-并把 steps 改成 4（导进去前确认 `models/mlx/lora/` 里确实有这个文件；
+并把 steps 改成 4（导进去前确认 `/Users/apple/ComfyUI-Shared/models/mlx/lora/` 里确实有这个文件；
 同目录的 `..._fl2v_...` 是首 / 尾帧（FL2VA）任务用的，`..._taomate_3step_...`
 只写了步数、没写适用任务，都别照抄参考工作流换过来）。H3 的 transformer、Qwen3-VL
 文本编码器、tokenizer、视频 VAE 与音频 VAE 是五个独立组件；常规目录布局如下：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/MiniMax-H3/          # 或 MiniMax-H3-MLX-8bit（预量化，见下）
 ├── transformer/MiniMax-H3-ref/      # 参考生视频（Ref2VA）用的 REF transformer
 ├── text_encoder/MiniMax-H3/         # text_encoder_back
@@ -279,7 +286,7 @@ Transformer 也可以直接使用
 的原生 MLX 预量化 checkpoint，而不需要先反量化再重新量化。它只替换上面第一项：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/transformer/
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/
 └── MiniMax-H3-MLX-8bit -> <HF cache>/models--pipenetwork--MiniMax-H3-MLX-8bit
 ```
 
@@ -322,7 +329,7 @@ workflows/ideogram-4-fp8.json
 `ideogram-4-fp8`。官方 checkpoint 有五个本地组件：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/ideogram-4-fp8/               # conditional transformer
 ├── unconditional_transformer/ideogram-4-fp8/ # unconditional transformer
 ├── text_encoder/ideogram-4-fp8/
@@ -359,18 +366,19 @@ Qwen-Image 2.1 使用独立的 `qwen_image_21` 大类，不会回退到旧版 25
 官方仓库的 tokenizer 位于 `processor/`，因此本地 `tokenizer/Qwen-Image-2.1` 应指向它：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/Qwen-Image-2.1 -> <官方模型>/transformer
 ├── text_encoder/Qwen-Image-2.1 -> <官方模型>/text_encoder
 ├── tokenizer/Qwen-Image-2.1 -> <官方模型>/processor
 └── vae/Qwen-Image-2.1 -> <官方模型>/vae
 ```
 
-仓库提供两份可直接导入的工作流：
+仓库提供三份可直接导入的工作流：
 
 ```text
 workflows/qwen-image-2.1.json       # 纯文生图
 workflows/qwen-image-2.1-edit.json  # 原生参考图编辑
+workflows/qwen-image-2.1-edit-multi.json  # 原生异尺寸多图编辑（示例接入 3 张，最多 10 张）
 ```
 
 三个加载器统一选择 `qwen_image_21` 和 `Qwen-Image-2.1`。默认使用 40 步、
@@ -389,7 +397,8 @@ MlxVAEEncoder.ref_images ├→ 正向 MlxTextEncoder.ref_images
 ```
 
 正向、负向和采样器必须连接**同一个** `ref_images`，插件会在加载 DiT 前校验缓存键。
-代码最多支持 10 张参考图；异尺寸多图可用 `MlxRefImageSet → MlxVAEEncoder.ref_source`。
+代码最多支持 10 张参考图；异尺寸多图可直接导入 `qwen-image-2.1-edit-multi.json`，其链路为
+`MlxRefImageSet → MlxVAEEncoder.ref_source`。
 `auto` 会保持每张图宽高比并缩放到约 `width × height` 的面积，再对齐到 32 像素倍数。
 
 ## Qwen-Image 2512 文生图
@@ -413,7 +422,7 @@ workflows/qwen-image-2512.json
 四类组件应放在插件使用的模型根目录下，并使用相同的权重集目录名：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/qwen-image-2512-8bit/
 ├── vae/qwen-image-2512-8bit/
 ├── text_encoder/qwen-image-2512-8bit/
@@ -467,7 +476,7 @@ python -m pip show mlx mflux
 ## Transformer LoRA
 
 `MlxModelLoraApply` 已接入真实推理链路。LoRA 文件放在
-`<ComfyUI-MLX-GEN>/models/mlx/lora/`，可串联多个节点后再接
+`/Users/apple/ComfyUI-Shared/models/mlx/lora/`，可串联多个节点后再接
 `MlxKSamplerMLX.model`。支持以下模型家族：
 
 - Z-Image：`ZImageLoRAMapping`；

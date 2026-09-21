@@ -188,7 +188,11 @@ def check_node(node, inputs, outputs) -> list[str]:
         )
 
     widget_def = frontend_widgets(
-        [(name, ntype, extra) for name, ntype, extra in inputs if ntype in WIDGET_TYPES]
+        [
+            (name, ntype, extra)
+            for name, ntype, extra in inputs
+            if ntype in WIDGET_TYPES and not extra.get("forceInput", False)
+        ]
     )
     values = node.get("widgets_values", [])
     if len(values) > len(widget_def):
@@ -245,7 +249,11 @@ def check_node(node, inputs, outputs) -> list[str]:
 # ----------------------------------------------------------------- 权重档位校验
 def widget_map(node, cls) -> dict:
     """按定义顺序把 widgets_values 对回「槽名 → 值」。"""
-    names = [name for name, ntype, _extra in definition_inputs(cls) if ntype in WIDGET_TYPES]
+    names = [
+        name
+        for name, ntype, extra in definition_inputs(cls)
+        if ntype in WIDGET_TYPES and not extra.get("forceInput", False)
+    ]
     return dict(zip(names, node.get("widgets_values", [])))
 
 

@@ -56,28 +56,27 @@ python -m pip show mlx mflux
 
 ### 1.2 创建模型目录
 
-**当前代码没有使用 ComfyUI 默认的 `models/checkpoints`、`models/vae` 等目录。** 插件使用
-相对于插件根目录的模型目录：
+**当前代码没有使用 ComfyUI 默认的 `models/checkpoints`、`models/vae` 等目录。** 插件从
+ComfyUI `folder_paths` 中读取注册为 `mlx` 的模型目录；当前 ComfyUI Desktop 配置对应：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx
+/Users/apple/ComfyUI-Shared/models/mlx
 ```
 
 先创建所需子目录：
 
 ```bash
-cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
-mkdir -p models/mlx/{transformer,unconditional_transformer,vae,audio_vae,text_encoder,tokenizer,lora}
+mkdir -p /Users/apple/ComfyUI-Shared/models/mlx/{transformer,unconditional_transformer,vae,audio_vae,text_encoder,tokenizer,lora}
 ```
 
-`MODEL_ROOT` 由 `paths.py` 所在位置解析为 `<插件根目录>/models/mlx`，与 macOS 用户名和
-启动 ComfyUI 时的工作目录无关，不需要再修改源码。希望把大模型放到其他磁盘时，请保留
-这里的组件目录，并在里面建立指向实际权重的绝对软链接。
+`MODEL_ROOT` 通过 `folder_paths.get_folder_paths("mlx")` 获取，不根据插件安装目录推导。
+ComfyUI Desktop 的 `extra_model_paths` 已将 `mlx` 注册到上述共享目录；希望把大模型放到
+其他磁盘时，请保留这里的组件目录，并在里面建立指向实际权重的绝对软链接。
 
 推荐的总目录结构如下：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/               # 扩散 Transformer、TTS 主模型、YuE2 主模型、Whisper
 ├── unconditional_transformer/ # Ideogram 4 的无条件 Transformer
 ├── vae/                       # 图片/视频 VAE、YuE2 VAE
@@ -139,7 +138,7 @@ ComfyUI，而不只是刷新浏览器。
 这四类模型使用相同的组件布局。以 Z-Image 为例：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/z-image-turbo-8bit/
 ├── text_encoder/z-image-turbo-8bit/
 ├── tokenizer/z-image-turbo-8bit/
@@ -149,7 +148,7 @@ ComfyUI，而不只是刷新浏览器。
 如果 Hugging Face snapshot 本身是 diffusers/mflux 风格目录，可以这样建立软链接：
 
 ```bash
-MLX_ROOT=/你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx
+MLX_ROOT=/Users/apple/ComfyUI-Shared/models/mlx
 SNAPSHOT=/模型实际位置/z-image-turbo-8bit
 MODEL_NAME=z-image-turbo-8bit
 
@@ -183,7 +182,7 @@ Qwen-Image 2.1 的官方仓库使用 `processor/` 而不是 `tokenizer/`，不�
 Ideogram 4 需要条件与无条件两套 Transformer：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/ideogram-4-fp8/
 ├── unconditional_transformer/ideogram-4-fp8/
 ├── text_encoder/ideogram-4-fp8/
@@ -194,7 +193,7 @@ Ideogram 4 需要条件与无条件两套 Transformer：
 示例软链接：
 
 ```bash
-MLX_ROOT=/你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx
+MLX_ROOT=/Users/apple/ComfyUI-Shared/models/mlx
 SNAPSHOT=/模型实际位置/ideogram-4-fp8
 MODEL_NAME=ideogram-4-fp8
 
@@ -225,7 +224,7 @@ Ideogram 4 是 gated 模型，需先在 Hugging Face 接受模型许可。
 MiniMax-H3 的标准组件布局（`transformer` 有 Base 与 REF 两条，其余组件共用）：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/MiniMax-H3/       # snapshot/transformer（Base：t2v / 首尾帧）
 ├── transformer/MiniMax-H3-ref/   # snapshot/transformer_ref（Ref2VA：参考生视频）
 ├── text_encoder/MiniMax-H3/      # snapshot/text_encoder_back
@@ -238,7 +237,7 @@ MiniMax-H3 的标准组件布局（`transformer` 有 Base 与 REF 两条，其�
 社区 NVFP4 `text_encoder` 单文件。
 
 ```bash
-MLX_ROOT=/你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx
+MLX_ROOT=/Users/apple/ComfyUI-Shared/models/mlx
 SNAPSHOT=/模型实际位置/MiniMax-H3
 
 ln -s "$SNAPSHOT/transformer"       "$MLX_ROOT/transformer/MiniMax-H3"
@@ -264,7 +263,7 @@ Transformer、`text_encoder_back`、视频 VAE 与音频 VAE。当前实现会�
 
 ```bash
 ln -s /路径/minimax_h3_latent_upscaler_3d_bf16.safetensors \
-  /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx/upscaler/minimax_h3_latent_upscaler_3d_bf16.safetensors
+  /Users/apple/ComfyUI-Shared/models/mlx/upscaler/minimax_h3_latent_upscaler_3d_bf16.safetensors
 ```
 
 文件名里带 `3d` 的是空间+时间联合处理的变体（本插件移植的就是它，全上下文一次前向
@@ -277,7 +276,7 @@ ln -s /路径/minimax_h3_latent_upscaler_3d_bf16.safetensors \
 
 ```bash
 ln -s /HuggingFace缓存/models--pipenetwork--MiniMax-H3-MLX-8bit \
-  /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx/transformer/MiniMax-H3-MLX-8bit
+  /Users/apple/ComfyUI-Shared/models/mlx/transformer/MiniMax-H3-MLX-8bit
 ```
 
 该链接可以指向 Hugging Face cache 外壳；插件会通过 `refs/main` 定位
@@ -312,7 +311,7 @@ vae.safetensors
 把 **同一个完整变体目录** 分别链接到 `transformer/` 与 `vae/`：
 
 ```bash
-MLX_ROOT=/你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx
+MLX_ROOT=/Users/apple/ComfyUI-Shared/models/mlx
 VARIANT=/模型实际位置/YuE2-3B-MLX/4bit
 
 ln -s "$VARIANT" "$MLX_ROOT/transformer/YuE2-3B-MLX-4bit"
@@ -331,13 +330,13 @@ Breeze checkpoint 已经包含主模型、文本编码器与 audio tokenizer。�
 `transformer/`，不需要向 `vae/`、`text_encoder/`、`tokenizer/` 再复制：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 └── transformer/Breeze-TTS-2-mlx-4bit/  # 完整 Hugging Face snapshot
 ```
 
 ```bash
 ln -s /模型实际位置/Breeze-TTS-2-mlx-4bit \
-  /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx/transformer/Breeze-TTS-2-mlx-4bit
+  /Users/apple/ComfyUI-Shared/models/mlx/transformer/Breeze-TTS-2-mlx-4bit
 ```
 
 `MlxTransformerLoader` 和 `MlxVAELoader` 都选择 `model_type=breeze_tts2` 和同一个 checkpoint
@@ -352,7 +351,7 @@ ln -s /模型实际位置/Breeze-TTS-2-mlx-4bit \
 Whisper 完整 checkpoint 放到：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/transformer/whisper-large-v3-mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/whisper-large-v3-mlx/
 ```
 
 该目录必须满足：
@@ -376,6 +375,7 @@ Whisper 完整 checkpoint 放到：
 | `workflows/qwen-image-edit-multi.json` | Qwen-Image-Edit 多图编辑 | 20 步、`linear`、guidance 2.5 |
 | `workflows/qwen-image-2.1.json` | Qwen-Image 2.1 文生图 | 40 步、flow-match、guidance 1.0、RGBA |
 | `workflows/qwen-image-2.1-edit.json` | Qwen-Image 2.1 原生图片编辑 | 同一 `ref_images` 接正向、负向与采样器，block-causal prefix KV |
+| `workflows/qwen-image-2.1-edit-multi.json` | Qwen-Image 2.1 原生异尺寸多图编辑 | `MlxRefImageSet` 保序接入 3 张示例图，最多可接 10 张 |
 | `workflows/ideogram-4-fp8.json` | Ideogram 4 FP8 文生图 | 1024×1024、`ideogram4_default` |
 | `workflows/minimax-h3-t2v-no-audio.json` | MiniMax-H3 文生视频 | 640×352、124 帧、50 步、无音轨 |
 | `workflows/minimax-h3-t2va.json` | MiniMax-H3 文生视频和立体声 | 在视频工作流上增加 `audio_vae` |
@@ -393,6 +393,7 @@ Whisper 完整 checkpoint 放到：
 | `workflows/minimax-h3-two-stage-upscale-lora.json` | 同上 + 8 步加速 LoRA（两段共用同一条 model 线） | 4 + 4 = 8 步、切点 σ=0.9231、`strength=1.0` |
 | `workflows/yue2-3b.json` | YuE2 风格+歌词生成音乐 | 32 步、最长先设约 8 秒 |
 | `workflows/breeze-tts2.json` | Breeze 内置说话人 TTS | `speaker` 模式、S0、24 kHz 单声道 |
+| `workflows/breeze-tts2-voice-design.json` | Breeze 自然语言语音设计 | 目标台词 + 音色指令、`voice_design`、CFG 1.5 |
 | `workflows/breeze-tts2-voice-clone.json` | Breeze 手工逐字稿声音克隆 | 参考音频 + 完全一致的逐字稿 |
 | `workflows/breeze-tts2-voice-clone-asr.json` | Breeze + Whisper 自动转写克隆 | Whisper 输出直接接 `ref_text` |
 
@@ -649,6 +650,11 @@ MlxPilToTorch.audio ──────→ PreviewAudio / SaveAudio
    - 把音色、情绪、语速等描述接到 `instruction`；
    - 需要 CFG 时把 `cfg_scale` 设为非 1.0。
 
+可直接导入 `workflows/breeze-tts2-voice-design.json`。示例将目标台词和音色设计指令拆成
+两个 `PrimitiveStringMultiline` 节点，默认 `cfg_scale=1.5`；修改音色时优先明确描述年龄、
+音高/质感、情绪、语速和表达场景。`speaker` 在该模式下只是必填兼容参数，不用于选择
+S0–S9 的固定音色；不要连接 `ref_text` 或 `ref_audio`。
+
 使用 ASR 工作流时，`MlxWhisperTranscribe.text` 会直接连接 Breeze 的 `ref_text`。普通话可选
 `zh`，粤语选 `yue`，混合语言可选 `auto`。短参考音频建议使用
 `temperature=0`、`condition_on_previous_text=false`。ASR 结果仍可能漏字，声音克隆质量不理想
@@ -769,7 +775,7 @@ conditional 与 unconditional 两套 Transformer。
 LoRA 文件放到：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/lora/
+/Users/apple/ComfyUI-Shared/models/mlx/lora/
 ```
 
 插件会递归扫描 `.safetensors` 文件，例如：
@@ -810,9 +816,10 @@ MiniMax-H3 还支持 ComfyUI 的 `int8_tensorwise + convrot` LoRA：插件会按
 
 依次检查：
 
-1. 模型是否放在 `<ComfyUI-MLX-GEN>/models/mlx`，而不是普通 ComfyUI 模型目录；
+1. 模型是否放在 `/Users/apple/ComfyUI-Shared/models/mlx`，而不是插件目录或普通
+   ComfyUI 模型目录；
 2. 组件是否放在正确子目录；
-3. 软链接目标是否存在：`ls -la /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN/models/mlx/<组件>/`；
+3. 软链接目标是否存在：`ls -la /Users/apple/ComfyUI-Shared/models/mlx/<组件>/`；
 4. 目录名是否以 `.` 或 `__` 开头，这两类名称会被忽略；
 5. 放好模型后是否重启了 ComfyUI。
 

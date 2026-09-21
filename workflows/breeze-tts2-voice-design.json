@@ -1,0 +1,188 @@
+{
+  "id": "mlx-breeze-tts2-voice-design",
+  "revision": 0,
+  "last_node_id": 9,
+  "last_link_id": 8,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 280],
+      "size": [460, 210],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "value", "type": "STRING", "widget": {"name": "value"}}
+      ],
+      "outputs": [
+        {"name": "STRING", "type": "STRING", "links": [1], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PrimitiveStringMultiline"},
+      "title": "要生成的目标台词",
+      "widgets_values": ["欢迎来到今天的节目，让我们一起探索声音所能表达的无限可能。"]
+    },
+    {
+      "id": 2,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 540],
+      "size": [460, 250],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "value", "type": "STRING", "widget": {"name": "value"}}
+      ],
+      "outputs": [
+        {"name": "STRING", "type": "STRING", "links": [2], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PrimitiveStringMultiline"},
+      "title": "音色设计指令（音色、年龄、情绪、语速、表达方式）",
+      "widgets_values": ["一位沉稳温暖的青年女性，声音清晰自然，带有亲切而自信的情绪，以稍慢的语速和富有感染力的播客主持人口吻说话。"]
+    },
+    {
+      "id": 3,
+      "type": "MlxTransformerLoader",
+      "pos": [40, 40],
+      "size": [460, 180],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "model", "type": "model", "links": [3], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTransformerLoader"},
+      "title": "Breeze-TTS-2 BF16 完整 checkpoint",
+      "widgets_values": ["breeze_tts2", "Breeze-TTS-2-mlx", 0, "bfloat16", false, 0]
+    },
+    {
+      "id": 4,
+      "type": "MlxVAELoader",
+      "pos": [550, 710],
+      "size": [430, 220],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "vae", "type": "mlx_vae", "links": [5], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAELoader"},
+      "title": "Breeze decode 兼容句柄（不会重复加载）",
+      "widgets_values": ["breeze_tts2", "Breeze-TTS-2-mlx", "bfloat16", 0, "vae"]
+    },
+    {
+      "id": 5,
+      "type": "MlxBreezeSampler",
+      "pos": [550, 100],
+      "size": [440, 560],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "model", "link": 3, "slot_index": 0},
+        {"name": "text", "type": "STRING", "link": 1, "slot_index": 1},
+        {"name": "ref_text", "type": "STRING", "link": null, "slot_index": 2},
+        {"name": "instruction", "type": "STRING", "link": 2, "slot_index": 3},
+        {"name": "ref_audio", "type": "AUDIO", "link": null, "slot_index": 4}
+      ],
+      "outputs": [
+        {"name": "latents", "type": "latents", "links": [4], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxBreezeSampler"},
+      "title": "Breeze 语音设计（voice_design，不接参考音频）",
+      "widgets_values": [42, "fixed", "voice_design", "S0", 0.9, 1.0, 50, 1.5, 750, 1.0]
+    },
+    {
+      "id": 6,
+      "type": "MlxVAEDecoder",
+      "pos": [1050, 250],
+      "size": [370, 260],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 5, "slot_index": 0},
+        {"name": "latents", "type": "latents", "link": 4, "slot_index": 1}
+      ],
+      "outputs": [
+        {"name": "images", "type": "images", "links": [6], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAEDecoder"},
+      "title": "waveform → 24 kHz 单声道 AudioTrack",
+      "widgets_values": [-1]
+    },
+    {
+      "id": 7,
+      "type": "MlxPilToTorch",
+      "pos": [1470, 250],
+      "size": [350, 180],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "images", "link": 6, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "images", "type": "IMAGE", "links": null, "slot_index": 0},
+        {"name": "masks", "type": "MASK", "links": null, "slot_index": 1},
+        {"name": "audio", "type": "AUDIO", "links": [7, 8], "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxPilToTorch"},
+      "title": "取 AUDIO 输出（IMAGE / MASK 是占位）",
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "SaveAudio",
+      "pos": [1870, 140],
+      "size": [400, 260],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 7, "slot_index": 0},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "SaveAudio"},
+      "title": "保存语音设计结果 FLAC（ComfyUI 内置）",
+      "widgets_values": ["audio/ComfyUI-MLX-GEN-breeze-voice-design"]
+    },
+    {
+      "id": 9,
+      "type": "PreviewAudio",
+      "pos": [1870, 460],
+      "size": [400, 220],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 8, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PreviewAudio"},
+      "title": "试听语音设计结果（ComfyUI 内置）",
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 1, 0, 5, 1, "STRING"],
+    [2, 2, 0, 5, 3, "STRING"],
+    [3, 3, 0, 5, 0, "model"],
+    [4, 5, 0, 6, 1, "latents"],
+    [5, 4, 0, 6, 0, "mlx_vae"],
+    [6, 6, 0, 7, 0, "images"],
+    [7, 7, 2, 8, 0, "AUDIO"],
+    [8, 7, 2, 9, 0, "AUDIO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 1, "offset": [0, 0]}},
+  "version": 0.4
+}

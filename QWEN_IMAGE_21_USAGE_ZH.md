@@ -35,21 +35,23 @@ BF16 仓库下载后约占 **31 GB**：Transformer 约 13 GB、Qwen3-VL 文本/�
 
 ## 2. 模型根目录
 
-插件现在使用相对于插件目录的模型根目录，不再包含开发者机器上的绝对路径：
+插件通过 ComfyUI 的 `folder_paths` 获取注册为 `mlx` 的模型根目录。当前 ComfyUI Desktop
+配置使用共享目录：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx
+/Users/apple/ComfyUI-Shared/models/mlx
 ```
 
-例如插件直接安装在 ComfyUI 中时，完整路径是：
+ComfyUI Desktop 启动时会通过 `extra_model_paths` 注册：
 
 ```text
-<ComfyUI>/custom_nodes/ComfyUI-MLX-GEN/models/mlx
+base_path: /Users/apple/ComfyUI-Shared/models
+mlx: mlx/
 ```
 
-代码使用 `Path(__file__).resolve()` 定位插件根目录，因此无论从哪个工作目录启动
-ComfyUI，都会找到同一个模型目录。模型数据也可以放在外置磁盘；只需让下文的四个组件
-目录使用绝对软链接指向外置磁盘，无需再修改 `paths.py`。
+代码使用 `folder_paths.get_folder_paths("mlx")` 获取该目录，不会根据插件安装位置寻找
+模型。模型数据也可以放在外置磁盘；只需让下文的四个组件目录使用绝对软链接指向外置
+磁盘，无需修改 `paths.py`。
 
 ## 3. 下载官方模型
 
@@ -138,7 +140,7 @@ du -sh "$MODEL"
 插件按组件扫描四个目录，四处显示的模型名必须同为 `Qwen-Image-2.1`：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/
+/Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/Qwen-Image-2.1/ -> <下载目录>/transformer
 ├── text_encoder/Qwen-Image-2.1/ -> <下载目录>/text_encoder
 ├── tokenizer/Qwen-Image-2.1/ -> <下载目录>/processor
@@ -149,11 +151,10 @@ du -sh "$MODEL"
 > `tokenizer/`。因此第三个链接必须是“本地 `tokenizer` → 官方 `processor`”，不能链接到
 > 一个不存在的官方 `tokenizer/` 目录。
 
-推荐使用软链接，约 31 GB 的权重只保留一份。请把 `PLUGIN_ROOT` 改成你的实际插件路径：
+推荐使用软链接，约 31 GB 的权重只保留一份：
 
 ```bash
-PLUGIN_ROOT="/你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN"
-MLX_ROOT="$PLUGIN_ROOT/models/mlx"
+MLX_ROOT="/Users/apple/ComfyUI-Shared/models/mlx"
 SNAPSHOT="$HOME/Models/Qwen-Image-2.1"
 
 mkdir -p "$MLX_ROOT"/{transformer,text_encoder,tokenizer,vae}
@@ -178,7 +179,8 @@ done
 ```
 
 也可以把四个真实组件目录复制到对应位置，但不要把整个 snapshot 只复制成
-`models/mlx/Qwen-Image-2.1`；Loader 不会扫描这个层级。放好模型后要**完整重启
+`/Users/apple/ComfyUI-Shared/models/mlx/Qwen-Image-2.1`；Loader 不会扫描这个层级。
+放好模型后要**完整重启
 ComfyUI**，浏览器刷新不会重新生成 Loader 下拉列表。
 
 ## 5. 文生图
@@ -264,6 +266,16 @@ DiT 前报错。
 
 ## 7. 多参考图编辑（最多 10 张）
 
+直接导入示例工作流：
+
+```text
+workflows/qwen-image-2.1-edit-multi.json
+```
+
+示例已接入 3 张图，分别用于主体/身份与构图、服装/道具、背景/风格。可删除不用的
+`Load Image`，也可继续连接 `MlxRefImageSet.image4` 到 `image10`；同时按实际用途修改提示词中
+“第一张、第二张……”的指代。
+
 参考图尺寸不同时，不要使用 ComfyUI 的 `Batch Images`，因为它会把后续图片调整到第一张
 的尺寸。使用 `MLX 参考图集（MlxRefImageSet）`：
 
@@ -297,10 +309,10 @@ Load Image 3 ─┘
 
 ### Loader 显示 `<无可用权重>`
 
-确认模型不在 ComfyUI 的 `models/checkpoints`，而在插件自己的：
+确认模型不在插件目录或 ComfyUI 的 `models/checkpoints`，而在共享目录：
 
 ```text
-<ComfyUI-MLX-GEN>/models/mlx/<组件>/Qwen-Image-2.1
+/Users/apple/ComfyUI-Shared/models/mlx/<组件>/Qwen-Image-2.1
 ```
 
 确认四个组件链接存在且没有断开，然后完整重启 ComfyUI。
@@ -310,7 +322,7 @@ Load Image 3 ─┘
 本地目录应为：
 
 ```text
-models/mlx/tokenizer/Qwen-Image-2.1 -> <官方 snapshot>/processor
+/Users/apple/ComfyUI-Shared/models/mlx/tokenizer/Qwen-Image-2.1 -> <官方 snapshot>/processor
 ```
 
 不是指向 snapshot 根目录，也不是指向不存在的 `<snapshot>/tokenizer`。
@@ -342,7 +354,7 @@ models/mlx/tokenizer/Qwen-Image-2.1 -> <官方 snapshot>/processor
 
 - [ ] 官方 `Qwen/Qwen-Image-2.1` 完整下载约 31 GB；
 - [ ] `transformer`、`text_encoder`、`processor`、`vae` 均完整；
-- [ ] 四个组件分别链接到 `models/mlx` 对应目录；
+- [ ] 四个组件分别链接到 `/Users/apple/ComfyUI-Shared/models/mlx` 对应目录；
 - [ ] 本地 `tokenizer` 链接指向官方 `processor`；
 - [ ] 三个 Loader 都是 `qwen_image_21 + Qwen-Image-2.1`；
 - [ ] Transformer/CLIP q8，VAE q0，compile 关闭；

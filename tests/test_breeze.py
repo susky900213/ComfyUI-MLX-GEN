@@ -602,6 +602,111 @@ check(
     "; ".join(clone_bad_links),
 )
 
+# -------------------------------------------------------------- 10. 语音设计工作流
+design_workflow = json.loads(
+    (ROOT / "workflows" / "breeze-tts2-voice-design.json").read_text(encoding="utf-8")
+)
+design_nodes = design_workflow["nodes"]
+design_links = design_workflow["links"]
+design_nodes_by_id = {node["id"]: node for node in design_nodes}
+design_counts = Counter(node["type"] for node in design_nodes)
+check(
+    "Breeze 语音设计工作流节点、连线与末尾 ID 完整",
+    design_counts
+    == Counter(
+        {
+            "PrimitiveStringMultiline": 2,
+            "MlxTransformerLoader": 1,
+            "MlxVAELoader": 1,
+            "MlxBreezeSampler": 1,
+            "MlxVAEDecoder": 1,
+            "MlxPilToTorch": 1,
+            "SaveAudio": 1,
+            "PreviewAudio": 1,
+        }
+    )
+    and len(design_nodes) == len(design_nodes_by_id) == 9
+    and len(design_links) == len({link[0] for link in design_links}) == 8
+    and design_workflow["last_node_id"] == max(design_nodes_by_id) == 9
+    and design_workflow["last_link_id"] == max(link[0] for link in design_links) == 8,
+    f"{design_counts} / links={len(design_links)}",
+)
+
+design_sampler = next(node for node in design_nodes if node["type"] == "MlxBreezeSampler")
+design_transformer = next(
+    node for node in design_nodes if node["type"] == "MlxTransformerLoader"
+)
+design_vae = next(node for node in design_nodes if node["type"] == "MlxVAELoader")
+design_strings = [node for node in design_nodes if node["type"] == "PrimitiveStringMultiline"]
+check(
+    "语音设计工作流选择本机 BF16 Breeze checkpoint",
+    design_transformer["widgets_values"]
+    == ["breeze_tts2", "Breeze-TTS-2-mlx", 0, "bfloat16", False, 0]
+    and design_vae["widgets_values"]
+    == ["breeze_tts2", "Breeze-TTS-2-mlx", "bfloat16", 0, "vae"],
+    f"{design_transformer['widgets_values']} / {design_vae['widgets_values']}",
+)
+check(
+    "语音设计工作流连接目标台词与 instruction，不连接克隆条件",
+    design_sampler["widgets_values"]
+    == [42, "fixed", "voice_design", "S0", 0.9, 1.0, 50, 1.5, 750, 1.0]
+    and [item["name"] for item in design_sampler["inputs"]]
+    == ["model", "text", "ref_text", "instruction", "ref_audio"]
+    and [item["link"] for item in design_sampler["inputs"]] == [3, 1, None, 2, None]
+    and design_strings[0]["outputs"][0]["links"] == [1]
+    and design_strings[1]["outputs"][0]["links"] == [2]
+    and "音色设计指令" in design_strings[1]["title"],
+    str(design_sampler),
+)
+
+design_bad_signatures = []
+for node in design_nodes:
+    cls = NODE_CLASS_MAPPINGS.get(node["type"])
+    if cls is None:
+        continue
+    declared = cls.INPUT_TYPES()
+    declared_inputs = {**declared.get("required", {}), **declared.get("optional", {})}
+    for item in node.get("inputs", []):
+        if item["name"] not in declared_inputs:
+            design_bad_signatures.append(f"{node['type']} 缺输入 {item['name']}")
+        elif declared_inputs[item["name"]][0] != item["type"]:
+            design_bad_signatures.append(
+                f"{node['type']}.{item['name']}: {item['type']} != "
+                f"{declared_inputs[item['name']][0]}"
+            )
+    output_types = tuple(item["type"] for item in node.get("outputs", []))
+    if output_types != tuple(cls.RETURN_TYPES):
+        design_bad_signatures.append(f"{node['type']} 输出 {output_types} != {cls.RETURN_TYPES}")
+check(
+    "语音设计工作流 MLX socket 与节点签名一致",
+    not design_bad_signatures,
+    "; ".join(design_bad_signatures),
+)
+
+design_bad_links = []
+for link_id, src_id, src_slot, dst_id, dst_slot, link_type in design_links:
+    src_output = design_nodes_by_id[src_id]["outputs"][src_slot]
+    dst_input = design_nodes_by_id[dst_id]["inputs"][dst_slot]
+    if link_id not in (src_output.get("links") or []):
+        design_bad_links.append(f"link {link_id} 不在源输出")
+    if dst_input.get("link") != link_id:
+        design_bad_links.append(f"link {link_id} 不在目标输入")
+    if src_output["type"] != link_type or dst_input["type"] != link_type:
+        design_bad_links.append(f"link {link_id} 类型不一致")
+check(
+    "语音设计工作流 link 与 socket 元数据一致",
+    not design_bad_links,
+    "; ".join(design_bad_links),
+)
+
+design_pil = next(node for node in design_nodes if node["type"] == "MlxPilToTorch")
+check(
+    "语音设计工作流 AUDIO 同时连接保存与试听",
+    design_pil["outputs"][2]["type"] == "AUDIO"
+    and design_pil["outputs"][2]["links"] == [7, 8],
+    str(design_pil["outputs"][2]),
+)
+
 if FAILED:
     print(f"\n{len(FAILED)} 项失败：{', '.join(FAILED)}")
     raise SystemExit(1)

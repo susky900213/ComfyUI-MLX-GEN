@@ -51,10 +51,40 @@ LEGACY_T2I_NAME = "qwen-image-2512-8bit"
 LEGACY_EDIT_NAME = "qwen-image-edit-2511-8bit"
 
 
-def test_model_root_is_relative_to_the_plugin_instead_of_the_working_directory():
-    assert paths.PLUGIN_ROOT == ROOT
-    assert paths.MODEL_ROOT == ROOT / "models" / "mlx"
-    assert paths.MODEL_ROOT.is_absolute()
+def test_model_root_uses_comfyui_registered_mlx_directory(tmp_path):
+    registered_root = tmp_path / "shared-models" / "mlx"
+
+    class FakeFolderPaths:
+        models_dir = str(tmp_path / "unused-default-models")
+
+        @staticmethod
+        def get_folder_paths(folder_name):
+            assert folder_name == "mlx"
+            return [str(registered_root), str(tmp_path / "secondary-mlx")]
+
+        @staticmethod
+        def add_model_folder_path(*_args):
+            raise AssertionError("已有 mlx 注册目录时不应再次注册")
+
+    assert paths._model_root_from_comfyui(FakeFolderPaths) == registered_root.resolve()
+
+
+def test_model_root_registers_shared_directory_when_mlx_is_not_configured(tmp_path):
+    calls = []
+
+    class FakeFolderPaths:
+        @staticmethod
+        def get_folder_paths(folder_name):
+            assert folder_name == "mlx"
+            raise KeyError(folder_name)
+
+        @staticmethod
+        def add_model_folder_path(*args):
+            calls.append(args)
+
+    expected = Path.home() / "ComfyUI-Shared" / "models" / "mlx"
+    assert paths._model_root_from_comfyui(FakeFolderPaths) == expected
+    assert calls == [("mlx", str(expected), True)]
 
 
 def test_qwen_image_21_is_an_isolated_supported_family():
@@ -403,6 +433,50 @@ def test_official_t2i_and_edit_workflows_keep_their_conditioning_paths_separate(
     sampler = next(node for node in edit["nodes"] if node["type"] == "MlxKSamplerMLX")
     assert sampler["widgets_values"][2:8] == [40, 1024, 1024, 1, 1.0, "flow_match_euler_discrete"]
 
+    multi = _workflow("qwen-image-2.1-edit-multi.json")
+    multi_types = [node["type"] for node in multi["nodes"]]
+    assert multi_types.count("LoadImage") == 3
+    assert multi_types.count("MlxRefImageSet") == 1
+    assert multi_types.count("MlxVAEEncoder") == 1
+    assert multi_types.count("MlxTextEncoder") == 2
+    assert "BatchImagesNode" not in multi_types
+    assert "MlxQwenEditEncoder" not in multi_types
+
+    multi_loaders = [
+        node for node in multi["nodes"]
+        if node["type"] in {"MlxClipLoader", "MlxTransformerLoader", "MlxVAELoader"}
+    ]
+    assert all(node["widgets_values"][0] == QWEN_IMAGE_21_FAMILY for node in multi_loaders)
+    assert all(
+        node["widgets_values"][2 if node["type"] == "MlxClipLoader" else 1] == QWEN_21_NAME
+        for node in multi_loaders
+    )
+
+    ref_set = next(node for node in multi["nodes"] if node["type"] == "MlxRefImageSet")
+    assert [item["name"] for item in ref_set["inputs"]] == [
+        f"image{index}" for index in range(1, 11)
+    ]
+    assert all(item["link"] is not None for item in ref_set["inputs"][:3])
+    assert all(item["link"] is None for item in ref_set["inputs"][3:])
+
+    multi_encoder = next(node for node in multi["nodes"] if node["type"] == "MlxVAEEncoder")
+    assert multi_encoder["widgets_values"] == [10, "auto", 1024, 1024]
+    encoder_inputs = {item["name"]: item["link"] for item in multi_encoder["inputs"]}
+    assert encoder_inputs["images"] is None
+    assert encoder_inputs["ref_source"] is not None
+    multi_nodes = {node["id"]: node for node in multi["nodes"]}
+    ref_destinations = [
+        (multi_nodes[target]["type"], multi_nodes[target]["inputs"][slot]["name"])
+        for link_id, _source, _source_slot, target, slot, _type in multi["links"]
+        if link_id in set(multi_encoder["outputs"][0]["links"])
+    ]
+    assert ref_destinations.count(("MlxTextEncoder", "ref_images")) == 2
+    assert ref_destinations.count(("MlxKSamplerMLX", "ref_images")) == 1
+    multi_sampler = next(node for node in multi["nodes"] if node["type"] == "MlxKSamplerMLX")
+    assert multi_sampler["widgets_values"][2:8] == [
+        40, 1024, 1024, 1, 1.0, "flow_match_euler_discrete"
+    ]
+
 
 def test_tiny_dit_to_rgba_vae_end_to_end():
     transformer = QwenImage21Transformer(
@@ -451,7 +525,6 @@ def test_tiny_dit_to_rgba_vae_end_to_end():
 
 if __name__ == "__main__":
     tests = [
-        test_model_root_is_relative_to_the_plugin_instead_of_the_working_directory,
         test_qwen_image_21_is_an_isolated_supported_family,
         test_name_detection_prioritizes_qwen_image_21_and_keeps_legacy_families_separate,
         test_validation_keeps_qwen_image_21_out_of_legacy_families,
@@ -470,6 +543,8 @@ if __name__ == "__main__":
         test()
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        test_model_root_uses_comfyui_registered_mlx_directory(root)
+        test_model_root_registers_shared_directory_when_mlx_is_not_configured(root)
         test_config_detection_identifies_a_local_qwen_image_21_checkpoint(root)
         test_public_loaders_create_qwen_image_21_handles_without_loading_weights(root)
     print("全部通过：Qwen-Image 2.1 隔离、T2I/多图编辑 KV、64 通道 latent 与 RGBA VAE 契约有效。")

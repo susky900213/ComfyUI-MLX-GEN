@@ -1,6 +1,8 @@
-"""路径解析与扫描（独立于 ComfyUI 默认模型目录）。
+"""通过 ComfyUI ``folder_paths`` 解析并扫描 MLX 模型目录。
 
-模型根目录：``<插件根目录>/models/mlx``，不依赖启动 ComfyUI 时的当前工作目录。
+ComfyUI 运行时优先使用注册为 ``mlx`` 的模型目录；没有注册时注册并使用
+``$HOME/ComfyUI-Shared/models/mlx``。脱离 ComfyUI 直接运行测试/工具时也使用该共享目录，
+不会从插件目录读取模型。
 子目录：transformer/ unconditional_transformer/ vae/ text_encoder/ tokenizer/ lora/
 每个子目录下可以有多个「模型文件夹」，也可以是单个 .safetensors 文件。
 """
@@ -9,10 +11,37 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# paths.py 位于 <插件根目录>/src/comfyui_mlx_gen/paths.py。
-# 必须先 resolve 再拼 models/mlx；直接写 Path("models/mlx") 会随 ComfyUI 的启动目录变化。
-PLUGIN_ROOT = Path(__file__).resolve().parents[2]
-MODEL_ROOT = PLUGIN_ROOT / "models" / "mlx"
+
+def _model_root_from_comfyui(folder_paths_module: object) -> Path:
+    """从 ComfyUI 已注册的 ``mlx`` 类别取得首选模型目录。
+
+    ``extra_model_paths.yaml`` 会在加载自定义节点前调用
+    ``folder_paths.add_model_folder_path``，且 ``is_default: true`` 的路径位于列表首位。
+    普通 ComfyUI 没有配置自定义 ``mlx`` 类别时，则注册共享模型目录。
+    """
+    try:
+        registered = folder_paths_module.get_folder_paths("mlx")
+    except KeyError:
+        registered = []
+    if registered:
+        return Path(registered[0]).expanduser().resolve()
+
+    shared_root = Path.home() / "ComfyUI-Shared" / "models" / "mlx"
+    folder_paths_module.add_model_folder_path("mlx", str(shared_root), True)
+    return shared_root
+
+
+def _discover_model_root() -> Path:
+    try:
+        import folder_paths
+    except ModuleNotFoundError as exc:
+        if exc.name != "folder_paths":
+            raise
+        return Path.home() / "ComfyUI-Shared" / "models" / "mlx"
+    return _model_root_from_comfyui(folder_paths)
+
+
+MODEL_ROOT = _discover_model_root()
 
 COMPONENT_DIRS: tuple[str, ...] = (
     "transformer",
