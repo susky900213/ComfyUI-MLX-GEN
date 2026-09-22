@@ -134,5 +134,6 @@ class MlxBreezeSampler:
             handle = pipeline.run_breeze_sampler(entry, model, breeze_model, params, CACHE)
         finally:
             # 最终 waveform 已进独立缓存；解码阶段不再需要完整模型。
+            breeze_model = None
             pipeline.release_breeze_model(model, CACHE)
         return (handle,)

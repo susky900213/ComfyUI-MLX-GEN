@@ -84,31 +84,34 @@ def _decode_h3(latents, vae_handle, audio_handle, batch_index: int) -> MlxPilIma
     主 handle 是 `role="vae"` → 出帧序列；只有把第二个 MlxVAELoader
     （`role="audio_vae"`）接到 `audio_vae` 入口，才会同时带上音轨。
     """
-    main = pipeline.decode_h3_latents(latents, vae_handle, CACHE, batch_index)
-    if vae_handle.role == "audio_vae":
-        pipeline.release_h3_vae(vae_handle, CACHE)  # 只解音频（帧给不了，MlxPilToTorch 会占位一张 1×1 黑图）
-        return main
-    if audio_handle is None:
-        print(
-            "[MlxVAEDecodeRawPIL] 没接 audio_vae（再放一个「MLX VAE 加载器」，"
-            "model_path 选 MiniMax-H3、role 选 audio_vae，接到本节点的 audio_vae 入口）："
-            "只出画面，没有声音"
+    try:
+        main = pipeline.decode_h3_latents(latents, vae_handle, CACHE, batch_index)
+        if vae_handle.role == "audio_vae":
+            # 只解音频（帧给不了，MlxPilToTorch 会占位一张 1×1 黑图）。
+            return main
+        if audio_handle is None:
+            print(
+                "[MlxVAEDecodeRawPIL] 没接 audio_vae（再放一个「MLX VAE 加载器」，"
+                "model_path 选 MiniMax-H3、role 选 audio_vae，接到本节点的 audio_vae 入口）："
+                "只出画面，没有声音"
+            )
+            return main
+        if audio_handle.role != "audio_vae":
+            raise ValueError(
+                f"audio_vae 入口接到的 handle role 是 {audio_handle.role!r}，"
+                "那样只会把视频 VAE 再解一遍、拿不到音轨："
+                "请在第二个「MLX VAE 加载器」里把 role 选成 audio_vae（model_path 选 MiniMax-H3）"
+            )
+        audio = pipeline.decode_h3_latents(latents, audio_handle, CACHE, -1)
+        return MlxPilImage(
+            images=main.images, batch_index=batch_index, fps=main.fps, audio=audio.audio
         )
+    finally:
+        # PIL / AudioTrack 已经是独立输出；无论第二路解码是否抛错，都不能留下
+        # 已经用过的 H3 VAE。
         pipeline.release_h3_vae(vae_handle, CACHE)
-        return main
-    if audio_handle.role != "audio_vae":
-        raise ValueError(
-            f"audio_vae 入口接到的 handle role 是 {audio_handle.role!r}，"
-            "那样只会把视频 VAE 再解一遍、拿不到音轨："
-            "请在第二个「MLX VAE 加载器」里把 role 选成 audio_vae（model_path 选 MiniMax-H3）"
-        )
-    audio = pipeline.decode_h3_latents(latents, audio_handle, CACHE, -1)
-    # 帧与音轨都拿到了：两个 VAE 都从缓存里丢掉（后面接的 MlxPilToTorch 只用现成数据）
-    pipeline.release_h3_vae(vae_handle, CACHE)
-    pipeline.release_h3_vae(audio_handle, CACHE)
-    return MlxPilImage(
-        images=main.images, batch_index=batch_index, fps=main.fps, audio=audio.audio
-    )
+        if audio_handle is not None and getattr(audio_handle, "role", None) == "audio_vae":
+            pipeline.release_h3_vae(audio_handle, CACHE)
 
 
 def _decode_yue2(latents, vae_handle, batch_index: int) -> MlxPilImage:
@@ -181,8 +184,12 @@ class MlxVAEDecodeRawPIL:
         arr = _cached_latents(latents)
         # 按同款 handle 走共享键 → 与 MlxVAELoader / MlxVAEDecoder 命中同一份 VAE
         handle = vae_handle_from_widgets(model_type, model_path, precision, quantize)
-        vae_module = pipeline.vae_component(handle, CACHE)
-        return (_decode_with_vae(entry, vae_module, latents, arr, batch_index),)
+        try:
+            vae_module = pipeline.vae_component(handle, CACHE)
+            return (_decode_with_vae(entry, vae_module, latents, arr, batch_index),)
+        finally:
+            vae_module = None
+            pipeline.release_vae_component(handle, CACHE)
 
 
 class MlxVAEDecoder:
@@ -233,5 +240,9 @@ class MlxVAEDecoder:
             return (_decode_breeze(latents, batch_index),)
         arr = _cached_latents(latents)
         # 与 MlxVAEEncoder / MlxVAEDecodeRawPIL 共用同一个键 → 全流程只驻留一份 VAE
-        vae_module = pipeline.vae_component(vae, CACHE)
-        return (_decode_with_vae(entry, vae_module, latents, arr, batch_index),)
+        try:
+            vae_module = pipeline.vae_component(vae, CACHE)
+            return (_decode_with_vae(entry, vae_module, latents, arr, batch_index),)
+        finally:
+            vae_module = None
+            pipeline.release_vae_component(vae, CACHE)

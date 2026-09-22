@@ -64,6 +64,9 @@ class Cache:
         while len(bucket) > cap:
             _old_key, old_value = bucket.popitem(last=False)
             _dispose(old_value)
+            # 不要让 evict 的局部变量在 mx.clear_cache() 执行期间继续持有
+            # 模型；否则 Metal cache 刷新时旧权重仍可能被 Python 引用着。
+            del old_value
             _flush_mlx()
         return value, False
 
@@ -84,6 +87,8 @@ class Cache:
             return False
         value = bucket.pop(key)
         _dispose(value)
+        # 先断开最后一个缓存层面的 Python 引用，再刷 MLX/Metal cache。
+        del value
         _flush_mlx()
         return True
 

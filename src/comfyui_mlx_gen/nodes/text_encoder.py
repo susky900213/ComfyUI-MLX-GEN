@@ -146,6 +146,7 @@ class MlxTextEncoder:
                 )
             finally:
                 # 条件编码器约 30 GB；成功或异常都必须立即释放。
+                comps = None
                 pipeline.release_h3_encoder(entry, clip, CACHE)
             print(
                 f"[MlxTextEncoder] {entry.family}: {int(tags.shape[0])} 个 token，"
@@ -167,19 +168,24 @@ class MlxTextEncoder:
         # 1) 按需创建 text_encoder + tokenizer（同一 handle 第二次执行直接命中缓存）
         # 参考缓存先读取：若已经淘汰，应在加载 8B 条件编码器之前快速失败。
         comps_key = runtime.cache_key({"kind": "module", "clip": clip})
-        comps = pipeline.prepare_encoder(entry, clip, CACHE, comps_key)
-
-        # 2) 编码本条提示词；数组只进缓存，handle 里只留键
-        encoding_key = pipeline.prompt_encoding_key(clip, prompt, ref_key)
-        pipeline.encode_text(
-            entry,
-            comps,
-            prompt,
-            CACHE,
-            encoding_key,
-            reference_images=reference_pils,
-            max_length=clip.max_length,
-        )
+        try:
+            comps = pipeline.prepare_encoder(entry, clip, CACHE, comps_key)
+            # 2) 编码本条提示词；数组只进缓存，handle 里只留键
+            encoding_key = pipeline.prompt_encoding_key(clip, prompt, ref_key)
+            pipeline.encode_text(
+                entry,
+                comps,
+                prompt,
+                CACHE,
+                encoding_key,
+                reference_images=reference_pils,
+                max_length=clip.max_length,
+            )
+        finally:
+            # 编码结果已经独立放进 prompt_encoding；条件节点不应把 text encoder
+            # 权重留到采样器，更不能在编码异常时留下半加载 bundle。
+            comps = None
+            pipeline.release_encoder(clip, CACHE)
 
         # 3) 交给 MlxKSamplerMLX 的 positive / negative 入口
         cond = MlxConditioning(

@@ -266,6 +266,7 @@ class _Bundle:
         self.model = None
         self.tokenizer = None
         self.processor = None
+        self.config = None
         del model
         gc.collect()
 
@@ -398,6 +399,26 @@ class QwenImagePEBackend:
             bucket, key, lambda: self._load_bundle(kind, path, loader_type)
         )
         return bundle
+
+    def release(
+        self, kind: PEKind, model_path: str | Path, loader_type: str = TRANSFORMERS
+    ) -> None:
+        """释放一次 PE 推理使用的 bundle。
+
+        ``_bundle`` 仍保留缓存语义，便于需要复用的 Python 调用方自行控制
+        生命周期；ComfyUI 节点会在每次推理的 ``finally`` 中调用这里，避免
+        节点输出的普通字符串反向把 PE 大模型留在进程里。
+        """
+        try:
+            path = resolve_model_path(model_path, kind, loader_type)
+            runtime_type, _variant = normalize_loader_type(loader_type)
+            bucket = f"qwen_image_pe_{runtime_type}_{kind}_module"
+            key = self._cache_key(kind, path, loader_type)
+            if CACHE.evict(bucket, key):
+                print(f"[Qwen-Image PE] 已释放 {kind} 模型（下次增强时重新懒加载）")
+        except Exception as exc:  # noqa: BLE001
+            # release 位于节点 finally，不能覆盖模型推理 / 路径校验的原始异常。
+            print(f"[Qwen-Image PE] 释放模型失败，继续返回原始结果：{exc}")
 
     @staticmethod
     def _prepare_inputs(bundle: _Bundle, messages: list[dict[str, Any]]) -> Any:

@@ -51,7 +51,10 @@ class MlxQwenImagePET2I:
         if not str(prompt or "").strip():
             raise ValueError("Qwen-Image T2I PE 的 prompt 不能为空")
         ensure_optional_dependencies(loader_type)
-        rewritten = BACKEND.enhance_t2i_with_loader(str(prompt), model_path, loader_type)
+        try:
+            rewritten = BACKEND.enhance_t2i_with_loader(str(prompt), model_path, loader_type)
+        finally:
+            BACKEND.release("t2i", model_path, loader_type)
         return _rewritten_prompt_result(rewritten)
 
 
@@ -95,11 +98,13 @@ class MlxQwenImagePEI2I:
         from .. import image as image_util
 
         pil_images = image_util.to_pil_batch(images)
-        return _rewritten_prompt_result(
-            BACKEND.enhance_i2i_with_loader(
+        try:
+            rewritten = BACKEND.enhance_i2i_with_loader(
                 pil_images, str(prompt), model_path, loader_type
             )
-        )
+        finally:
+            BACKEND.release("i2i", model_path, loader_type)
+        return _rewritten_prompt_result(rewritten)
 
 
 __all__ = ["MlxQwenImagePEI2I", "MlxQwenImagePET2I"]

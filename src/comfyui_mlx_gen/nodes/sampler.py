@@ -453,6 +453,12 @@ class MlxKSamplerMLX:
         # （mflux 也是在建模型前调 apply_runtime_memory_options，编不编译都设），
         # 所以 compile 关闭时照样设。0 = 沿用默认不动，之前设过则还原。
         runtime.apply_cache_limit(model.compile_cache_limit, label=entry.family)
-        comps = pipeline.prepare_sampler_components(entry, model, CACHE)
-        handle = pipeline.run_sampler(entry, model, comps, params, CACHE)
+        try:
+            comps = pipeline.prepare_sampler_components(entry, model, CACHE)
+            handle = pipeline.run_sampler(entry, model, comps, params, CACHE)
+        finally:
+            # latent 已独立进 component_weights；不要让 transformer 或 mx.compile
+            # 闭包跨越采样节点继续持有整套权重。
+            comps = None
+            pipeline.release_sampler_components(entry, model, CACHE)
         return (handle,)

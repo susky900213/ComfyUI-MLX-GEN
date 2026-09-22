@@ -326,6 +326,17 @@ def load(path: str, precision: str = "bfloat16", cache: Any | None = None) -> La
     return module
 
 
+def release(path: str, precision: str = "bfloat16", cache: Any | None = None) -> None:
+    """释放一次推理使用的放大器；输出 latent 已由调用方独立缓存。"""
+    if cache is None:
+        return
+    from comfyui_mlx_gen import runtime
+
+    key = runtime.cache_key({"kind": BUCKET, "path": str(path), "precision": str(precision)})
+    if cache.evict(BUCKET, key):
+        print("[MlxH3LatentUpscaler] 已释放放大模型（下次放大时重新懒加载）")
+
+
 def upscale_latents(
     module: LatentResizer3D,
     latents: mx.array,

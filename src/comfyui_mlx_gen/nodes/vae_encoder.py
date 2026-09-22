@@ -156,6 +156,27 @@ class MlxVAEEncoder:
         height=0,
         ref_source=None,
     ):
+        try:
+            return self._encode(
+                images, vae, max_reference_images, resize_mode, width, height, ref_source
+            )
+        finally:
+            # ref_encoding 只保存编码后的数组 / PIL；参考图编码节点不应把 VAE
+            # 继续留给后续采样器。
+            vae_module = None
+            if isinstance(vae, MlxVaeHandle):
+                pipeline.release_vae_component(vae, CACHE)
+
+    def _encode(
+        self,
+        images=None,
+        vae=None,
+        max_reference_images=2,
+        resize_mode="auto",
+        width=0,
+        height=0,
+        ref_source=None,
+    ):
         if vae is None or not isinstance(vae, MlxVaeHandle):
             raise ValueError(
                 "必须连接「MLX VAE 加载器」的输出；"

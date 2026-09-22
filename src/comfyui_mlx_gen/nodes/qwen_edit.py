@@ -70,13 +70,17 @@ class MlxQwenEditEncoder:
 
         # 1) 按需创建 text_encoder（含视觉塔）+ tokenizer + VL 两层（同一 handle 命中缓存）
         comps_key = runtime.cache_key({"kind": "module", "clip": clip})
-        comps = pipeline.prepare_encoder(entry, clip, CACHE, comps_key)
-
-        # 2) 编码本条条件（带图）；数组只进缓存，handle 里只留键
-        encoding_key = pipeline.edit_prompt_encoding_key(
-            clip, prompt, image_mod.digest(images), count
-        )
-        pipeline.encode_edit_conditioning(entry, comps, prompt, pils, CACHE, encoding_key)
+        try:
+            comps = pipeline.prepare_encoder(entry, clip, CACHE, comps_key)
+            # 2) 编码本条条件（带图）；数组只进缓存，handle 里只留键
+            encoding_key = pipeline.edit_prompt_encoding_key(
+                clip, prompt, image_mod.digest(images), count
+            )
+            pipeline.encode_edit_conditioning(entry, comps, prompt, pils, CACHE, encoding_key)
+        finally:
+            # embeds / mask 已经进 prompt_encoding，VL 文本塔和视觉塔到这里即无用。
+            comps = None
+            pipeline.release_encoder(clip, CACHE)
 
         # 3) 交给 MlxKSamplerMLX 的 positive / negative 入口
         cond = MlxConditioning(clip=clip, text=prompt, encoding_key=encoding_key)

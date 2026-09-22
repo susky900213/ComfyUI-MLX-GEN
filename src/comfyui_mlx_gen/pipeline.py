@@ -413,6 +413,47 @@ def release_encoder(clip, cache) -> None:
     cache.evict("module", runtime.cache_key({"kind": "module", "clip": clip}))
 
 
+def release_vae_component(handle, cache) -> None:
+    """释放普通图片 VAE；已经编码/解码出的数组和 PIL 不受影响。
+
+    VAE 句柄只是配置数据，真正的大对象在 ``module`` 桶里。编码参考图或
+    解码 latent 后，下游只需要缓存中的结果，不需要继续持有 VAE 权重。
+    """
+    if handle is None or not getattr(handle, "cache_key", ""):
+        return
+    if cache.evict("module", handle.cache_key):
+        print("[MLX VAE] 已释放 VAE（下次编码/解码时重新懒加载）")
+
+
+def clear_compiled_predict_caches() -> None:
+    """丢弃所有 ``mx.compile`` 闭包，避免它们继续闭住已释放的 transformer。
+
+    编译缓存按预测分支拆桶，而不是按模型句柄拆桶；释放模型时一次清空全部
+    分支最安全，也能处理 Ideogram / LoRA 等后续新增的变体。
+    """
+    for compiled in COMPILED_PREDICT.values():
+        compiled.clear()
+
+
+def release_sampler_components(entry, model_handle, cache) -> None:
+    """采样完成后释放普通图片 transformer 及其编译闭包。"""
+    clear_compiled_predict_caches()
+    roles = (
+        ("transformer", "unconditional_transformer")
+        if entry.family == "ideogram4"
+        else ("transformer",)
+    )
+    released = False
+    for role in roles:
+        key = transformer_cache_key(model_handle, role)
+        released = cache.evict("module", key) or released
+    # 即便模块已被缓存淘汰，compiled callable / MLX free buffers 也可能刚刚释放；
+    # 这里再 flush 一次，确保节点 finally 之后不会留下旧 Metal allocation。
+    runtime.flush_caches()
+    if released:
+        print("[MLX 采样器] 已释放 transformer（下次采样时重新懒加载）")
+
+
 def encode_text(
     defn,
     comps,

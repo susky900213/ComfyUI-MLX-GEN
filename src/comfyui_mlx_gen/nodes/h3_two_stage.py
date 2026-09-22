@@ -341,6 +341,7 @@ def run_first_pass(entry, model_handle, params, cache, keyframes, stop_at_step):
                     on_progress=progress.update_absolute,
                 )
         finally:
+            comps = None
             pipeline.release_h3_sampler_components(entry, model_handle, cache)
         return video_rows, audio_rows, plan
 
@@ -548,10 +549,16 @@ def run_upscale(latents, model_name, scale, precision, cache):
         print("[MlxH3LatentUpscaler] 手动诊断模式：使用内置 latent 三线性插值（不加载神经模型）")
         upscaled = interpolate_latents(source, (latent_h_out, latent_w_out))
     else:
-        module = h3_latent_upscaler.load(resolve_upscaler_path(str(model_name)), str(precision), cache)
-        upscaled = h3_latent_upscaler.upscale_latents(
-            module, source, (latent_h_out, latent_w_out), str(precision), enable_chunking=True
-        )
+        upscaler_path = resolve_upscaler_path(str(model_name))
+        try:
+            module = h3_latent_upscaler.load(upscaler_path, str(precision), cache)
+            upscaled = h3_latent_upscaler.upscale_latents(
+                module, source, (latent_h_out, latent_w_out), str(precision), enable_chunking=True
+            )
+        finally:
+            # new_rows 只在下方写入 h3_latents；放大网络本身不应跨节点常驻。
+            module = None
+            h3_latent_upscaler.release(upscaler_path, str(precision), cache)
         input_std, output_std, output_ratio = validate_neural_output(source, upscaled, str(model_name))
         print(
             f"[MlxH3LatentUpscaler] normalized latent 统计：输入 std={input_std:.3f} "
