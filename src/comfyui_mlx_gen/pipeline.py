@@ -2437,23 +2437,41 @@ def encode_h3_prompt(
 
     def build() -> tuple[Any, Any]:
         images: tuple[Any, ...] = ()
+        motion_frames: tuple[Any, ...] = ()
+        motion_timestamps: tuple[float, ...] = ()
         if visual is not None:
-            found, hit = cache.get(H3_VISUAL_BUCKET, visual.images_key)
-            if not hit or found is None:
-                raise RuntimeError(
-                    "H3 的参考图缓存已失效，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
-                )
-            images = tuple(found)
-            if len(images) != int(visual.picture_count):
-                raise RuntimeError(
-                    "H3 的参考图数量与 handle 不一致，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
-                )
+            if visual.source in {"motion_reference", "motion_reference_with_picture"}:
+                source, hit = cache.get("h3_motion_source", visual.motion_key)
+                if not hit or source is None:
+                    raise RuntimeError("H3 动作参考缓存已失效，请重新运行「MLX H3 动作参考条件」节点")
+                motion_frames = tuple(source["presentation_frames"])
+                motion_timestamps = tuple(float(v) for v in source["timestamps"])
+            if visual.source not in {"motion_reference"}:
+                found, hit = cache.get(H3_VISUAL_BUCKET, visual.images_key)
+                if not hit or found is None:
+                    raise RuntimeError(
+                        "H3 的参考图缓存已失效，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
+                    )
+                images = tuple(found)
+                if len(images) != int(visual.picture_count):
+                    raise RuntimeError(
+                        "H3 的参考图数量与 handle 不一致，请重新运行「MLX H3 关键帧 / 视觉条件」节点"
+                    )
         encode = runtime.import_object(entry.prompt_encoder)
-        # comps 里是 LoadedH3Component（模块 + 量化档位 + 生效精度），而
-        # encode_presentation 要的是里面那个 nn.Module（它调 text_encoder.encode(...)）
+        # 保留 entry.prompt_encoder 的可注入契约（测试 / 第三方扩展会替换它）。
+        # 旧的四参数 encoder 继续用于图片 / 纯文本条件；只有动作参考才使用
+        # 新增的两个可选参数。
         with h3_exact_fp32():
+            if motion_frames:
+                return encode(
+                    comps["text_encoder"].module,
+                    comps["tokenizer"],
+                    prompt,
+                    images,
+                    motion_frames=motion_frames,
+                    motion_timestamps=motion_timestamps,
+                )
             return encode(comps["text_encoder"].module, comps["tokenizer"], prompt, images)
-
     return cache.get_or_create(H3_PROMPT_BUCKET, cache_key, build)[0]
 
 
@@ -2525,6 +2543,24 @@ def encode_h3_keyframes(
     return tuple(visual.anchors), latents
 
 
+def encode_h3_motion_reference(
+    visual: MlxH3VisualCondition, cache
+) -> tuple[Any, ...]:
+    """物化完整动作参考视频的 normalized Video VAE latent。"""
+    if visual.source not in {"motion_reference", "motion_reference_with_picture"}:
+        return ()
+    source, hit = cache.get("h3_motion_source", visual.motion_key)
+    if not hit or source is None:
+        raise RuntimeError("H3 动作参考缓存已失效，请重新运行「MLX H3 动作参考条件」节点")
+    try:
+        vae = prepare_h3_vae(visual.vae, cache)
+        with h3_exact_fp32():
+            latent = h3_pipeline.encode_motion_reference_latent(tuple(source["frames"]), vae)
+        return (latent,)
+    finally:
+        release_h3_vae(visual.vae, cache)
+
+
 def run_h3_sampler(
     entry,
     model_handle,
@@ -2532,6 +2568,7 @@ def run_h3_sampler(
     params: dict[str, Any],
     cache,
     keyframe_latents: tuple[Any, ...] = (),
+    reference_latents: tuple[Any, ...] = (),
 ) -> MlxLatentHandle:
     """规划 → 内存预检 → 联合去噪 → 把 `(视频行, 音频行, 计划)` 存进 h3_latents 桶。"""
     plan = h3_pipeline.make_plan(
@@ -2557,6 +2594,10 @@ def run_h3_sampler(
             text_tokens=int(tags.shape[0]),
             cache_bytes=_mlx_memory_bytes(),
             keyframe_count=len(params.get("keyframe_anchors", ())),
+            reference_rows=sum(
+                int(latent.shape[2]) * (int(latent.shape[3]) // 2) * (int(latent.shape[4]) // 2)
+                for latent in reference_latents
+            ),
             log=print,
         )
         with h3_exact_fp32():
@@ -2568,6 +2609,7 @@ def run_h3_sampler(
                 int(params["seed"]),
                 keyframe_latents=keyframe_latents,
                 keyframe_anchors=tuple(params.get("keyframe_anchors", ())),
+                reference_latents=reference_latents,
                 log=print,
                 on_progress=progress.update_absolute,
             )

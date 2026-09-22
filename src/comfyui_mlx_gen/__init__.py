@@ -24,6 +24,7 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     vae_encoder,
     vae_loader,
     whisper_transcribe,
+    qwen_image_pe,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -46,6 +47,8 @@ NODE_CLASS_MAPPINGS = {
     "MlxSaveImage": save.MlxSaveImage,
     "MlxPilToTorch": pil_to_torch.MlxPilToTorch,
     "MlxWhisperTranscribe": whisper_transcribe.MlxWhisperTranscribe,
+    "MlxQwenImagePET2I": qwen_image_pe.MlxQwenImagePET2I,
+    "MlxQwenImagePEI2I": qwen_image_pe.MlxQwenImagePEI2I,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -68,6 +71,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxSaveImage": "MLX 保存图片",
     "MlxPilToTorch": "MLX PIL → 张量",
     "MlxWhisperTranscribe": "MLX Whisper 语音转文字",
+    "MlxQwenImagePET2I": "Qwen-Image 2.1 T2I 提示词增强",
+    "MlxQwenImagePEI2I": "Qwen-Image 2.1 I2I 提示词增强",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -25,6 +25,7 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     vae_encoder,
     vae_loader,
     whisper_transcribe,
+    qwen_image_pe,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -33,6 +34,8 @@ NODE_CLASS_MAPPINGS = {
     "MlxH3KeyframeCondition": h3_keyframes.MlxH3KeyframeCondition,
     "MlxH3MultiReferenceCondition": h3_keyframes.MlxH3MultiReferenceCondition,
     "MlxH3VideoCondition": h3_keyframes.MlxH3VideoCondition,
+    "MlxH3MotionReferenceCondition": h3_keyframes.MlxH3MotionReferenceCondition,
+    "MlxH3MotionReferenceWithImageCondition": h3_keyframes.MlxH3MotionReferenceWithImageCondition,
     "MlxH3FirstPassSampler": h3_two_stage.MlxH3FirstPassSampler,
     "MlxH3LatentUpscaler": h3_two_stage.MlxH3LatentUpscaler,
     "MlxH3SecondPassSampler": h3_two_stage.MlxH3SecondPassSampler,
@@ -50,6 +53,8 @@ NODE_CLASS_MAPPINGS = {
     "MlxSaveImage": save.MlxSaveImage,
     "MlxPilToTorch": pil_to_torch.MlxPilToTorch,
     "MlxWhisperTranscribe": whisper_transcribe.MlxWhisperTranscribe,
+    "MlxQwenImagePET2I": qwen_image_pe.MlxQwenImagePET2I,
+    "MlxQwenImagePEI2I": qwen_image_pe.MlxQwenImagePEI2I,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -58,6 +63,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxH3KeyframeCondition": "MLX H3 关键帧条件",
     "MlxH3MultiReferenceCondition": "MLX H3 多图参考条件",
     "MlxH3VideoCondition": "MLX H3 视频条件（续写）",
+    "MlxH3MotionReferenceCondition": "MLX H3 动作参考条件（Ref2VA）",
+    "MlxH3MotionReferenceWithImageCondition": "MLX H3 图片动作迁移条件（Ref2VA）",
     "MlxH3FirstPassSampler": "MLX H3 一阶段采样（低分辨率）",
     "MlxH3LatentUpscaler": "MLX H3 Latent 放大（3D）",
     "MlxH3SecondPassSampler": "MLX H3 二阶段采样（放大后精修）",
@@ -75,6 +82,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxSaveImage": "MLX 保存图片",
     "MlxPilToTorch": "MLX PIL → 张量",
     "MlxWhisperTranscribe": "MLX Whisper 语音转文字",
+    "MlxQwenImagePET2I": "Qwen-Image 2.1 T2I 提示词增强",
+    "MlxQwenImagePEI2I": "Qwen-Image 2.1 I2I 提示词增强",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

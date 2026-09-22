@@ -367,6 +367,79 @@ try:
         "必须连接 ComfyUI 的「Load Video」",
         lambda: video_node.pack(object(), "continue_from_end", True, 64, 32, vae=video_vae),
     )
+
+    # --------------------------------------------- 1e. 图片外观 + 视频动作 / 运镜
+    motion_frames = torch.cat(
+        [tensor_image(8, 16, index / 50.0) for index in range(22)], dim=0
+    )
+    motion_video = SimpleNamespace(
+        file_path="fake-motion.mp4",
+        get_components=lambda: SimpleNamespace(images=motion_frames, audio=None, frame_rate=25),
+    )
+    motion_image = tensor_image(7, 11, 0.4)
+    motion_node = keyframe_node.MlxH3MotionReferenceWithImageCondition()
+    combined, combined_report = motion_node.pack(
+        motion_image,
+        motion_video,
+        64,
+        32,
+        124,
+        False,
+        2.0,
+        vae=video_vae,
+    )
+    combined_images, combined_image_hit = iso_cache.get(
+        "h3_keyframe_source", combined.images_key
+    )
+    combined_motion, combined_motion_hit = iso_cache.get(
+        "h3_motion_source", combined.motion_key
+    )
+    check(
+        "图片动作迁移保留一张 <Picture 1> 且视频裁成合法 17n+5 帧",
+        combined.picture_count == 1
+        and combined.anchors == ()
+        and combined.source == "motion_reference_with_picture"
+        and combined.motion_frame_count == 22
+        and combined_images[0].size == (64, 32)
+        and combined_image_hit,
+    )
+    check(
+        "图片动作迁移默认按 2 fps 抽样并保留完整视频缓存",
+        combined_motion_hit
+        and len(combined_motion["frames"]) == 22
+        and len(combined_motion["presentation_frames"]) == 2
+        and "<Picture 1>" in combined_report
+        and "<Video 1>" in combined_report,
+        combined_report,
+    )
+    combined_again, _ = motion_node.pack(
+        motion_image,
+        motion_video,
+        64,
+        32,
+        124,
+        False,
+        2.0,
+        vae=video_vae,
+    )
+    check(
+        "图片或动作视频不变时组合条件命中同一组缓存键",
+        combined_again.digest == combined.digest
+        and combined_again.motion_key == combined.motion_key,
+    )
+    check_raises(
+        "图片动作迁移没有视频 VAE 时拒绝",
+        ValueError,
+        "必须连接「MLX VAE 加载器」",
+        lambda: motion_node.pack(motion_image, motion_video, 64, 32, 124, False, 2.0),
+    )
+    check(
+        "图片动作迁移只能使用 REF transformer",
+        h3_pipeline.checkpoint_tier_for_condition(combined) == "ref"
+        and "源视频同时" in h3_pipeline.check_visual_condition_checkpoint(
+            SimpleNamespace(model_path="MiniMax-H3-ref"), combined
+        ),
+    )
 finally:
     keyframe_node.CACHE = old_keyframe_cache
     ref_set_node.CACHE = old_ref_cache
@@ -1175,7 +1248,13 @@ def workflow_is_valid(workflow):
     return valid, nodes, links
 
 
-VISUAL_TYPES = {"MlxH3KeyframeCondition", "MlxH3MultiReferenceCondition", "MlxH3VideoCondition"}
+VISUAL_TYPES = {
+    "MlxH3KeyframeCondition",
+    "MlxH3MultiReferenceCondition",
+    "MlxH3VideoCondition",
+    "MlxH3MotionReferenceCondition",
+    "MlxH3MotionReferenceWithImageCondition",
+}
 # 值 = (必须出现的节点, 视觉条件是否带 latent 锚点, 期望的 transformer 权重集)。
 # 参考生视频（多图 / 纯参考）必须落在 Minimax-H3-ref 上，其余都留在 Base。
 WORKFLOW_CONTRACTS = {
@@ -1218,6 +1297,11 @@ WORKFLOW_CONTRACTS = {
         True,
         "MiniMax-H3",
     ),
+    "minimax-h3-motion-transfer-with-image.json": (
+        {"LoadImage", "LoadVideo", "MlxH3MotionReferenceWithImageCondition", "MlxKSamplerMLX"},
+        False,
+        "MiniMax-H3-ref",
+    ),
 }
 for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW_CONTRACTS.items():
     workflow = json.loads((ROOT / "workflows" / workflow_name).read_text(encoding="utf-8"))
@@ -1235,6 +1319,13 @@ for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW
     if visual["type"] == "MlxH3KeyframeCondition":
         # 首 / 尾帧允许只接一张，但一张都不接就是配错
         valid = valid and wired_sources >= 1
+    elif visual["type"] == "MlxH3MotionReferenceWithImageCondition":
+        source_names = {"image", "video"}
+        valid = valid and wired_sources == 2 and all(
+            item["link"] is not None
+            for item in source_inputs
+            if item["name"] in source_names
+        )
     else:
         # 图集 / 源视频是这类条件的唯一入口，必须接上
         valid = valid and wired_sources == len(source_inputs) == 1
@@ -1252,13 +1343,21 @@ for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW
         and keyframe_links[0][5] == "mlx_h3_keyframes"
         and len(condition_links) == 2
         and all(item[1] == text["id"] for item in condition_links)
-        # 视觉条件的画布必须与采样器一致，否则采样器会直接报错
-        # （采样器 widgets：0 seed / 1 control_after_generate / 2 steps / 3 width / 4 height）
-        and visual["widgets_values"][-2:] == sampler["widgets_values"][3:5]
+        # 视觉条件的画布必须与采样器一致，否则采样器会直接报错。
+        # 组合节点的前两个 widget 是 width / height；旧视觉节点的最后两个
+        # widget 才是 width / height。
+        and (
+            visual["widgets_values"][:2] if visual["type"] == "MlxH3MotionReferenceWithImageCondition"
+            else visual["widgets_values"][-2:]
+        ) == sampler["widgets_values"][3:5]
         # seed 后面必须写前端插的 control_after_generate，否则整排 widget 会错位一格
         and sampler["widgets_values"][1] in {"fixed", "increment", "decrement", "randomize"}
         # 没有锚点时不该接视频 VAE；有锚点时必须接
-        and (visual["inputs"][1]["link"] is not None) == has_anchor
+        and (
+            (visual["inputs"][1]["link"] is not None) == has_anchor
+            if visual["type"] != "MlxH3MotionReferenceWithImageCondition"
+            else visual["inputs"][7]["link"] is not None
+        )
         # 参考生视频（不钉锚点 / 2 张以上）必须落在 REF 权重上，
         # 否则采样器会在 check_visual_condition_checkpoint 里直接报错
         and transformer["widgets_values"][1] == expected_checkpoint

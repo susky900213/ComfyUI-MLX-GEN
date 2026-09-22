@@ -42,6 +42,15 @@ class MlxTextEncoder:
             "optional": {
                 "h3_keyframes": (h3_keyframes_type, {}),
                 "ref_images": (ref_images_type, {}),
+                # 放在既有可选 socket 后面，保持历史 H3 / Qwen-Image 2.1
+                # 工作流的输入 slot 顺序不变。
+                "prompt": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "可连接 Qwen-Image 2.1 Prompt Enhancer；连接后覆盖上方文本",
+                    },
+                ),
             },
         }
 
@@ -49,7 +58,7 @@ class MlxTextEncoder:
     FUNCTION = "encode"
     CATEGORY = "MLX/Gen"
 
-    def encode(self, text, clip, h3_keyframes=None, ref_images=None):
+    def encode(self, text, clip, h3_keyframes=None, ref_images=None, prompt=None):
         if clip is None:
             raise ValueError("必须先连接 MlxClipLoader 的输出")
         if not isinstance(clip, MlxClipHandle):
@@ -57,6 +66,10 @@ class MlxTextEncoder:
                 "clip 必须是 MlxClipLoader 产出的 handle；"
                 "ComfyUI 原生 CLIP（torch 权重）不能被 MLX 模型使用"
             )
+        # prompt 是可选外部 STRING socket，优先级高于旧的 widget 文本。
+        # 这样 PE 节点只会改变正向提示词，不会触碰 h3/ref_images 条件。
+        if prompt is not None:
+            text = prompt
         # 配置由 handle 里的大类决定；未验证的大类直接报错（不静默回退）
         entry = entry_for(clip.model_type)
         validate_model_family(clip.model_type, clip.path)

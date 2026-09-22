@@ -74,6 +74,18 @@ def list_component_items(component: str) -> list[str]:
     return items
 
 
+def list_component_dirs(component: str) -> list[str]:
+    """只列出组件目录的直接子目录，不递归扫描嵌套模型目录。"""
+    root = component_dir(component)
+    if not root.is_dir():
+        return []
+    return [
+        entry.name
+        for entry in sorted(root.iterdir())
+        if not entry.name.startswith((".", "__")) and entry.is_dir()
+    ]
+
+
 def scan_loras() -> list[str]:
     """lora/ 下的 .safetensors（含一层子目录）。"""
     root = component_dir("lora")

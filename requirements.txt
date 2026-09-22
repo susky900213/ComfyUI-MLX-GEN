@@ -1,5 +1,7 @@
 # 本地 MLX 推理依赖；Ideogram 4 的 FP8 线性层需要 MLX 0.32。
-mlx>=0.32.0,<0.33.0
+mlx>=0.32.2,<0.33.0
+# Qwen-Image 2.1 PE 的 MLX-VLM Qwen3.5 推理后端。
+mlx-vlm>=0.7.2,<0.8.0
 mflux==0.19.1
 # Breeze-TTS-2 的完整本地 MLX runtime（主干、文本编码器与 24 kHz audio tokenizer）。
 mlx-audio==0.5.1

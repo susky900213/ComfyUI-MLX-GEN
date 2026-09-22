@@ -20,7 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from comfyui_mlx_gen import paths, pipeline, weights  # noqa: E402
-from comfyui_mlx_gen.nodes.clip_loader import MlxClipLoader  # noqa: E402
+from comfyui_mlx_gen.nodes.clip_loader import (  # noqa: E402
+    MlxClipLoader,
+    normalize_max_length,
+    normalize_precision,
+)
 from comfyui_mlx_gen.nodes.loader import MlxTransformerLoader  # noqa: E402
 from comfyui_mlx_gen.nodes.sampler import MlxKSamplerMLX  # noqa: E402
 from comfyui_mlx_gen.nodes.vae_loader import MlxVAELoader  # noqa: E402
@@ -36,6 +40,7 @@ from comfyui_mlx_gen.qwen_image_21.transformer import (  # noqa: E402
 from comfyui_mlx_gen.qwen_image_21.vae import QwenImage21VAE  # noqa: E402
 from comfyui_mlx_gen.types import (  # noqa: E402
     QWEN_IMAGE_21_FAMILY,
+    QWEN_IMAGE_21_MAX_LENGTH,
     MlxClipHandle,
     MlxConditioning,
     MlxModelHandle,
@@ -98,6 +103,44 @@ def test_qwen_image_21_is_an_isolated_supported_family():
     assert entry.default_scheduler == "flow_match_euler_discrete"
     assert entry.default_guidance == 1.0
     assert "legacy qwen_image" in entry.notes
+
+
+def test_qwen_image_21_conditioning_length_uses_the_model_context_limit():
+    precision_options = MlxClipLoader.INPUT_TYPES()["required"]["precision"][0]
+    assert "MLX 16bit" in precision_options
+    assert normalize_precision("MLX 16bit") == normalize_precision("float16") == "float16"
+
+    max_length = MlxClipLoader.INPUT_TYPES()["required"]["max_length"][1]
+    assert (
+        max_length["default"]
+        == max_length["max"]
+        == QWEN_IMAGE_21_MAX_LENGTH
+        == 262_144
+    )
+
+    clip = MlxClipLoader().load(
+        QWEN_IMAGE_21_FAMILY,
+        "text_encoder",
+        QWEN_21_NAME,
+        "MLX 16bit",
+        QWEN_IMAGE_21_MAX_LENGTH,
+        8,
+    )[0]
+    assert clip.precision == "float16"
+    assert clip.max_length == QWEN_IMAGE_21_MAX_LENGTH
+    assert normalize_max_length(QWEN_IMAGE_21_FAMILY, 512) == QWEN_IMAGE_21_MAX_LENGTH
+    assert normalize_max_length(QWEN_IMAGE_21_FAMILY, 4096) == 4096
+    assert normalize_max_length("qwen_image", 512) == 512
+
+    legacy_clip = MlxClipLoader().load(
+        QWEN_IMAGE_21_FAMILY,
+        "text_encoder",
+        QWEN_21_NAME,
+        "bfloat16",
+        512,
+        8,
+    )[0]
+    assert legacy_clip.max_length == QWEN_IMAGE_21_MAX_LENGTH
 
 
 def test_name_detection_prioritizes_qwen_image_21_and_keeps_legacy_families_separate():
@@ -393,12 +436,16 @@ def _workflow(name: str) -> dict:
 
 def test_official_t2i_and_edit_workflows_keep_their_conditioning_paths_separate():
     t2i = _workflow("qwen-image-2.1.json")
+    t2i_clip = next(node for node in t2i["nodes"] if node["type"] == "MlxClipLoader")
+    assert t2i_clip["widgets_values"][4] == QWEN_IMAGE_21_MAX_LENGTH
     assert all(node["type"] != "MlxVAEEncoder" for node in t2i["nodes"])
     t2i_sampler = next(node for node in t2i["nodes"] if node["type"] == "MlxKSamplerMLX")
     assert all(item["name"] != "ref_images" for item in t2i_sampler["inputs"])
     assert t2i_sampler["widgets_values"][2:8] == [40, 1024, 1024, 1, 1.0, "flow_match_euler_discrete"]
 
     edit = _workflow("qwen-image-2.1-edit.json")
+    edit_clip = next(node for node in edit["nodes"] if node["type"] == "MlxClipLoader")
+    assert edit_clip["widgets_values"][4] == QWEN_IMAGE_21_MAX_LENGTH
     node_types = [node["type"] for node in edit["nodes"]]
     assert node_types.count("MlxVAEEncoder") == 1
     assert node_types.count("MlxTextEncoder") == 2
@@ -434,6 +481,8 @@ def test_official_t2i_and_edit_workflows_keep_their_conditioning_paths_separate(
     assert sampler["widgets_values"][2:8] == [40, 1024, 1024, 1, 1.0, "flow_match_euler_discrete"]
 
     multi = _workflow("qwen-image-2.1-edit-multi.json")
+    multi_clip = next(node for node in multi["nodes"] if node["type"] == "MlxClipLoader")
+    assert multi_clip["widgets_values"][4] == QWEN_IMAGE_21_MAX_LENGTH
     multi_types = [node["type"] for node in multi["nodes"]]
     assert multi_types.count("LoadImage") == 3
     assert multi_types.count("MlxRefImageSet") == 1

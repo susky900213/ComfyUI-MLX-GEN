@@ -196,7 +196,21 @@ class MlxKSamplerMLX:
                     "（guidance 蒸馏模型，每步一次前向），已忽略这三项"
                 )
             keyframes = positive.h3_keyframes
+            is_motion_reference = keyframes is not None and keyframes.source in {
+                "motion_reference",
+                "motion_reference_with_picture",
+            }
+            if keyframes is not None and keyframes.source == "motion_reference":
+                if keyframes.picture_count != 0 or keyframes.anchors:
+                    raise ValueError("H3 动作参考 handle 不能同时带图片或首尾帧锚点")
+            if keyframes is not None and keyframes.source == "motion_reference_with_picture" and keyframes.anchors:
+                raise ValueError("H3 图片动作迁移 handle 不能带首尾帧锚点")
             if keyframes is not None:
+                if is_motion_reference and not h3_pipeline.uses_ref_checkpoint(model.model_path):
+                    raise ValueError(
+                        "H3 动作迁移 / 完整参考视频必须使用 MiniMax-H3-ref（Ref2VA）transformer；"
+                        f"当前选的是 {model.model_path}。旧的 MiniMax-H3 Base 只支持 T2V / 首尾帧锚点"
+                    )
                 # 参考生视频（Ref2VA）与首 / 尾锚点（I2VA / FL2VA）是两套不同的
                 # transformer 权重：拿 Base 跑参考图，模型只会读到文本里的图片描述
                 checkpoint_note = h3_pipeline.check_visual_condition_checkpoint(model, keyframes)
@@ -247,7 +261,16 @@ class MlxKSamplerMLX:
                 return (pipeline.run_h3_sampler(entry, model, None, params, CACHE),)
             # 锚点 latent 与 params["keyframe_anchors"] 一一对应（纯参考时两个都是空）
             keyframe_latents = (
-                pipeline.encode_h3_keyframes(keyframes, CACHE)[1] if keyframes is not None else ()
+                pipeline.encode_h3_keyframes(keyframes, CACHE)[1]
+                if keyframes is not None
+                and keyframes.source not in {"motion_reference", "motion_reference_with_picture"}
+                else ()
+            )
+            reference_latents = (
+                pipeline.encode_h3_motion_reference(keyframes, CACHE)
+                if keyframes is not None
+                and keyframes.source in {"motion_reference", "motion_reference_with_picture"}
+                else ()
             )
             try:
                 comps = pipeline.prepare_h3_sampler_components(entry, model, CACHE)
@@ -258,6 +281,7 @@ class MlxKSamplerMLX:
                     params,
                     CACHE,
                     keyframe_latents=keyframe_latents,
+                    reference_latents=reference_latents,
                 )
             finally:
                 # 潜变量已进 h3_latents 桶：transformer（q8 约 35 GB）用完或异常都释放。

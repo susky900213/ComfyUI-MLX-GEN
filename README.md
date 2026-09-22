@@ -235,6 +235,7 @@ workflows/minimax-h3-all-reference-to-video.json  # 4 张纯参考 + 4 步加速
 workflows/minimax-h3-video-continuation-keep-audio.json     # 源视频 + 原声拼成片（Base）
 workflows/minimax-h3-video-continuation-drop-audio.json     # 只出新片段（Base）
 workflows/minimax-h3-video-continuation-replace-audio.json  # 新片段 + 外部配乐（Base）
+workflows/minimax-h3-motion-transfer.json          # 完整参考视频动作/运镜迁移（H3-REF）
 workflows/minimax-h3-two-stage-upscale.json       # 二阶段：低分采样 → latent 放大 → 高分精修
 workflows/minimax-h3-two-stage-upscale-lora.json  # 同上 + 8 步加速 LoRA（总步数 4+4=8）
 ```
@@ -424,6 +425,45 @@ workflows/qwen-image-2512.json
 ```text
 /Users/apple/ComfyUI-Shared/models/mlx/
 ├── transformer/qwen-image-2512-8bit/
+
+### H3 完整参考视频动作迁移
+
+导入 `workflows/minimax-h3-motion-transfer.json` 可以把一段源视频作为
+**动作 / 运镜参考**生成新视频。它和 `MlxH3VideoCondition` 的视频续写不同：
+
+- `MlxH3MotionReferenceCondition` 保留完整参考视频的 Video VAE latent；
+- 同一段视频另外按默认 2 fps 抽样，使用真实的两帧 temporal patch 编码进 Qwen3-VL
+  presentation，并带 `<Video 1>` 与时间戳标签；
+- 采样器把参考视频插入 H3 的固定 reference block，每一步都作为上下文参与注意力；
+- 该任务必须使用 `transformer/MiniMax-H3-ref`（Ref2VA），不能使用 Base 的
+  `transformer/MiniMax-H3`。
+
+工作流默认是 640×352、124 帧、50 步，源视频节点替换为自己的动作视频即可。提示词中
+应明确写 `<Video 1>`，例如“以 `<Video 1>` 作为动作与镜头运动参考，人物外观改为……”。
+参考视频会从开头截取不超过目标长度，并裁成 H3 的 `17n+5` 帧（至少 5 帧）。
+
+这是 H3 的参考视频迁移，不是 OpenPose / ControlNet 式逐帧骨骼锁定：人物身份、手脚
+
+### H3 参考图片 + 动作视频迁移
+
+导入 `workflows/minimax-h3-motion-transfer-with-image.json` 可以用一张参考图片
+提供人物外观 / 服装，同时用另一段视频提供动作和运镜：
+
+- `MlxH3MotionReferenceWithImageCondition` 把图片编码为 `<Picture 1>`；
+- 同一节点把动作视频编码为 `<Video 1>` 的 2 fps temporal presentation；
+- 动作视频的完整 Video VAE latent 仍作为固定 reference block 参与每一步采样；
+- 这是图片与视频共同参考的 Ref2VA 任务，必须选择 `MiniMax-H3-ref`。
+
+提示词要同时引用两个视觉槽，例如：
+
+```text
+integrated_multimodal_description: 以 <Video 1> 作为动作与镜头运动参考，
+以 <Picture 1> 作为人物外观与服装参考；保持视频的动作节奏，但不要复制视频中的身份。
+```
+
+该路径是“图片定外观、视频定动作 / 运镜”，不是把图片首帧钉到生成视频，也不是
+OpenPose / ControlNet 式逐帧骨骼锁定；脸部、手脚和局部轨迹仍可能漂移。
+细节和局部轨迹仍可能漂移；若需要严格的姿态或遮罩控制，应使用专门的姿态 / 视频控制模型。
 ├── vae/qwen-image-2512-8bit/
 ├── text_encoder/qwen-image-2512-8bit/
 └── tokenizer/qwen-image-2512-8bit/

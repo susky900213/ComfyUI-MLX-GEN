@@ -29,7 +29,13 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 COMFY = Path("/Users/apple/ComfyUI-Installs/ComfyUI/ComfyUI")
 WIDGET_TYPES = {"INT", "FLOAT", "STRING", "COMBO", "BOOLEAN", "SECRET", "PYSEED"}
-VISUAL_NODES = {"MlxH3KeyframeCondition", "MlxH3MultiReferenceCondition", "MlxH3VideoCondition"}
+VISUAL_NODES = {
+    "MlxH3KeyframeCondition",
+    "MlxH3MultiReferenceCondition",
+    "MlxH3VideoCondition",
+    "MlxH3MotionReferenceCondition",
+    "MlxH3MotionReferenceWithImageCondition",
+}
 
 # ComfyUI 前端对名叫 `seed` / `noise_seed` 的 widget 会自动插一个「控制方式」伴随 widget
 # （前端源码里的 `(t === "seed" || t === "noise_seed") && (i.control_after_generate = ...)`，
@@ -277,6 +283,20 @@ def condition_spec(workflow, plugin_classes) -> SimpleNamespace | None:
             anchors=("last",) if mode == "continue_from_end" else ("first",),
             picture_count=1,
             source_label="源视频续写",
+        )
+    if visual["type"] == "MlxH3MotionReferenceCondition":
+        return SimpleNamespace(
+            anchors=(),
+            picture_count=0,
+            source_label="完整参考视频（动作 / 运镜）",
+            source="motion_reference",
+        )
+    if visual["type"] == "MlxH3MotionReferenceWithImageCondition":
+        return SimpleNamespace(
+            anchors=(),
+            picture_count=1,
+            source_label="1 张参考图 + 完整参考视频（动作 / 运镜）",
+            source="motion_reference_with_picture",
         )
 
     source_id = next((link[1] for link in workflow["links"]

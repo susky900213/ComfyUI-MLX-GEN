@@ -1,4 +1,4 @@
-"""生成 MiniMax-H3 的七份示例工作流（纯标准库，可重复运行）。
+"""生成 MiniMax-H3 的九份示例工作流（纯标准库，可重复运行）。
 
 写法说明：工作流里每个节点只声明「输入槽名 + 输出槽名 + widget 值」，
 链接用 (源节点, 源槽, 目标节点, 目标槽, 类型) 描述；slot_index、
@@ -61,6 +61,24 @@ PROMPT_VIDEO_REPLACE = (
     "overall_soundscape: 猫爪踩在混凝土上的细碎声、风声、远处浪涛；"
     "音轨整体替换成配乐（见工作流的「Load Audio」连线）。\n\n"
     "non_diegetic_music: 温暖的钢琴与弦乐，适合作为一段小纪录片的结尾。"
+)
+
+PROMPT_MOTION_TRANSFER = (
+    "integrated_multimodal_description: 以 <Video 1> 作为动作与镜头运动参考，"
+    "保持参考视频中的人物运动节奏、身体朝向、手臂摆动和镜头轨迹；将主体替换为一名"
+    "穿白色运动外套的年轻女性，场景改为黄昏的城市天台。动作要跟随参考视频的时间结构，"
+    "但人物外观、服装、环境和色调以文字描述为准，不要复制参考视频中的身份。\n\n"
+    "overall_soundscape: 城市天台的风声、远处车流与轻微脚步声，动作变化处保留自然的衣料摩擦声。\n\n"
+    "non_diegetic_music: 克制的电子氛围音乐，节奏跟随动作但不要盖过环境声。"
+)
+
+PROMPT_MOTION_TRANSFER_WITH_IMAGE = (
+    "integrated_multimodal_description: 以 <Video 1> 作为动作与镜头运动参考，"
+    "保持参考视频中的动作节奏、身体朝向、手臂摆动和镜头轨迹；以 <Picture 1> 作为"
+    "人物外观与服装参考，将主体放在黄昏的城市天台。动作要跟随参考视频的时间结构，"
+    "但不要复制参考视频中的身份、脸部和服装；优先保持 <Picture 1> 的人物特征。\n\n"
+    "overall_soundscape: 城市天台的风声、远处车流与轻微脚步声，动作变化处保留自然的衣料摩擦声。\n\n"
+    "non_diegetic_music: 克制的电子氛围音乐，节奏跟随动作但不要盖过环境声。"
 )
 
 
@@ -438,6 +456,126 @@ def workflow_video_continuation(mode):
                    links)
 
 
+# --- 7. 完整参考视频 → 动作迁移（Ref2VA）-------------------------------------------
+def workflow_motion_reference():
+    """完整参考视频：presentation + Video VAE latent，必须使用 H3-REF。"""
+    nodes = base_nodes(
+        PROMPT_MOTION_TRANSFER,
+        sampler_wh=(640, 352),
+        checkpoint=CKPT_REF,
+        visual_id=12,
+        visual_label="完整参考视频（动作 / 运镜）",
+        steps=50,
+        scheduler="minimax_h3",
+    ) + [
+        vae_loader(),
+        node_spec(
+            11,
+            "LoadVideo",
+            "动作参考视频（建议 5 秒以上，人物动作清晰）",
+            [],
+            [["VIDEO", "VIDEO"]],
+            ["h3_motion_reference.mp4"],
+            [420, 800],
+            [380, 260],
+            4,
+        ),
+        node_spec(
+            12,
+            "MlxH3MotionReferenceCondition",
+            "H3 完整动作参考（2 fps presentation + 完整 Video VAE latent；必须 H3-REF）",
+            [["video", "VIDEO"], ["vae", "mlx_vae"]],
+            [["keyframes", "mlx_h3_keyframes"], ["report", "STRING"]],
+            [640, 352, 124, True, 2.0],
+            [820, 800],
+            [460, 360],
+            5,
+        ),
+    ]
+    links = list(BASE_LINKS) + [
+        (10, 0, 12, 1, "mlx_vae"),
+        (11, 0, 12, 0, "VIDEO"),
+        (12, 0, 2, 1, "mlx_h3_keyframes"),
+    ]
+    write_workflow(
+        "minimax-h3-motion-transfer",
+        "mlx-minimax-h3-motion-transfer",
+        "MiniMax-H3 动作迁移（完整参考视频 · Ref2VA）",
+        nodes,
+        links,
+    )
+
+
+def workflow_motion_reference_with_image():
+    """一张外观参考图 + 完整动作参考视频：图片与视频共同进入 Ref2VA。"""
+    nodes = base_nodes(
+        PROMPT_MOTION_TRANSFER_WITH_IMAGE,
+        sampler_wh=(640, 352),
+        checkpoint=CKPT_REF,
+        visual_id=12,
+        visual_label="1 张外观参考图 + 完整动作视频",
+        steps=50,
+        scheduler="minimax_h3",
+    ) + [
+        vae_loader(),
+        node_spec(
+            11,
+            "LoadImage",
+            "人物 / 外观参考图（提示词里的 <Picture 1>）",
+            [],
+            [["IMAGE", "IMAGE"], ["MASK", "MASK"]],
+            ["h3_subject_reference.png"],
+            [420, 760],
+            [360, 400],
+            4,
+        ),
+        node_spec(
+            13,
+            "LoadVideo",
+            "动作与运镜参考视频（提示词里的 <Video 1>）",
+            [],
+            [["VIDEO", "VIDEO"]],
+            ["h3_motion_reference.mp4"],
+            [420, 1220],
+            [380, 260],
+            4,
+        ),
+        node_spec(
+            12,
+            "MlxH3MotionReferenceWithImageCondition",
+            "H3 图片 + 动作迁移（<Picture 1> 外观 + <Video 1> 动作 / 运镜；必须 H3-REF）",
+            [
+                ["image", "IMAGE"],
+                ["video", "VIDEO"],
+                ["width", "INT"],
+                ["height", "INT"],
+                ["num_frames", "INT"],
+                ["use_source_aspect", "BOOLEAN"],
+                ["presentation_fps", "FLOAT"],
+                ["vae", "mlx_vae"],
+            ],
+            [["keyframes", "mlx_h3_keyframes"], ["report", "STRING"]],
+            [640, 352, 124, True, 2.0],
+            [820, 960],
+            [500, 420],
+            5,
+        ),
+    ]
+    links = list(BASE_LINKS) + [
+        (10, 0, 12, 7, "mlx_vae"),
+        (11, 0, 12, 0, "IMAGE"),
+        (13, 0, 12, 1, "VIDEO"),
+        (12, 0, 2, 1, "mlx_h3_keyframes"),
+    ]
+    write_workflow(
+        "minimax-h3-motion-transfer-with-image",
+        "mlx-minimax-h3-motion-transfer-with-image",
+        "MiniMax-H3 图片动作迁移（1 张外观参考图 + 完整动作视频 · Ref2VA）",
+        nodes,
+        links,
+    )
+
+
 # --- 7. 全能参考生视频（4 张参考图 + 加速 LoRA，Ref2VA）---------------------------
 def workflow_all_reference():
     """对照社区那份「3 步加速 Lora + 全能参考」的工作流，做一份只靠本插件节点的版本。
@@ -514,5 +652,7 @@ if __name__ == "__main__":
     workflow_video_continuation("keep")
     workflow_video_continuation("drop")
     workflow_video_continuation("replace")
+    workflow_motion_reference()
+    workflow_motion_reference_with_image()
     workflow_all_reference()
-    print("[gen] 七份 H3 工作流已生成")
+    print("[gen] 九份 H3 工作流已生成")

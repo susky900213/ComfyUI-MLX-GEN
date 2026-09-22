@@ -97,6 +97,8 @@ def checkpoint_tier_for_condition(keyframes: Any) -> str:
     """
     if keyframes is None:
         return "any"
+    if getattr(keyframes, "source", "") in {"motion_reference", "motion_reference_with_picture"}:
+        return "ref"
     if not keyframes.anchors:
         return "ref"
     if int(keyframes.picture_count) > BASE_MAX_IMAGES:
@@ -113,6 +115,16 @@ def check_visual_condition_checkpoint(model: Any, keyframes: Any) -> str:
     if keyframes is None:
         return ""
     label = keyframes.source_label or f"{keyframes.picture_count} 张图"
+    if getattr(keyframes, "source", "") in {"motion_reference", "motion_reference_with_picture"}:
+        if not uses_ref_checkpoint(model.model_path):
+            raise ValueError(
+                f"{label}：完整参考视频（动作 / 运镜迁移）必须用 Minimax-H3-REF 的 transformer，"
+                f"当前选的是 {model.model_path}"
+            )
+        return (
+            f"{label}：使用 REF 权重 {model.model_path}，"
+            "源视频同时进入 Qwen3-VL 时序 presentation 与 Video VAE reference block"
+        )
     is_ref = uses_ref_checkpoint(model.model_path)
     limit = REF_MAX_IMAGES if is_ref else BASE_MAX_IMAGES
     if int(keyframes.picture_count) > limit:
@@ -237,10 +249,17 @@ def make_plan(
     )
 
 
-def packed_rows(plan: H3Plan, text_tokens: int = DEFAULT_TEXT_TOKENS, keyframe_count: int = 0) -> int:
+def packed_rows(
+    plan: H3Plan,
+    text_tokens: int = DEFAULT_TEXT_TOKENS,
+    keyframe_count: int = 0,
+    reference_rows: int = 0,
+) -> int:
     """打包序列的行数（峰值内存跟着它走，而不是单独跟画布或帧数走）。"""
     condition_rows = int(keyframe_count) * (plan.latent_height // PATCH_SIZE) * (plan.latent_width // PATCH_SIZE)
-    return packed_sequence_length(plan.width, plan.height, plan.num_frames, int(text_tokens)) + condition_rows
+    return packed_sequence_length(plan.width, plan.height, plan.num_frames, int(text_tokens)) + condition_rows + int(
+        reference_rows
+    )
 
 
 def estimate_peak_bytes(
@@ -249,12 +268,13 @@ def estimate_peak_bytes(
     text_tokens: int = DEFAULT_TEXT_TOKENS,
     cache_bytes: int = 0,
     keyframe_count: int = 0,
+    reference_rows: int = 0,
 ) -> int:
     """预期峰值足迹 = 已物化组件 + MLX 缓存 + 每行标定值 × 行数。"""
     return int(
         resident_bytes
         + cache_bytes
-        + PEAK_BYTES_PER_PACKED_ROW * packed_rows(plan, text_tokens, keyframe_count)
+        + PEAK_BYTES_PER_PACKED_ROW * packed_rows(plan, text_tokens, keyframe_count, reference_rows)
     )
 
 
@@ -265,12 +285,13 @@ def preflight(
     text_tokens: int = DEFAULT_TEXT_TOKENS,
     cache_bytes: int = 0,
     keyframe_count: int = 0,
+    reference_rows: int = 0,
     log: Callable[[str], None] | None = print,
 ) -> None:
     """峰值放不下就拒绝，接近上限就警告（不改用户的请求，只把四个缩档说清楚）。"""
     if physical_bytes <= 0:
         return
-    expected = estimate_peak_bytes(plan, resident_bytes, text_tokens, cache_bytes, keyframe_count)
+    expected = estimate_peak_bytes(plan, resident_bytes, text_tokens, cache_bytes, keyframe_count, reference_rows)
     gib = 1024**3
     lever = (
         "请缩时长（帧数最小 124）、换小画布（如 640×352）、降量化档位（q4），"
@@ -292,6 +313,7 @@ def build_layout(
     patch_size: tuple[int, int, int],
     audio_channels: int = AUDIO_CHANNELS,
     keyframe_anchors: tuple[str, ...] = (),
+    reference_latents: tuple[Any, ...] = (),
 ):
     """把提示词标签、关键帧条件行及目标音视频行拼成一条序列。"""
     return build_packed_sequence(
@@ -303,6 +325,7 @@ def build_layout(
         patch_size=patch_size,
         audio_channels=audio_channels,
         keyframe_anchors=keyframe_anchors,
+        reference_latents=reference_latents,
     )
 
 
@@ -333,6 +356,26 @@ def encode_keyframe_latents(keyframes: tuple[Any, ...], vae: Any) -> tuple[mx.ar
     return tuple(encoded)
 
 
+def encode_motion_reference_latent(frames: tuple[Any, ...], vae: Any) -> mx.array:
+    """Encode a complete reference clip into normalized `(1, 24, F', H', W')` latent.
+
+    Unlike a keyframe, the reference clip keeps its temporal axis. We use the posterior
+    mean here rather than sampling independently per clip, so rerunning the same motion
+    reference cannot introduce latent noise before the H3 denoising seed is applied.
+    """
+    if len(frames) < 5:
+        raise ValueError("H3 动作参考至少需要 5 帧")
+    pixels = np.stack([np.asarray(frame.convert("RGB"), dtype=np.float32) for frame in frames], axis=0) / 255.0
+    pixels = (pixels - np.array(PIXEL_MEAN, dtype=np.float32)) / np.array(PIXEL_STD, dtype=np.float32)
+    tensor = mx.array(pixels.transpose(3, 0, 1, 2)[None]).astype(component_dtype(vae))
+    mean, _logvar = vae.encode(tensor)
+    latents = (mean.astype(mx.float32) - vae.latents_mean.reshape(1, -1, 1, 1, 1)) / vae.latents_std.reshape(
+        1, -1, 1, 1, 1
+    )
+    mx.eval(latents)
+    return latents
+
+
 def sample(
     transformer: Any,
     prompt_embeds: Any,
@@ -341,6 +384,7 @@ def sample(
     seed: int,
     keyframe_latents: tuple[mx.array, ...] = (),
     keyframe_anchors: tuple[str, ...] = (),
+    reference_latents: tuple[mx.array, ...] = (),
     log: Callable[[str], None] | None = print,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[mx.array, mx.array, Any]:
@@ -355,6 +399,7 @@ def sample(
         plan,
         tuple(transformer.patch_size),
         keyframe_anchors=keyframe_anchors,
+        reference_latents=reference_latents,
     )
     video_scheduler = MiniMaxH3Scheduler(shift=plan.video_shift)
     audio_scheduler = MiniMaxH3Scheduler(shift=plan.audio_shift)
@@ -362,7 +407,7 @@ def sample(
     audio_scheduler.set_timesteps(plan.grid_points)
 
     # 抽噪顺序与参考实现一致：整组条件增强噪声在前，随后是目标视频、目标音频。
-    keys = mx.random.split(mx.random.key(int(seed)), len(keyframe_latents) + 2)
+    keys = mx.random.split(mx.random.key(int(seed)), len(keyframe_latents) + len(reference_latents) + 2)
     key_video, key_audio = keys[-2], keys[-1]
     video_rows = patchify_video_latents(
         mx.random.normal(
@@ -372,14 +417,26 @@ def sample(
         ),
         tuple(transformer.patch_size),
     )
-    if keyframe_latents:
+    if keyframe_latents or reference_latents:
         condition_rows = []
-        for condition, key in zip(keyframe_latents, keys[:-2], strict=True):
-            expected = (1, int(transformer.in_channels), 1, plan.latent_height, plan.latent_width)
-            if tuple(condition.shape) != expected:
-                raise ValueError(
-                    f"H3 关键帧 latent 形状应为 {expected}，收到 {tuple(condition.shape)}"
-                )
+        all_conditions = (*keyframe_latents, *reference_latents)
+        for index, (condition, key) in enumerate(zip(all_conditions, keys[:-2], strict=True)):
+            if index < len(keyframe_latents):
+                expected = (1, int(transformer.in_channels), 1, plan.latent_height, plan.latent_width)
+                if tuple(condition.shape) != expected:
+                    raise ValueError(
+                        f"H3 关键帧 latent 形状应为 {expected}，收到 {tuple(condition.shape)}"
+                    )
+            else:
+                if len(condition.shape) != 5 or int(condition.shape[0]) != 1 or int(condition.shape[1]) != int(transformer.in_channels):
+                    raise ValueError(
+                        "H3 动作参考 latent 必须是 (1, 24, F, H, W)，"
+                        f"收到 {tuple(condition.shape)}"
+                    )
+                if int(condition.shape[3]) % int(transformer.patch_size[1]) or int(condition.shape[4]) % int(transformer.patch_size[2]):
+                    raise ValueError(
+                        f"H3 动作参考 latent 空间尺寸不能被 patch {tuple(transformer.patch_size)} 整除：{tuple(condition.shape)}"
+                    )
             condition_noise = mx.random.normal(condition.shape, key=key, dtype=mx.float32)
             noised = video_scheduler.scale_noise(condition, KEYFRAME_NOISE_AUG, condition_noise)
             condition_rows.append(patchify_video_latents(noised, tuple(transformer.patch_size)))

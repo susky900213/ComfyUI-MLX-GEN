@@ -1,4 +1,4 @@
-"""MiniMax-H3 的视觉条件节点（首尾帧 / 多图参考 / 视频续写）。
+"""MiniMax-H3 的视觉条件节点（首尾帧 / 多图参考 / 视频续写 / 图片动作迁移）。
 
 H3 的视觉条件只有一条通路，而且**只有两个 latent 锚点槽**：
 `h3/latent_creator/h3_layout.py` 的 `keyframe_anchors` 只认 `first` / `last`，
@@ -25,7 +25,7 @@ H3 的视觉条件只有一条通路，而且**只有两个 latent 锚点槽**�
   文本编码器 / tokenizer / 两个 VAE 两边共用（都填 `MiniMax-H3`），
   校验由 `h3/pipeline.check_visual_condition_checkpoint` 在采样器里兜住。
 
-三个节点都只产出数据：图片留在 cache.py 的 "h3_keyframe_source" 桶里，
+这些节点都只产出数据：图片留在 cache.py 的 "h3_keyframe_source" 桶里，
 handle 只带摘要、顺序、画布与 VAE 配置。2 张以上的组合由本插件自己实现
 （`Qwen3VLModel.encode` 收 `list[patches] + list[grid]`，上游 mlx-gen 只用过
 「1 张图 + 1 个锚点」）：首 / 尾锚点之外再多出来的图只进 presentation。
@@ -382,4 +382,265 @@ class MlxH3VideoCondition:
             "（首 / 尾锚点属于 Base 的 I2VA 任务，「MLX 模型加载器」选 MiniMax-H3；"
             "要把原片段也放进成片，请用 GetVideoComponents + CreateVideo + ConcatenateVideo 拼接）"
         )
+        return handle, report
+
+
+# --- 4. 完整参考视频（Ref2VA：动作 / 运镜参考）-------------------------------
+class MlxH3MotionReferenceCondition:
+    """MiniMax-H3 Ref2VA 的完整视频参考条件。
+
+    这条链路与 ``MlxH3VideoCondition``（续写）严格分开：源视频不会被压成首尾
+    锚点，而是同时保留为 Qwen3-VL 的 2 fps 时序 presentation 和 Video VAE 的
+    完整 latent block。采样器会要求使用 ``MiniMax-H3-ref`` transformer。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {}),
+                "width": ("INT", {"default": 640, "min": 32, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 352, "min": 32, "max": 4096, "step": 32}),
+                "num_frames": ("INT", {"default": 124, "min": 5, "max": 345, "step": 17}),
+                "use_source_aspect": ("BOOLEAN", {"default": True}),
+                "presentation_fps": (
+                    "FLOAT",
+                    {
+                        "default": 2.0,
+                        "min": 0.5,
+                        "max": 8.0,
+                        "step": 0.5,
+                        "tooltip": "H3 官方 Ref2VA presentation 默认按 2 fps 抽样；不要设为源视频原始 fps",
+                    },
+                ),
+            },
+            "optional": {"vae": (vae, {})},
+        }
+
+    RETURN_TYPES = (h3_keyframes, "STRING")
+    RETURN_NAMES = ("keyframes", "report")
+    FUNCTION = "pack"
+    CATEGORY = "MLX/Gen"
+
+    def pack(self, video, width, height, num_frames, use_source_aspect, presentation_fps, vae=None):
+        if video is None or not hasattr(video, "get_components"):
+            raise ValueError("video 必须连接 ComfyUI 的「Load Video」节点")
+        check_video_vae(vae, "H3 动作参考")
+        if float(presentation_fps) <= 0:
+            raise ValueError("H3 动作参考的 presentation_fps 必须大于 0")
+
+        components = video.get_components()
+        source = image_mod.to_pil_batch(components.images)
+        if len(source) < 5:
+            raise ValueError("H3 动作参考视频至少需要 5 帧")
+        if use_source_aspect:
+            width, height = canvas_from_image(source[0])
+        width, height = check_canvas(width, height, "H3 动作参考")
+        # H3 Video VAE 的时间网格是 17n+5；参考视频不能静默延长到目标时长，
+        # 只取源视频前段，并裁到模型可编码的最后一个合法长度。
+        requested = min(int(num_frames), len(source))
+        aligned = requested
+        while aligned >= 5 and aligned % 17 != 5:
+            aligned -= 1
+        if aligned < 5:
+            raise ValueError(
+                f"源视频只有 {len(source)} 帧，无法裁成 H3 合法的 17n+5 参考片段（至少 5 帧）"
+            )
+        frames = tuple(fit_to_canvas(frame.convert("RGB"), width, height) for frame in source[:aligned])
+        sample_step = max(1, int(round(float(components.frame_rate) / float(presentation_fps))))
+        sampled = tuple(frames[::sample_step])
+        timestamps = tuple(index * sample_step / float(components.frame_rate) for index in range(len(sampled)))
+        if len(sampled) < 2:
+            sampled = (frames[0], frames[-1])
+            timestamps = (0.0, (aligned - 1) / float(components.frame_rate))
+
+        digest = runtime.cache_key(
+            {
+                "kind": "h3_motion_reference",
+                "frames": image_mod.digest(frames),
+                "sampled": image_mod.digest(sampled),
+                "timestamps": timestamps,
+                "width": width,
+                "height": height,
+                "fps": float(components.frame_rate),
+            }
+        )
+        CACHE.get_or_create(
+            "h3_motion_source",
+            digest,
+            lambda: {
+                "frames": frames,
+                "presentation_frames": sampled,
+                "timestamps": timestamps,
+                "fps": float(components.frame_rate),
+            },
+        )
+        # images_key 只用于满足通用 handle 契约；动作参考实际读取 motion_key。
+        images_key = runtime.cache_key({"kind": "h3_motion_images", "digest": digest})
+        CACHE.get_or_create("h3_keyframe_source", images_key, lambda: tuple())
+        handle = MlxH3VisualCondition(
+            images_key=images_key,
+            picture_count=0,
+            anchors=(),
+            anchor_images=(),
+            width=width,
+            height=height,
+            digest=digest,
+            source="motion_reference",
+            source_label=f"动作参考视频 {aligned} 帧",
+            vae=vae,
+            motion_key=digest,
+            motion_frame_count=aligned,
+            motion_fps=float(components.frame_rate),
+        )
+        report = (
+            f"H3 动作参考 | 源 {source[0].width}×{source[0].height} / "
+            f"{len(source)} 帧 @ {float(components.frame_rate):g}fps → "
+            f"{aligned} 帧，presentation {len(sampled)} 帧 @ {float(presentation_fps):g}fps | "
+            f"画布 {width}×{height} | 必须使用 MiniMax-H3-ref"
+        )
+        print(f"[MlxH3MotionReferenceCondition] {report}")
+        return handle, report
+
+
+class MlxH3MotionReferenceWithImageCondition:
+    """用一张参考图片提供人物 / 外观，同时用完整视频提供动作 / 运镜。
+
+    图片只进入 Qwen3-VL 的 ``<Picture 1>`` presentation，不会与动作视频
+    共用视觉槽；视频仍同时进入 ``<Video 1>`` presentation 和固定的 Video VAE
+    reference block。该组合属于 Ref2VA，采样器必须使用 ``MiniMax-H3-ref``。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {}),
+                "video": ("VIDEO", {}),
+                "width": ("INT", {"default": 640, "min": 32, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 352, "min": 32, "max": 4096, "step": 32}),
+                "num_frames": ("INT", {"default": 124, "min": 5, "max": 345, "step": 17}),
+                "use_source_aspect": ("BOOLEAN", {"default": True}),
+                "presentation_fps": (
+                    "FLOAT",
+                    {
+                        "default": 2.0,
+                        "min": 0.5,
+                        "max": 8.0,
+                        "step": 0.5,
+                        "tooltip": "动作视频按该帧率抽样进 Qwen3-VL；默认 2 fps",
+                    },
+                ),
+            },
+            "optional": {"vae": (vae, {})},
+        }
+
+    RETURN_TYPES = (h3_keyframes, "STRING")
+    RETURN_NAMES = ("keyframes", "report")
+    FUNCTION = "pack"
+    CATEGORY = "MLX/Gen"
+
+    def pack(
+        self,
+        image,
+        video,
+        width,
+        height,
+        num_frames,
+        use_source_aspect,
+        presentation_fps,
+        vae=None,
+    ):
+        if image is None:
+            raise ValueError("image 必须连接一张参考图片")
+        picture_batch = image_mod.to_pil_batch(image)
+        if len(picture_batch) != 1:
+            raise ValueError(f"image 必须恰好包含一张 IMAGE，收到 {len(picture_batch)} 张")
+        if video is None or not hasattr(video, "get_components"):
+            raise ValueError("video 必须连接 ComfyUI 的「Load Video」节点")
+        check_video_vae(vae, "H3 图片动作迁移")
+        if float(presentation_fps) <= 0:
+            raise ValueError("H3 图片动作迁移的 presentation_fps 必须大于 0")
+
+        components = video.get_components()
+        source = image_mod.to_pil_batch(components.images)
+        if len(source) < 5:
+            raise ValueError("H3 图片动作迁移的参考视频至少需要 5 帧")
+        if use_source_aspect:
+            width, height = canvas_from_image(source[0])
+        width, height = check_canvas(width, height, "H3 图片动作迁移")
+
+        requested = min(int(num_frames), len(source))
+        aligned = requested
+        while aligned >= 5 and aligned % 17 != 5:
+            aligned -= 1
+        if aligned < 5:
+            raise ValueError(
+                f"源视频只有 {len(source)} 帧，无法裁成 H3 合法的 17n+5 参考片段（至少 5 帧）"
+            )
+        frames = tuple(fit_to_canvas(frame.convert("RGB"), width, height) for frame in source[:aligned])
+        sample_step = max(1, int(round(float(components.frame_rate) / float(presentation_fps))))
+        sampled = tuple(frames[::sample_step])
+        timestamps = tuple(index * sample_step / float(components.frame_rate) for index in range(len(sampled)))
+        if len(sampled) < 2:
+            sampled = (frames[0], frames[-1])
+            timestamps = (0.0, (aligned - 1) / float(components.frame_rate))
+
+        motion_digest = runtime.cache_key(
+            {
+                "kind": "h3_motion_reference",
+                "frames": image_mod.digest(frames),
+                "sampled": image_mod.digest(sampled),
+                "timestamps": timestamps,
+                "width": width,
+                "height": height,
+                "fps": float(components.frame_rate),
+            }
+        )
+        CACHE.get_or_create(
+            "h3_motion_source",
+            motion_digest,
+            lambda: {
+                "frames": frames,
+                "presentation_frames": sampled,
+                "timestamps": timestamps,
+                "fps": float(components.frame_rate),
+            },
+        )
+
+        picture = fit_to_canvas(picture_batch[0].convert("RGB"), width, height)
+        image_digest = runtime.cache_key(
+            {
+                "kind": "h3_motion_reference_with_picture",
+                "picture": image_mod.digest((picture,)),
+                "motion": motion_digest,
+                "width": width,
+                "height": height,
+                "vae": vae,
+            }
+        )
+        images_key = runtime.cache_key({"kind": "h3_keyframe_source", "digest": image_digest})
+        CACHE.get_or_create("h3_keyframe_source", images_key, lambda: (picture,))
+        handle = MlxH3VisualCondition(
+            images_key=images_key,
+            picture_count=1,
+            anchors=(),
+            anchor_images=(),
+            width=width,
+            height=height,
+            digest=image_digest,
+            source="motion_reference_with_picture",
+            source_label=f"1 张参考图 + 动作参考视频 {aligned} 帧",
+            vae=vae,
+            motion_key=motion_digest,
+            motion_frame_count=aligned,
+            motion_fps=float(components.frame_rate),
+        )
+        report = (
+            f"H3 图片动作迁移 | 参考图 1 张 + 源视频 {source[0].width}×{source[0].height} / "
+            f"{len(source)} 帧 @ {float(components.frame_rate):g}fps → {aligned} 帧，"
+            f"presentation {len(sampled)} 帧 @ {float(presentation_fps):g}fps | "
+            f"画布 {width}×{height} | 图片=<Picture 1>，动作视频=<Video 1> | 必须使用 MiniMax-H3-ref"
+        )
+        print(f"[MlxH3MotionReferenceWithImageCondition] {report}")
         return handle, report

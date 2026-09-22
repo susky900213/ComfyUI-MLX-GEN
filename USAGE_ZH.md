@@ -254,6 +254,58 @@ ln -s "$SNAPSHOT/audio_vae"         "$MLX_ROOT/audio_vae/MiniMax-H3"
 首 / 尾帧与视频续写仍用 Base。两份 transformer 的结构与 `config.json` 相同，
 差的只是训练权重，因此换 checkpoint 不需要改代码——但选错了采样器会直接报错。
 
+#### 完整参考视频动作迁移
+
+使用 `workflows/minimax-h3-motion-transfer.json`。这条链路必须选择
+`transformer/MiniMax-H3-ref`，并按以下方式连接：
+
+```text
+LoadVideo
+  └─→ MlxH3MotionReferenceCondition.video
+MlxVAELoader（role=vae）
+  └─→ MlxH3MotionReferenceCondition.vae
+MlxH3MotionReferenceCondition.keyframes
+  └─→ 正向 MlxTextEncoder.h3_keyframes
+正向 MlxTextEncoder.condition ─→ MlxKSamplerMLX.positive
+```
+
+`MlxH3MotionReferenceCondition` 不会只取首帧或尾帧。它会：
+
+1. 将源视频裁到 H3 合法的 `17n+5` 帧，并用视频 VAE 编码完整时序 latent；
+2. 默认按 2 fps 抽帧，把每两个相邻帧作为一个真实 temporal patch 送入 Qwen3-VL；
+3. 在 H3 packed sequence 中放入固定的 reference video block，目标视频和音频仍由
+   H3 正常联合去噪。
+
+提示词要引用 `<Video 1>`，例如：
+
+```text
+integrated_multimodal_description: 以 <Video 1> 作为动作与镜头运动参考，
+保持参考视频的动作节奏和运镜，但把人物外观、服装和场景替换为……
+```
+
+这不是 OpenPose / ControlNet 的逐帧骨骼锁定。人物身份、手脚细节和局部轨迹仍可能
+漂移；如果只需要从源视频最后一帧继续生成，请继续使用 `MlxH3VideoCondition` 和
+`minimax-h3-video-continuation-*.json`，不要把续写节点当作动作迁移节点。
+
+#### 参考图片 + 动作视频迁移
+
+使用 `workflows/minimax-h3-motion-transfer-with-image.json`，可以让一张图片负责
+人物外观 / 服装，让一段视频负责动作和运镜。连接方式如下：
+
+```text
+LoadImage ────────────────→ MlxH3MotionReferenceWithImageCondition.image
+LoadVideo ────────────────→ MlxH3MotionReferenceWithImageCondition.video
+MlxVAELoader（role=vae） ─→ MlxH3MotionReferenceWithImageCondition.vae
+MlxH3MotionReferenceWithImageCondition.keyframes
+  └─→ 正向 MlxTextEncoder.h3_keyframes
+```
+
+条件节点会把图片作为 `<Picture 1>`、动作视频作为 `<Video 1>` 编码；动作视频仍会
+被完整编码为固定 Video VAE reference block，presentation 默认按 2 fps 抽样并使用
+相邻双帧 temporal patch。提示词必须明确同时引用两个槽位，且 `MlxTransformerLoader`
+必须选择 `MiniMax-H3-ref`。该功能是 Ref2VA 参考迁移，不是首帧锚点，也不是
+OpenPose / ControlNet 的逐帧姿态锁定。
+
 每个 H3 组件目录都必须保留自己的 `config.json` 和 `.safetensors` 权重；这包括
 Transformer、`text_encoder_back`、视频 VAE 与音频 VAE。当前实现会分别调用严格的
 配置加载器，任一组件缺少 `config.json` 都会直接报错，没有内置默认配置回退。
@@ -386,6 +438,7 @@ Whisper 完整 checkpoint 放到：
 | `workflows/minimax-h3-multi-image-to-video.json` | MiniMax-H3 多图参考生视频（**H3-REF**） | 3 张参考图，第 1 张钉首帧 |
 | `workflows/minimax-h3-reference-only-to-video.json` | MiniMax-H3 纯参考生视频（**H3-REF**） | 3 张只进 presentation，不钉锚点 |
 | `workflows/minimax-h3-all-reference-to-video.json` | MiniMax-H3 全能参考生视频（**H3-REF**） | 4 张只进 presentation + Ref2VA 的 4 步加速 LoRA |
+| `workflows/minimax-h3-motion-transfer.json` | MiniMax-H3 完整参考视频动作 / 运镜迁移（**H3-REF**） | 124 帧、50 步、默认 2 fps presentation + 完整 Video VAE reference block |
 | `workflows/minimax-h3-video-continuation-keep-audio.json` | 源视频续写并拼成片（Base） | `GetVideoComponents` + `ConcatenateVideo` + `AudioConcat` |
 | `workflows/minimax-h3-video-continuation-drop-audio.json` | 只出新片段（Base） | 丢弃原声，用 H3 生成的音轨 |
 | `workflows/minimax-h3-video-continuation-replace-audio.json` | 只出新片段 + 外部配乐（Base） | `LoadAudio` 整段替换音轨 |

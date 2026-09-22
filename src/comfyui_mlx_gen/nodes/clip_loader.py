@@ -13,14 +13,46 @@ ModelConfig 由 weights.config_for_path 按目录名匹配）。
 from __future__ import annotations
 
 from .. import paths, runtime
-from ..types import CLIP, MlxClipHandle, entry_for, model_types, validate_model_family
+from ..types import (
+    CLIP,
+    QWEN_IMAGE_21_MAX_LENGTH,
+    MlxClipHandle,
+    entry_for,
+    model_types,
+    validate_model_family,
+)
 
 COMPONENTS = ["text_encoder", "tokenizer"]
-PRECISIONS = ["bfloat16", "float16", "float32"]
+# `MLX 16bit` 是给用户看的加载类型；内部仍使用 MLX 原生的 `float16`。
+# 保留 `float16` 以兼容旧工作流直接序列化的值。
+PRECISIONS = ["bfloat16", "MLX 16bit", "float16", "float32"]
 # 0 = 不量化（图片链路的现状）；MiniMax-H3 的 Qwen3-VL 编码器不量化要常驻约 50 GB，
 # 所以选 minimax_h3 时必须填 8 或 4（MlxTextEncoder 里会挡住 0）
 QUANTIZE_OPTIONS = [0, 4, 8]
 NO_PATH = "<无可用权重>"
+
+
+def normalize_precision(value: str) -> str:
+    """将 Loader 显示值转换为 MLX/模型加载器使用的 dtype 名称。"""
+    text = str(value).strip().casefold()
+    if text in {"mlx 16bit", "16bit", "fp16", "float16"}:
+        return "float16"
+    if text in {"bfloat16", "bf16", "float32", "fp32"}:
+        return {"bf16": "bfloat16", "fp32": "float32"}.get(text, text)
+    raise ValueError(f"未知精度: {value}；可选：{', '.join(PRECISIONS)}")
+
+
+def normalize_max_length(model_type: str, value: int) -> int:
+    """迁移 Qwen-Image 2.1 旧工作流中的 512 默认值。
+
+    Qwen-Image 2.1 的模板本身会占用一部分上下文，PE 重写后的普通提示词很容易
+    超过旧版 Loader 的 512 默认值。这里只迁移历史默认值；其它长度仍按用户设置
+    保留，避免把有意设置的较小上限静默改掉。
+    """
+    length = int(value)
+    if model_type == "qwen_image_21" and length == 512:
+        return QWEN_IMAGE_21_MAX_LENGTH
+    return length
 
 
 def component_options(component: str) -> list[str]:
@@ -50,7 +82,14 @@ class MlxClipLoader:
                 "component": (COMPONENTS, {"default": comp}),
                 "path": (paths_for_comp, {"default": paths_for_comp[0]}),
                 "precision": (PRECISIONS, {"default": "bfloat16"}),
-                "max_length": ("INT", {"default": 512, "min": 1}),
+                "max_length": (
+                    "INT",
+                    {
+                        "default": QWEN_IMAGE_21_MAX_LENGTH,
+                        "min": 1,
+                        "max": QWEN_IMAGE_21_MAX_LENGTH,
+                    },
+                ),
                 # 0 = 不量化；MiniMax-H3 请选 8（选 0 时「MLX 文本编码器」会直接报错）
                 "quantize": (QUANTIZE_OPTIONS, {"default": 0}),
             }
@@ -68,8 +107,8 @@ class MlxClipLoader:
             raise NotImplementedError(f"{model_type} 尚未实现：{entry.notes}")
         if component not in COMPONENTS:
             raise ValueError(f"未知组件: {component}")
-        if precision not in PRECISIONS:
-            raise ValueError(f"未知精度: {precision}")
+        precision = normalize_precision(precision)
+        max_length = normalize_max_length(model_type, max_length)
         config = {
             "model_type": model_type,
             "component": component,

@@ -46,6 +46,9 @@ h3_keyframes = "mlx_h3_keyframes"
 # 本地 config.json 内容；未知名称不会猜测成 2.1，宁可继续由调用方按原有路径
 # 报「找不到权重」。
 QWEN_IMAGE_21_FAMILY = "qwen_image_21"
+# Qwen-Image 2.1 的 Qwen3-VL text_config.max_position_embeddings。
+# 该值包含提示词模板和编辑模式中的视觉 token；不要再用 512/4096 这类过小的工作流默认值。
+QWEN_IMAGE_21_MAX_LENGTH = 262_144
 QWEN_IMAGE_FAMILY = "qwen_image"
 QWEN_EDIT_FAMILY = "qwen_edit"
 
@@ -278,7 +281,7 @@ class MlxVaeHandle:
 
 @dataclass(frozen=True)
 class MlxH3VisualCondition:
-    """MiniMax-H3 的视觉条件：有序图片 + 可选的首 / 尾帧 latent 锚点。
+    """MiniMax-H3 的视觉条件：图片、首 / 尾帧锚点，或完整参考视频。
 
     图片本体不进 handle：按 ``images_key`` 存在 cache.py 的 ``h3_keyframe_source``
     桶里（值是 ``tuple[PIL.Image, ...]``，顺序 = presentation 里 ``<Picture i>``
@@ -291,6 +294,8 @@ class MlxH3VisualCondition:
 
     - ``anchors`` 为空 = **纯参考**：图只进 Qwen3-VL 的 presentation（视觉提示），
       不占 latent 行 —— 这是「多张图片参考生视频」在本模型上唯一的通路；
+      ``source="motion_reference_with_picture"`` 时，图片仍只进 presentation，
+      但同时还有一段完整动作参考视频（视频 latent 作为固定 reference block）；
     - 有锚点时，被点名的那几张图必须已经按目标画布（``width`` × ``height``）
       用 LANCZOS 拉伸过，这样 Qwen3-VL 与 Video VAE 看到的是同一份像素；
       没被点名的参考图保留自己的尺寸（``preprocess_image`` 会各自 smart-resize）。
@@ -311,12 +316,17 @@ class MlxH3VisualCondition:
     width: int = 0  # 目标画布（必须与采样器一致）
     height: int = 0
     digest: str = ""  # 有序图片 + 锚点 + 画布的摘要（进缓存键）
-    source: str = "keyframe"  # "keyframe" | "reference" | "video"
+    source: str = "keyframe"  # "keyframe" | "reference" | "video" | "motion_reference" | "motion_reference_with_picture"
     source_label: str = ""  # 报告 / 排错用：源图片或源视频的名字
     vae: MlxVaeHandle | None = None  # 有锚点时必须有视频 VAE（role=vae）；纯参考可为空
+    # Ref2VA 的完整参考视频。视频帧和 VAE latent 都留在独立缓存桶，避免把大数组
+    # 放进 ComfyUI 会长期持有的节点输出；motion_key 同时覆盖两者的内容摘要。
+    motion_key: str = ""
+    motion_frame_count: int = 0
+    motion_fps: float = 24.0
 
     def __post_init__(self) -> None:
-        if self.picture_count < 1:
+        if self.picture_count < 1 and self.source != "motion_reference":
             raise ValueError(f"H3 视觉条件至少需要 1 张图，收到 {self.picture_count} 张")
         if not self.images_key:
             raise ValueError("H3 视觉条件必须带图片缓存键（图片本体留在 cache.py）")
@@ -351,6 +361,11 @@ class MlxH3VisualCondition:
                 "H3 视觉条件必须使用 minimax_h3 的视频 VAE（role=vae），"
                 f"收到 model_type={self.vae.model_type!r}, role={self.vae.role!r}"
             )
+        if self.source in {"motion_reference", "motion_reference_with_picture"}:
+            if not self.motion_key or self.motion_frame_count < 5:
+                raise ValueError("H3 动作参考必须带至少 5 帧的完整视频条件")
+            if self.vae is None:
+                raise ValueError("H3 动作参考必须接视频 VAE，以编码完整参考视频")
 
 
 @dataclass(frozen=True)

@@ -65,6 +65,50 @@ def preprocess_image(
     return np.ascontiguousarray(patches.reshape(grid_h * grid_w, -1)), (1, grid_h, grid_w)
 
 
+def preprocess_video_pair(
+    frames: tuple[PIL.Image.Image, PIL.Image.Image] | list[PIL.Image.Image],
+    patch_size: int = 16,
+    merge_size: int = 2,
+    temporal_patch_size: int = 2,
+    min_pixels: int = 3136,
+    max_pixels: int = 12845056,
+) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """Encode two consecutive RGB frames into one real temporal Qwen3-VL block.
+
+    ``preprocess_image`` deliberately repeats one image over the temporal axis for
+    image conditioning. Ref2VA is different: the two slices must contain the two
+    actual frames, otherwise motion is erased before the vision tower sees it.
+    """
+    if len(frames) != 2:
+        raise ValueError(f"Qwen3-VL 的视频 temporal patch 必须恰好有 2 帧，收到 {len(frames)} 帧")
+    first, second = (frame.convert("RGB") for frame in frames)
+    height, width = first.height, first.width
+    if second.size != first.size:
+        second = second.resize(first.size, PIL.Image.Resampling.BICUBIC)
+    height, width = smart_resize(height, width, patch_size * merge_size, min_pixels, max_pixels)
+    if (width, height) != first.size:
+        first = first.resize((width, height), PIL.Image.Resampling.BICUBIC)
+        second = second.resize((width, height), PIL.Image.Resampling.BICUBIC)
+    pixels = np.stack(
+        [np.asarray(first, dtype=np.float32), np.asarray(second, dtype=np.float32)], axis=0
+    )
+    pixels = (pixels / 255.0 - IMAGE_MEAN) / IMAGE_STD  # (T, H, W, C)
+    pixels = pixels.transpose(0, 3, 1, 2)  # (T, C, H, W)
+    grid_h, grid_w = height // patch_size, width // patch_size
+    patches = pixels.reshape(
+        temporal_patch_size,
+        3,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.transpose(2, 5, 3, 6, 1, 0, 4, 7)
+    return np.ascontiguousarray(patches.reshape(grid_h * grid_w, -1)), (1, grid_h, grid_w)
+
+
 def vision_position_ids(grid_thw: tuple[int, int, int], merge_size: int) -> np.ndarray:
     """`(N, 2)` (h, w) patch coordinates in spatial-merge-block order, repeated over the temporal grid."""
     t, h, w = grid_thw

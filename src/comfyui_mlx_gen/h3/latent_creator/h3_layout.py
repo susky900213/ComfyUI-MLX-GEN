@@ -12,6 +12,7 @@ as upstream does and cast to float32 where the transformer consumes them.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -204,6 +205,14 @@ def _frame_position_grid(
     return np.stack([hh.reshape(-1), ww.reshape(-1)], axis=-1), width_grid
 
 
+def _video_time_span(num_latent_frames: int) -> float:
+    """Timeline span occupied by a reference video latent block."""
+    spans = np.ones(num_latent_frames, dtype=np.float64) * _ROPE_FRAME_RESCALE
+    for offset in range(len(_ROPE_FRAMES_PER_LATENT)):
+        spans[offset :: len(_ROPE_FRAMES_PER_LATENT)] *= _ROPE_FRAMES_PER_LATENT[offset]
+    return float(spans.sum())
+
+
 @dataclass(frozen=True)
 class H3PackedLayout:
     """Structural description of one packed MiniMax-H3 sequence, shared by every batch item."""
@@ -234,12 +243,25 @@ def build_packed_sequence(
     patch_size: tuple[int, int, int] = (1, 2, 2),
     audio_channels: int = AUDIO_CHANNELS,
     keyframe_anchors: tuple[str, ...] = (),
+    reference_latents: tuple[Any, ...] = (),
 ) -> H3PackedLayout:
-    """Build the `[text | keyframe conditions | target audio | target video]` layout of `t2va` / `fl2va`."""
+    """Build `[text | keyframes | reference video | target audio | target video]`.
+
+    Reference video rows are fixed visual context. They are inserted before the target
+    streams and remain in the packed attention sequence on every denoising step.
+    """
     _, patch_h, patch_w = patch_size
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     num_text_tokens = int(text_token_tags.shape[0])
-    num_condition_rows = len(keyframe_anchors) * rows_per_frame
+    reference_shapes = [tuple(int(v) for v in latent.shape[2:]) for latent in reference_latents]
+    for shape in reference_shapes:
+        if len(shape) != 3:
+            raise ValueError(f"H3 参考视频 latent 必须是 (F,H,W)，收到 {shape}")
+        if shape[1] % patch_h or shape[2] % patch_w:
+            raise ValueError(f"H3 参考视频 latent 空间尺寸必须能被 patch {patch_size} 整除，收到 {shape}")
+    reference_rows = sum((frames * (height_i // patch_h) * (width_i // patch_w))
+                         for frames, height_i, width_i in reference_shapes)
+    num_condition_rows = len(keyframe_anchors) * rows_per_frame + reference_rows
     num_audio_rows = num_audio_latents * audio_channels
     num_video_rows = num_latent_frames * rows_per_frame
     sequence_length = num_text_tokens + num_condition_rows + num_audio_rows + num_video_rows
@@ -251,21 +273,37 @@ def build_packed_sequence(
     position_ids[:num_text_tokens, 0] = np.arange(num_text_tokens, dtype=np.float64)
 
     frame_grid, width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+    # Official Ref2VA puts reference blocks on a timeline immediately after text.
+    # The row order remains keyframes first, then references, so all condition rows
+    # can still be kept in one prefix slice by the MLX sampler.
+    reference_start = condition_start + len(keyframe_anchors) * rows_per_frame
+    cursor = float(num_text_tokens)
+    reference_offset = reference_start
+    for frames_i, height_i, width_i in reference_shapes:
+        ref_grid, _ = _frame_position_grid(height_i, width_i, patch_h, patch_w)
+        count = frames_i * ref_grid.shape[0]
+        rows = slice(reference_offset, reference_offset + count)
+        positions = np.empty((frames_i, ref_grid.shape[0], 3), dtype=np.float64)
+        positions[:, :, 0] = _temporal_position_grid(frames_i, cursor)[:, None]
+        positions[:, :, 1:] = ref_grid[None]
+        position_ids[rows] = positions.reshape(-1, 3)
+        reference_offset += count
+        cursor += _video_time_span(frames_i)
     for index, anchor in enumerate(keyframe_anchors):
         if anchor == "first":
-            anchor_time = float(num_text_tokens)
+            anchor_time = cursor
         elif anchor == "last":
             spans = np.ones(num_latent_frames, dtype=np.float64) * _ROPE_FRAME_RESCALE
             for offset in range(len(_ROPE_FRAMES_PER_LATENT)):
                 spans[offset :: len(_ROPE_FRAMES_PER_LATENT)] *= _ROPE_FRAMES_PER_LATENT[offset]
-            anchor_time = float(num_text_tokens) + float(spans.sum()) - _ROPE_FRAME_RESCALE
+            anchor_time = cursor + float(spans.sum()) - _ROPE_FRAME_RESCALE
         else:
             raise ValueError(f"A keyframe anchor must be 'first' or 'last', got {anchor!r}.")
         rows = slice(condition_start + index * rows_per_frame, condition_start + (index + 1) * rows_per_frame)
         position_ids[rows, 0] = anchor_time
         position_ids[rows, 1:] = frame_grid
 
-    audio_time = float(num_text_tokens) + np.arange(num_audio_latents, dtype=np.float64)
+    audio_time = cursor + np.arange(num_audio_latents, dtype=np.float64)
     position_ids[audio_start:video_start, 0] = np.tile(audio_time, audio_channels)
     position_ids[audio_start:video_start, 2] = np.concatenate(
         [
@@ -275,7 +313,7 @@ def build_packed_sequence(
     )
 
     video_positions = np.empty((num_latent_frames, rows_per_frame, 3), dtype=np.float64)
-    video_positions[:, :, 0] = _temporal_position_grid(num_latent_frames, float(num_text_tokens))[:, None]
+    video_positions[:, :, 0] = _temporal_position_grid(num_latent_frames, cursor)[:, None]
     video_positions[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_positions.reshape(-1, 3)
 

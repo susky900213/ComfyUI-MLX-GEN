@@ -204,6 +204,10 @@ ComfyUI**，浏览器刷新不会重新生成 Loader 下拉列表。
    时逐 shard 在线转换为 MLX q8，以降低统一内存占用；不会改写磁盘上的官方文件。VAE 是
    卷积网络，保持 `quantize=0`。
 
+   如果要保留 Qwen-Image 2.1 文本编码器的 16bit 精度，在 `MLX CLIP 加载` 中选择
+   `precision=MLX 16bit`，并把该节点的 `quantize` 设为 `0`。`MLX 16bit` 在内部映射为
+   MLX `float16`；`quantize` 是独立开关，仍设为 4 或 8 时会继续执行在线量化。
+
 4. 在正向 `MLX 文本编码器` 中填写提示词。负向节点可以保留单个空格；当
    `guidance=1.0` 时负向条件不会参与采样。
 5. 先保持示例参数进行验证：
@@ -218,6 +222,51 @@ ComfyUI**，浏览器刷新不会重新生成 Loader 下拉列表。
 官方模型卡以 2048×2048、40 步为示例，并列出 4:3、3:4、3:2、2:3、16:9 和 9:16 等
 比例；本插件工作流为了先控制 Apple 统一内存占用，默认从 1024×1024 开始。确认正常后再
 逐步提高分辨率。
+
+## 5.2 Qwen-Image 2.1 PE 提示词增强（MLX-VLM / Transformers）
+
+`MlxQwenImagePET2I` 和 `MlxQwenImagePEI2I` 是独立的提示词重写节点，不是 Qwen-Image
+主模型的 `text_encoder`。它们输出 `rewritten_prompt`，可以连接到正向
+`MlxTextEncoder.prompt`。
+
+本插件支持以下加载类型：
+
+| 加载类型 | 适用目录 | 依赖 | `system_prompt.txt` |
+| --- | --- | --- | --- |
+| `MLX-VLM (4bit)` / `MLX-VLM (8bit)` | `Qwen-Image-2.1-PE-*-MLX` 的 `4bit/` 或 `8bit/` | `mlx-vlm` | 不要求；若同目录下安装了对应官方 Transformers PE，会自动复用其 system prompt |
+| `MLX 16bit` | MLX checkpoint 的 `16bit/` 子目录；若不存在则使用 checkpoint 根目录的 FP16/BF16 权重 | `mlx-vlm` | 不要求；若同目录下安装了对应官方 Transformers PE，会自动复用其 system prompt |
+| `Transformers` | 官方 `Qwen/Qwen-Image-2.1-PE-T2I` 或 `PE-I2I` snapshot | `torch`、`transformers` | 必须存在 |
+
+你的 MLX checkpoint 应保持完整目录，不要只复制 safetensors：
+
+```text
+text_encoder/Image-2.1-PE-T2I-MLX/
+├── 4bit/
+│   ├── config.json
+│   ├── chat_template.jinja
+│   ├── tokenizer.json
+│   ├── tokenizer_config.json
+│   ├── model.safetensors.index.json
+│   └── model-*.safetensors
+├── 8bit/                         # 可选
+└── 16bit/                        # 可选；也可以把非量化权重直接放在根目录
+```
+
+节点下拉只扫描 `text_encoder/` 的直接子目录，不会把 `4bit/`、`8bit/`、`16bit/` 等嵌套目录显示为
+独立模型。T2I 节点只能选择 `PE-T2I`，I2I 节点只能选择 `PE-I2I`；代码会在执行时再次校验，
+因此旧工作流中的 stale dropdown 值不会被错误地送入另一种模型。I2I 节点还必须连接
+`IMAGE`；T2I 节点不需要图片。
+
+安装依赖后**完整重启 ComfyUI**，再在节点中选择 `model_path` 和 `loader_type`：
+
+```bash
+/你的/ComfyUI/.venv/bin/python -m pip install -r requirements.txt
+```
+
+如果选择 `Transformers`，缺少 `system_prompt.txt` 会得到明确的文件错误；如果使用
+你当前的 `prithivMLmods/...-MLX` checkpoint，请根据权重目录选择 `MLX-VLM (4bit)`、
+`MLX-VLM (8bit)` 或 `MLX 16bit`，不需要手工复制或修改 MLX snapshot。`MLX 16bit`
+由 `mlx-vlm` 按 checkpoint 配置自动加载非量化 FP16/BF16 safetensors，不会执行额外量化。
 
 ### 5.1 生成透明 RGBA 图片
 
@@ -342,8 +391,12 @@ Load Image 3 ─┘
 
 ### 报 `max_length` 不够
 
-编辑条件包含提示词和每张参考图的视觉 token。缩短提示词/减少参考图，或提高
-`MLX CLIP 加载.max_length`。示例文生图使用 512，编辑工作流使用 4096。
+Qwen-Image 2.1 的 `text_config.max_position_embeddings` 是 **262144**。本仓库的
+`MLX 条件加载器.max_length` 默认值和最大值都已设为 262144，T2I、单图编辑和多图编辑
+工作流也使用这个值，不会再用 512/4096 这种过小值限制 PE 重写后的提示词。其他模型如
+有需要仍可手动把该值调小。编辑模式中参考图的视觉 token 也占用这个总上下文窗口；如果
+同时连接很多高分辨率参考图仍然超限，需要减少参考图或降低参考图尺寸，而不是继续增大
+超过模型上限的数值。
 
 ### 报缺少权重、shape 不符或只下载了几 MB
 

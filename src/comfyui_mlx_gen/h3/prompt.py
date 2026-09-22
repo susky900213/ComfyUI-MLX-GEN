@@ -91,11 +91,15 @@ def encode_presentation(
     tokenizer: Any,
     prompt: str,
     keyframes: Sequence[Any] = (),
+    motion_frames: Sequence[Any] = (),
+    motion_timestamps: Sequence[float] = (),
 ) -> tuple[Any, np.ndarray]:
     """编码 presentation，返回 `(embeds (1, L, 5120), tags (L,) int32)`。
 
-    `keyframes` 只供二期的图生视频使用：每张图会变成
-    `<Picture i>: ` + `<|vision_start|>` + `<|image_pad|> × N` + `<|vision_end|>`。
+    `keyframes` 是按顺序编号的 `<Picture N>` 图片参考；`motion_frames` 是按 2 fps
+    抽样的动作参考帧，每两个相邻帧组成一个真正的 temporal patch，并以
+    `<Video 1>` / `<T seconds>` 标签写进 presentation。两者可以同时存在，图片块
+    排在视频块之前，分别占用自己的视觉槽。
     """
     ids: list[int] = []
     tags: list[int] = []
@@ -115,6 +119,36 @@ def encode_presentation(
             patches.append(frame_patches)
             grids.append(grid)
             label = token_ids(tokenizer, f"<Picture {index + 1}>: ")
+            num_image_tokens = (grid[0] * grid[1] * grid[2]) // (merge * merge)
+            vision = [VISION_START_TOKEN_ID] + [IMAGE_TOKEN_ID] * num_image_tokens + [VISION_END_TOKEN_ID]
+            ids += label + vision
+            tags += [TEXT_TAG] * len(label) + [VIDEO_TAG] * len(vision)
+
+    if motion_frames:
+        from comfyui_mlx_gen.h3.model.h3_text_encoder.qwen3_vl_model import (
+            IMAGE_TOKEN_ID,
+            VISION_END_TOKEN_ID,
+            VISION_START_TOKEN_ID,
+        )
+        from comfyui_mlx_gen.h3.model.h3_text_encoder.qwen3_vl_vision_model import preprocess_video_pair
+
+        if len(motion_frames) < 2:
+            raise ValueError("H3 动作参考 presentation 至少需要 2 帧")
+        timestamps = list(motion_timestamps) if motion_timestamps else [i / 2.0 for i in range(len(motion_frames))]
+        if len(timestamps) != len(motion_frames):
+            raise ValueError("H3 动作参考的时间戳数量必须与抽样帧数量一致")
+        if len(motion_frames) % 2:
+            motion_frames = tuple(motion_frames) + (motion_frames[-1],)
+            timestamps.append(timestamps[-1])
+        merge = int(text_encoder.visual.spatial_merge_size)
+        ids += token_ids(tokenizer, "<Video 1>: ")
+        tags += [TEXT_TAG] * len(token_ids(tokenizer, "<Video 1>: "))
+        for index in range(0, len(motion_frames), 2):
+            block_time = (float(timestamps[index]) + float(timestamps[index + 1])) / 2.0
+            label = token_ids(tokenizer, f"<{block_time:.1f} seconds>")
+            frame_patches, grid = preprocess_video_pair((motion_frames[index], motion_frames[index + 1]))
+            patches.append(frame_patches)
+            grids.append(grid)
             num_image_tokens = (grid[0] * grid[1] * grid[2]) // (merge * merge)
             vision = [VISION_START_TOKEN_ID] + [IMAGE_TOKEN_ID] * num_image_tokens + [VISION_END_TOKEN_ID]
             ids += label + vision

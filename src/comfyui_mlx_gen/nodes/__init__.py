@@ -7,6 +7,8 @@ from .h3_keyframes import (
     MlxH3KeyframeCondition,
     MlxH3MultiReferenceCondition,
     MlxH3VideoCondition,
+    MlxH3MotionReferenceCondition,
+    MlxH3MotionReferenceWithImageCondition,
 )
 from .h3_two_stage import (
     MlxH3FirstPassSampler,
@@ -24,6 +26,7 @@ from .vae_loader import MlxVAELoader
 from .save import MlxSaveImage
 from .pil_to_torch import MlxPilToTorch
 from .whisper_transcribe import MlxWhisperTranscribe
+from .qwen_image_pe import MlxQwenImagePEI2I, MlxQwenImagePET2I
 
 __all__ = [
     "MlxBreezeSampler",
@@ -31,6 +34,8 @@ __all__ = [
     "MlxH3KeyframeCondition",
     "MlxH3MultiReferenceCondition",
     "MlxH3VideoCondition",
+    "MlxH3MotionReferenceCondition",
+    "MlxH3MotionReferenceWithImageCondition",
     "MlxH3FirstPassSampler",
     "MlxH3LatentUpscaler",
     "MlxH3SecondPassSampler",
@@ -48,4 +53,6 @@ __all__ = [
     "MlxSaveImage",
     "MlxPilToTorch",
     "MlxWhisperTranscribe",
+    "MlxQwenImagePET2I",
+    "MlxQwenImagePEI2I",
 ]

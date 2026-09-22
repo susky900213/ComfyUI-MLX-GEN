@@ -30,6 +30,8 @@ _TYPE_CAPS: dict[str, int] = {
     "h3_prompt": 4,
     # 首帧 / 尾帧经目标画布 LANCZOS 拉伸后的 PIL；当前条件 + 刚替换的一份
     "h3_keyframe_source": 2,
+    # Ref2VA 动作参考：完整源视频帧 + 2 fps presentation 采样帧；只保留当前一份
+    "h3_motion_source": 1,
     # 一次视频生成 = 一条（视频行 + 音频行 + 计划，几 GB 量级，只留最近的一份）
     "h3_latents": 1,
     # --- YuE2（主模型与 VAE 分阶段物化，任一时刻通常只有一条）---
@@ -37,6 +39,11 @@ _TYPE_CAPS: dict[str, int] = {
     # --- Breeze-TTS-2（完整 checkpoint 一次加载；生成后只保留最终 24 kHz 波形）---
     "breeze_module": 1,
     "breeze_waveform": 2,
+    # Qwen-Image 2.1 PE 的 PyTorch/Transformers bundle；T2I / I2I 分桶，互不挤占。
+    "qwen_image_pe_t2i_module": 2,
+    "qwen_image_pe_i2i_module": 2,
+    "qwen_image_pe_mlx_vlm_t2i_module": 2,
+    "qwen_image_pe_mlx_vlm_i2i_module": 2,
 }
 
 
@@ -55,7 +62,8 @@ class Cache:
         bucket[key] = value
         cap = _TYPE_CAPS.get(type_, 4)
         while len(bucket) > cap:
-            bucket.popitem(last=False)
+            _old_key, old_value = bucket.popitem(last=False)
+            _dispose(old_value)
             _flush_mlx()
         return value, False
 
@@ -74,7 +82,8 @@ class Cache:
         bucket = self._data.get(type_, OrderedDict())
         if key not in bucket:
             return False
-        del bucket[key]
+        value = bucket.pop(key)
+        _dispose(value)
         _flush_mlx()
         return True
 
@@ -86,6 +95,17 @@ def _flush_mlx() -> None:
     from . import runtime
 
     runtime.flush_caches()
+
+
+def _dispose(value: Any) -> None:
+    """调用缓存对象的可选释放钩子。"""
+    close = getattr(value, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[cache] 释放缓存对象失败，继续清理：{exc}")
 
 
 CACHE = Cache()

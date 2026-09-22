@@ -464,6 +464,9 @@ def derive_visual_condition(visual: Any, width: int, height: int, cache: Any) ->
         source=visual.source,
         source_label=visual.source_label,
         vae=visual.vae,
+        motion_key=visual.motion_key,
+        motion_frame_count=int(visual.motion_frame_count),
+        motion_fps=float(visual.motion_fps),
     )
 
 
