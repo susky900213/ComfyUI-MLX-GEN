@@ -56,7 +56,7 @@ Load Audio ─┬→ MlxWhisperTranscribe → STRING → MlxBreezeSampler.ref_te
 示例默认使用：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/transformer/whisper-large-v3-mlx
+~/ComfyUI-Shared/models/mlx/transformer/whisper-large-v3-mlx
 ```
 
 `MlxWhisperTranscribe` 只扫描本地 `transformer/` 中同时包含 `config.json` 和
@@ -80,7 +80,7 @@ checkpoint 目录**放入或软链接到 transformer 目录。目录必须保留
 `model_type` 应为 `breeze_tts`：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+~/ComfyUI-Shared/models/mlx/
 └── transformer/Breeze-TTS-2-mlx-4bit -> <完整 Hugging Face snapshot>
 ```
 
@@ -170,7 +170,7 @@ vae.safetensors
 `YuE2-3B-MLX-4bit`：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+~/ComfyUI-Shared/models/mlx/
 ├── transformer/YuE2-3B-MLX-4bit -> <HF snapshot>/4bit
 └── vae/YuE2-3B-MLX-4bit         -> <HF snapshot>/4bit
 ```
@@ -256,13 +256,13 @@ workflows/minimax-h3-two-stage-upscale-lora.json  # 同上 + 8 步加速 LoRA（
 默认工作流使用 640×352、124 帧（24 fps）和 50 步；只有
 `minimax-h3-all-reference-to-video.json` 例外——它把「MLX 模型 LoRA」接在
 transformer 与采样器之间，用 `minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors`
-并把 steps 改成 4（导进去前确认 `/Users/apple/ComfyUI-Shared/models/mlx/lora/` 里确实有这个文件；
+并把 steps 改成 4（导进去前确认 `~/ComfyUI-Shared/models/mlx/lora/` 里确实有这个文件；
 同目录的 `..._fl2v_...` 是首 / 尾帧（FL2VA）任务用的，`..._taomate_3step_...`
 只写了步数、没写适用任务，都别照抄参考工作流换过来）。H3 的 transformer、Qwen3-VL
 文本编码器、tokenizer、视频 VAE 与音频 VAE 是五个独立组件；常规目录布局如下：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+~/ComfyUI-Shared/models/mlx/
 ├── transformer/MiniMax-H3/          # 或 MiniMax-H3-MLX-8bit（预量化，见下）
 ├── transformer/MiniMax-H3-ref/      # 参考生视频（Ref2VA）用的 REF transformer
 ├── text_encoder/MiniMax-H3/         # text_encoder_back
@@ -287,7 +287,7 @@ Transformer 也可以直接使用
 的原生 MLX 预量化 checkpoint，而不需要先反量化再重新量化。它只替换上面第一项：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/transformer/
+~/ComfyUI-Shared/models/mlx/transformer/
 └── MiniMax-H3-MLX-8bit -> <HF cache>/models--pipenetwork--MiniMax-H3-MLX-8bit
 ```
 
@@ -330,7 +330,7 @@ workflows/ideogram-4-fp8.json
 `ideogram-4-fp8`。官方 checkpoint 有五个本地组件：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+~/ComfyUI-Shared/models/mlx/
 ├── transformer/ideogram-4-fp8/               # conditional transformer
 ├── unconditional_transformer/ideogram-4-fp8/ # unconditional transformer
 ├── text_encoder/ideogram-4-fp8/
@@ -367,7 +367,7 @@ Qwen-Image 2.1 使用独立的 `qwen_image_21` 大类，不会回退到旧版 25
 官方仓库的 tokenizer 位于 `processor/`，因此本地 `tokenizer/Qwen-Image-2.1` 应指向它：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+~/ComfyUI-Shared/models/mlx/
 ├── transformer/Qwen-Image-2.1 -> <官方模型>/transformer
 ├── text_encoder/Qwen-Image-2.1 -> <官方模型>/text_encoder
 ├── tokenizer/Qwen-Image-2.1 -> <官方模型>/processor
@@ -423,7 +423,7 @@ workflows/qwen-image-2512.json
 四类组件应放在插件使用的模型根目录下，并使用相同的权重集目录名：
 
 ```text
-/Users/apple/ComfyUI-Shared/models/mlx/
+~/ComfyUI-Shared/models/mlx/
 ├── transformer/qwen-image-2512-8bit/
 
 ### H3 完整参考视频动作迁移
@@ -516,7 +516,7 @@ python -m pip show mlx mflux
 ## Transformer LoRA
 
 `MlxModelLoraApply` 已接入真实推理链路。LoRA 文件放在
-`/Users/apple/ComfyUI-Shared/models/mlx/lora/`，可串联多个节点后再接
+`~/ComfyUI-Shared/models/mlx/lora/`，可串联多个节点后再接
 `MlxKSamplerMLX.model`。支持以下模型家族：
 
 - Z-Image：`ZImageLoRAMapping`；
