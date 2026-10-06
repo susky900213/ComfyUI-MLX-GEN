@@ -376,6 +376,68 @@ YuE2 没有需要单独放置的文本编码器；`MlxClipLoader` 会把名称�
 插件也兼容指向 `model.safetensors` 和 `vae.safetensors` 的单文件软链接，但目录软链接更不易
 出错，因为插件还需要从同级目录读取配置、tokenizer 和另一组权重。
 
+#### 使用原曲作为旋律参考
+
+导入：
+
+```text
+workflows/yue2-3b-melody-reference.json
+```
+
+连线是：
+
+```text
+LoadAudio（原曲）
+  → MlxYue2MelodyFromAudio（单旋律近似 → ABC）
+  → MlxKSamplerMLX.abc（YuE2 外部 ABC 条件）
+```
+
+YuE2-3B-MLX 原生支持的是文本、歌词和可选 ABC 乐谱条件；它没有把 WAV/MP3 直接作为
+melody audio prompt 的输入，也不是音频续写接口。因此本插件先对原曲取单声道、重采样，
+用短时自相关估计主音高，再按八分音符量化成 ABC。这会参考旋律走向，但不会把原曲音频、
+原曲伴奏或原曲音色送入 YuE2。
+
+节点参数建议：
+
+- `bpm`：原曲速度；默认 100，若节拍不匹配会导致旋律时间轴偏移；
+- `max_seconds`：只分析原曲前 N 秒，默认 60；先用 10–30 秒验证更快；
+- `min_note_hz` / `max_note_hz`：主旋律音域，默认 65–1000 Hz；
+- `gate`：相对峰值的静音门限，伴奏很满时可适当提高。
+
+这是一种启发式单旋律提取，不是专业扒谱。清晰独唱、单音旋律或旋律乐器效果最好；
+完整混音、和弦、鼓组和多人声可能产生八度跳变或错误音符。遇到这种情况，可以调整
+参数，或断开 `MlxYue2MelodyFromAudio`，把一个手写 ABC `STRING` 节点接到采样器的
+`abc`。采样器连接了 `abc` 后会跳过自动 ABC 规划，`cot` 必须选择 `melody` 或 `full`；
+不连接 `abc` 时则保持原有的自动规划行为。
+
+#### 使用 ABC 文件生成歌曲
+
+如果已经有手写或专业扒谱得到的 ABC 文件，导入：
+
+```text
+workflows/yue2-3b-abc-file.json
+```
+
+把文件放入 ComfyUI 的 `input/` 目录，例如：
+
+```text
+<ComfyUI>/input/abc/your_song.abc
+```
+
+在 `MlxYue2LoadABC` 节点中填写相对路径 `abc/your_song.abc`。该节点只读取 `input/`
+目录以内的 `.abc` 文件，会检查 `X:`、`K:` 头部和音符主体，然后把完整 ABC 文本连接到
+`MlxKSamplerMLX.abc`。工作流已经将 `cot` 设为 `melody`，因此会跳过自动旋律规划，直接
+使用文件中的旋律；不要把 `cot` 改成 `off`。正向节点填写 style（曲风、乐器、演唱），
+负向节点实际填写 lyrics（歌词，不是传统扩散模型里的负向提示词）。
+
+该节点默认按 UTF-8 读取并统一换行；如果 ABC 文件编码不是 UTF-8，请先转换编码。文件
+内容改变后节点会重新执行，不会沿用旧的 ABC prompt cache。
+
+该示例的 Loader 默认值是当前仓库本机可扫描的 8-bit 单文件软链接：
+`YuE2-3B-MLX-8bit.safetensors` 与 `YuE2-3B-MLX-8bit-vae.safetensors`。如果本地使用
+完整目录、4-bit 或 bf16 变体，导入后请在 CLIP / Transformer / VAE 三个 Loader 中
+同时改为同一变体的实际名称，并按 checkpoint 选择 `quantize`。
+
 ### 2.5 Breeze-TTS-2
 
 Breeze checkpoint 已经包含主模型、文本编码器与 audio tokenizer。完整 checkpoint 只需放入

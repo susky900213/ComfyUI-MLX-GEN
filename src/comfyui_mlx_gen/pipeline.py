@@ -2040,6 +2040,7 @@ def run_yue2_sampler(entry, model_handle, comps, params: dict[str, Any], cache) 
             steps=int(params["steps"]),
             max_tokens=int(params["max_tokens"]),
             cfg_scale=float(params["guidance"]),
+            abc=params.get("abc"),
             log=print,
             on_progress=progress.update_absolute,
         )
@@ -2063,7 +2064,12 @@ def run_yue2_sampler(entry, model_handle, comps, params: dict[str, Any], cache) 
         duration=float(duration),
         audio_num_rows=int(latents.shape[0]),
         prompt_digest=runtime.cache_key(
-            {"style": params["style"], "lyrics": params["lyrics"], "cot": params["cot"]}
+            {
+                "style": params["style"],
+                "lyrics": params["lyrics"],
+                "cot": params["cot"],
+                "abc": params.get("abc"),
+            }
         ),
     )
 

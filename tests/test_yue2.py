@@ -32,6 +32,8 @@ from comfyui_mlx_gen.types import (  # noqa: E402
     model_types,
 )
 from comfyui_mlx_gen.yue2 import pipeline as yue2_pipeline  # noqa: E402
+from comfyui_mlx_gen.yue2_melody import audio_to_abc, validate_abc  # noqa: E402
+from comfyui_mlx_gen.nodes import yue2_abc as yue2_abc_node  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -109,6 +111,39 @@ check(
     {"MlxClipLoader", "MlxTextEncoder", "MlxTransformerLoader", "MlxKSamplerMLX",
      "MlxVAELoader", "MlxVAEDecoder", "MlxPilToTorch"} <= set(NODE_CLASS_MAPPINGS)
     and not any("YuE" in name for name in NODE_CLASS_MAPPINGS),
+)
+check(
+    "注册原曲旋律 → ABC 节点",
+    "MlxYue2MelodyFromAudio" in NODE_CLASS_MAPPINGS,
+)
+check(
+    "注册 ABC 文件 → YuE2 节点",
+    "MlxYue2LoadABC" in NODE_CLASS_MAPPINGS,
+)
+
+check(
+    "ABC 基本头部与音符校验",
+    validate_abc("X:1\nT:test\nK:C\nC D E F|G A B c|\n").startswith("X:1"),
+)
+check_raises(
+    "ABC 缺少音符主体会被拒绝",
+    ValueError,
+    "没有音符",
+    lambda: validate_abc("X:1\nK:C\n"),
+)
+
+melody_rate = 16_000
+melody_time = np.arange(melody_rate * 2, dtype=np.float32) / melody_rate
+melody_wave = np.sin(2 * np.pi * 440.0 * melody_time)[None, None, :]
+melody_abc = audio_to_abc(
+    {"waveform": melody_wave, "sample_rate": melody_rate},
+    bpm=120,
+    max_seconds=2,
+)
+check(
+    "原曲单音频可提取为 YuE2 ABC",
+    "Q:1/4=120" in melody_abc and ("A" in melody_abc or "a" in melody_abc),
+    melody_abc,
 )
 
 
@@ -204,6 +239,7 @@ try:
         scheduler="yue2_midpoint",
         cot="melody",
         max_tokens=200,
+        abc=melody_abc,
     )
 finally:
     sampler_module.CACHE = old_cache
@@ -217,7 +253,8 @@ check(
     and captured == {
         "seed": 17, "steps": 2, "guidance": 1.5,
         "style": "cinematic synthwave", "lyrics": "[Verse]\nHello world",
-        "cot": "melody", "max_tokens": 200, "comps": {"fake": True}, "released": True,
+        "cot": "melody", "max_tokens": 200, "abc": melody_abc,
+        "comps": {"fake": True}, "released": True,
     },
     str(captured),
 )
@@ -371,12 +408,26 @@ check(
     and generation_config["semantic"]["min_tokens"] == 200,
     json.dumps(generation_config, ensure_ascii=False),
 )
+check_raises(
+    "YuE2 外部 ABC 禁止与 cot=off 混用",
+    ValueError,
+    "外部 ABC 需要 cot=melody 或 full",
+    lambda: yue2_pipeline.generate_music_latents(
+        object(), object(), {}, "style", "lyrics", cot="off", abc="X:1\nK:C\nC\n"
+    ),
+)
 requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 check("requirements 声明 tiktoken>=0.9", "tiktoken>=0.9" in requirements)
 
 
 # --------------------------------------------------------- 6. 示例工作流序列化契约
 workflow = json.loads((ROOT / "workflows" / "yue2-3b.json").read_text(encoding="utf-8"))
+melody_workflow = json.loads(
+    (ROOT / "workflows" / "yue2-3b-melody-reference.json").read_text(encoding="utf-8")
+)
+abc_workflow = json.loads(
+    (ROOT / "workflows" / "yue2-3b-abc-file.json").read_text(encoding="utf-8")
+)
 nodes = workflow["nodes"]
 links = workflow["links"]
 nodes_by_id = {node["id"]: node for node in nodes}
@@ -398,6 +449,40 @@ actual_counts = Counter(node["type"] for node in nodes)
 check("工作流节点种类与数量完整", actual_counts == expected_counts, str(actual_counts))
 custom_types = {name for name in actual_counts if name.startswith("Mlx")}
 check("工作流 MLX 节点均已注册", custom_types <= NODE_CLASS_MAPPINGS.keys())
+
+melody_types = Counter(node["type"] for node in melody_workflow["nodes"])
+check(
+    "原曲旋律参考工作流包含音频输入与 ABC 桥接节点",
+    melody_types["LoadAudio"] == 1
+    and melody_types["MlxYue2MelodyFromAudio"] == 1
+    and any(
+        link[1] == 12 and link[3] == 6 and link[5] == "STRING"
+        for link in melody_workflow["links"]
+    ),
+    str(melody_types),
+)
+
+abc_types = Counter(node["type"] for node in abc_workflow["nodes"])
+abc_sampler = next(node for node in abc_workflow["nodes"] if node["type"] == "MlxKSamplerMLX")
+abc_loader = next(node for node in abc_workflow["nodes"] if node["type"] == "MlxYue2LoadABC")
+check(
+    "ABC 文件工作流包含读取节点并连接采样器",
+    abc_types["MlxYue2LoadABC"] == 1
+    and abc_loader["widgets_values"] == ["abc/your_song.abc"]
+    and any(
+        link[1] == abc_loader["id"]
+        and link[3] == abc_sampler["id"]
+        and link[4] == 4
+        and link[5] == "STRING"
+        for link in abc_workflow["links"]
+    ),
+    str(abc_types),
+)
+check(
+    "ABC 文件工作流使用 melody CoT（外部 ABC 不自动规划）",
+    abc_sampler["widgets_values"][12] == "melody",
+    str(abc_sampler["widgets_values"]),
+)
 
 model_key = "YuE2-3B-MLX-4bit"
 loader_indices = {

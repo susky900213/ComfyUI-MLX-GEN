@@ -131,6 +131,15 @@ class MlxKSamplerMLX:
                     "INT",
                     {"default": 9000, "min": 200, "max": 9000, "step": 100, "advanced": True},
                 ),
+                # 仅 YuE2：官方 --abc-file 的等价入口。可连接「音频 → ABC」节点；
+                # 不接时由 cot=melody/full 自动规划 ABC。
+                "abc": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "YuE2 外部 ABC 旋律；连接后跳过自动 ABC 规划",
+                    },
+                ),
             },
         }
 
@@ -157,6 +166,7 @@ class MlxKSamplerMLX:
         kv_cache="auto",
         cot="full",
         max_tokens=9000,
+        abc=None,
     ):
         if model is None:
             raise ValueError("必须连接 MlxTransformerLoader 的输出")
@@ -313,6 +323,8 @@ class MlxKSamplerMLX:
                 "cot": str(cot),
                 "max_tokens": int(max_tokens),
             }
+            if abc is not None:
+                params["abc"] = str(abc)
             # ComfyUI 可能因下游变化而重跑本节点；相同参数的 latent 若仍在缓存，绝不
             # 为构造同一个 handle 再加载一次 3B 主模型。
             if pipeline.has_yue2_latents(model, params, CACHE):

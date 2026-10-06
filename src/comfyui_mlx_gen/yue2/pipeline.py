@@ -19,6 +19,7 @@ import mlx.core as mx
 
 from .model import KVCache, Yue2Model
 from .vae import audio_samples
+from ..yue2_melody import validate_abc
 
 EOD = 151643
 ABC_START, ABC_END = 151847, 151848
@@ -288,12 +289,19 @@ def generate_music_latents(
     steps: int | None = None,
     max_tokens: int | None = None,
     cfg_scale: float | None = None,
+    abc: str | None = None,
     log: Callable[[str], None] = print,
     on_progress: Callable[[int, int], None] | None = None,
 ):
-    """执行 YuE2 的 ABC 规划、语义 AR 与 NAR，返回 latent 和诊断信息。"""
+    """执行 YuE2 的 ABC 规划、语义 AR 与 NAR，返回 latent 和诊断信息。
+
+    ``abc`` 对齐官方 YuE2 的 ``--abc-file``：传入时直接 tokenize 外部 ABC，
+    不再运行自动 ABC 规划；它仍要求 ``cot`` 为 ``melody`` 或 ``full``。
+    """
     if cot not in INSTRUCTIONS:
         raise ValueError("YuE2 cot 必须是 off、melody 或 full")
+    if abc is not None and cot == "off":
+        raise ValueError("YuE2 外部 ABC 需要 cot=melody 或 full")
     if not style.strip():
         raise ValueError("YuE2 的 style 不能为空（请写在正向 MlxTextEncoder 中）")
     abc_sampling = Sampling(**generation_config["abc"])
@@ -312,18 +320,25 @@ def generate_music_latents(
 
     abc_ids, abc_text = [], None
     if cot != "off":
-        log(f"[YuE2 plan] 正在生成 {cot} ABC 乐谱")
-        abc_ids, truncated = generate_tokens(
-            model,
-            token_prefix(tokenizer, style, lyrics, cot),
-            abc_sampling,
-            seed,
-            "abc",
-            on_token=_progress_logger("abc", log),
-        )
-        abc_text = tokenizer.decode(abc_ids)
-        if truncated:
-            log("[YuE2 plan] ABC 达到 token 上限")
+        if abc is not None:
+            abc_text = validate_abc(str(abc))
+            abc_ids = tokenizer.encode(abc_text)
+            if not abc_ids:
+                raise ValueError("YuE2 外部 ABC 没有可编码的内容")
+            log(f"[YuE2 plan] 使用外部 ABC 旋律（{len(abc_ids)} tokens）")
+        else:
+            log(f"[YuE2 plan] 正在生成 {cot} ABC 乐谱")
+            abc_ids, truncated = generate_tokens(
+                model,
+                token_prefix(tokenizer, style, lyrics, cot),
+                abc_sampling,
+                seed,
+                "abc",
+                on_token=_progress_logger("abc", log),
+            )
+            abc_text = tokenizer.decode(abc_ids)
+            if truncated:
+                log("[YuE2 plan] ABC 达到 token 上限")
 
     prefix = token_prefix(tokenizer, style, lyrics, cot, abc_ids)
     guidance = (1.01 if cot == "off" else 1.0) if cfg_scale is None else float(cfg_scale)

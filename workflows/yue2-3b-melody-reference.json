@@ -1,0 +1,243 @@
+{
+  "id": "mlx-yue2-3b-melody-reference",
+  "revision": 0,
+  "last_node_id": 12,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [40, 40],
+      "size": [380, 240],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "CLIP", "type": "CLIP", "links": [2, 4], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxClipLoader"},
+      "title": "YuE2 tokenizer 句柄（文本节点只透传原文）",
+      "widgets_values": ["yue2", "text_encoder", "YuE2-3B-MLX-8bit.safetensors", "bfloat16", 9000, 0]
+    },
+    {
+      "id": 2,
+      "type": "MlxTextEncoder",
+      "pos": [40, 320],
+      "size": [420, 220],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": 2, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "condition", "type": "condition", "links": [3], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "positive = 新歌风格（不复制原曲音色）",
+      "widgets_values": ["indie pop, warm female vocal, 100 BPM, acoustic guitar, soft drums, original arrangement"]
+    },
+    {
+      "id": 3,
+      "type": "MlxTextEncoder",
+      "pos": [40, 580],
+      "size": [420, 300],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": 4, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "condition", "type": "condition", "links": [5], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "negative = 新歌歌词（不是负向提示词）",
+      "widgets_values": ["[Verse]\nWrite new lyrics here\n\n[Chorus]\nKeep the extracted melody but use an original song"]
+    },
+    {
+      "id": 4,
+      "type": "MlxTransformerLoader",
+      "pos": [500, 40],
+      "size": [380, 240],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "model", "type": "model", "links": [1], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTransformerLoader"},
+      "title": "YuE2-3B 8-bit（checkpoint 决定真实精度）",
+      "widgets_values": ["yue2", "YuE2-3B-MLX-8bit.safetensors", 8, "bfloat16", false, 0]
+    },
+    {
+      "id": 5,
+      "type": "MlxVAELoader",
+      "pos": [500, 320],
+      "size": [380, 220],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "vae", "type": "mlx_vae", "links": [7], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAELoader"},
+      "title": "YuE2 Oobleck VAE（采样结束后才加载）",
+      "widgets_values": ["yue2", "YuE2-3B-MLX-8bit-vae.safetensors", "bfloat16", 8, "vae"]
+    },
+    {
+      "id": 11,
+      "type": "LoadAudio",
+      "pos": [500, 600],
+      "size": [380, 260],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "COMBO", "widget": {"name": "audio"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "AUDIO", "type": "AUDIO", "links": [11], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "LoadAudio"},
+      "title": "选择原曲（仅提取旋律，不把音频直接送入 YuE2）",
+      "widgets_values": [""]
+    },
+    {
+      "id": 12,
+      "type": "MlxYue2MelodyFromAudio",
+      "pos": [930, 600],
+      "size": [430, 360],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 11, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "abc", "type": "STRING", "links": [12], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxYue2MelodyFromAudio"},
+      "title": "原曲 → 单旋律 ABC（短时自相关近似）",
+      "widgets_values": [100.0, 60, 65.0, 1000.0, 0.2]
+    },
+    {
+      "id": 6,
+      "type": "MlxKSamplerMLX",
+      "pos": [1420, 180],
+      "size": [480, 560],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "model", "link": 1, "slot_index": 0},
+        {"name": "positive", "type": "condition", "link": 3, "slot_index": 1},
+        {"name": "negative", "type": "condition", "link": 5, "slot_index": 2},
+        {"name": "abc", "type": "STRING", "link": 12, "slot_index": 4}
+      ],
+      "outputs": [
+        {"name": "latents", "type": "latents", "links": [6], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxKSamplerMLX"},
+      "title": "YuE2：使用原曲提取的旋律 ABC（32 步 / 约 8 秒）",
+      "widgets_values": [42, "randomize", 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0, "auto", "melody", 200]
+    },
+    {
+      "id": 7,
+      "type": "MlxVAEDecoder",
+      "pos": [1940, 220],
+      "size": [360, 260],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 7, "slot_index": 0},
+        {"name": "latents", "type": "latents", "link": 6, "slot_index": 1}
+      ],
+      "outputs": [
+        {"name": "images", "type": "images", "links": [8], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAEDecoder"},
+      "title": "声学 latent → 48 kHz 立体声",
+      "widgets_values": [-1]
+    },
+    {
+      "id": 8,
+      "type": "MlxPilToTorch",
+      "pos": [2340, 220],
+      "size": [340, 180],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "images", "link": 8, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "images", "type": "IMAGE", "links": null, "slot_index": 0},
+        {"name": "masks", "type": "MASK", "links": null, "slot_index": 1},
+        {"name": "audio", "type": "AUDIO", "links": [9, 10], "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxPilToTorch"},
+      "title": "取 AUDIO 输出（IMAGE / MASK 是占位）",
+      "widgets_values": []
+    },
+    {
+      "id": 9,
+      "type": "SaveAudio",
+      "pos": [2720, 120],
+      "size": [360, 260],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 9, "slot_index": 0},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "SaveAudio"},
+      "title": "保存新歌 FLAC（ComfyUI 内置）",
+      "widgets_values": ["audio/ComfyUI-MLX-GEN-yue2-melody-reference"]
+    },
+    {
+      "id": 10,
+      "type": "PreviewAudio",
+      "pos": [2720, 440],
+      "size": [360, 220],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 10, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PreviewAudio"},
+      "title": "试听新歌",
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 4, 0, 6, 0, "model"],
+    [2, 1, 0, 2, 0, "CLIP"],
+    [3, 2, 0, 6, 1, "condition"],
+    [4, 1, 0, 3, 0, "CLIP"],
+    [5, 3, 0, 6, 2, "condition"],
+    [6, 6, 0, 7, 1, "latents"],
+    [7, 5, 0, 7, 0, "mlx_vae"],
+    [8, 7, 0, 8, 0, "images"],
+    [9, 8, 2, 9, 0, "AUDIO"],
+    [10, 8, 2, 10, 0, "AUDIO"],
+    [11, 11, 0, 12, 0, "AUDIO"],
+    [12, 12, 0, 6, 4, "STRING"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.8, "offset": [0, 0]}},
+  "version": "0.4"
+}

@@ -147,6 +147,34 @@ MlxClipLoader
 workflows/yue2-3b.json
 ```
 
+如果要把原曲作为旋律参考，导入下面这份工作流：
+
+```text
+workflows/yue2-3b-melody-reference.json
+```
+
+它使用 `LoadAudio → MlxYue2MelodyFromAudio → MlxKSamplerMLX.abc`：先从原曲估计
+单旋律并转换成 YuE2 官方 `--abc-file` 等价的 ABC 条件，再生成新编曲。原曲 WAV/MP3
+不会作为音频 prompt 直接送进 YuE2，也不会克隆原曲音色；这条链路是“旋律提示”，不是
+原曲续写或 stem 保留。`MlxYue2MelodyFromAudio` 使用 NumPy 短时自相关，适合人声或
+单旋律较清晰的片段；复杂和弦、鼓组、多声部或混音较满时，建议调整 BPM / 音域 / gate，
+或把节点输出替换成手写 ABC。
+
+YuE2 采样器的 `abc` 是可选输入。不连接时，`cot=melody/full` 由模型自动规划 ABC；
+连接后会直接使用外部 ABC，并要求 `cot=melody` 或 `full`，不能与 `cot=off` 混用。
+
+如果已经有扒好的 ABC 文件，导入下面的工作流：
+
+```text
+workflows/yue2-3b-abc-file.json
+```
+
+先把 `.abc` 文件放到 ComfyUI 的 `input/` 目录（例如 `input/abc/your_song.abc`），
+在 `MlxYue2LoadABC` 中填写 `abc/your_song.abc`。节点会读取 UTF-8 文本、检查 `X:`、
+`K:` 和音符主体，再将内容连接到 `MlxKSamplerMLX.abc`；该工作流使用 `cot=melody`，
+不会再次自动规划旋律。生成的歌词仍填写在负向文本节点中，曲风、乐器和演唱方式填写在
+正向 style 节点中。
+
 工作流使用 ComfyUI 内置的 `SaveAudio`（FLAC）与 `PreviewAudio`，默认将文件写到
 ComfyUI 输出目录的 `audio/` 子目录。当前上游已把旧 `SaveAudio` 标为 deprecated，
 但仍保留兼容；如果所用 ComfyUI 版本提供新的音频保存节点，也可以直接把
@@ -204,6 +232,9 @@ vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
 - `guidance=1.0` 不额外运行 CFG 分支；允许范围为 1.0–5.0。`batch_size` 必须为 1。
   `width`、`height`、视频帧数/shift 和 `kv_cache` 是通用采样器为其他模型保留的 widget，
   YuE2 不使用这些值。
+- 原曲旋律参考工作流默认截取前 60 秒，按 100 BPM 量化为八分音符；导入后可在
+  `MlxYue2MelodyFromAudio` 中调整 `bpm`、`max_seconds`、`min_note_hz`、`max_note_hz`
+  和 `gate`。这是启发式单旋律估计，不保证对完整商业混音扒谱准确。
 
 ### 精度与内存
 
@@ -213,7 +244,7 @@ vae/YuE2-3B-MLX-4bit-vae.safetensors     -> <HF snapshot>/4bit/vae.safetensors
 - 采样结束后插件会主动释放 YuE2-3B 主模型，再加载 VAE；解码结束后也会释放 VAE，
   避免二者同时常驻。声学 latent 保留在小型缓存中，因此参数完全相同的重复执行可直接
   命中 latent，不会为了重建句柄再次加载 3B 主模型。修改 seed、style、lyrics、`cot`、
-  `max_tokens`、steps 或 guidance 都会产生新的缓存键。
+  `max_tokens`、ABC、steps 或 guidance 都会产生新的缓存键。
 - 已验证 4-bit 端到端链路可将 `[200, 64]` latent 解码为 48 kHz 立体声；实际听感仍应
   结合目标提示词和音频设备人工试听。
 

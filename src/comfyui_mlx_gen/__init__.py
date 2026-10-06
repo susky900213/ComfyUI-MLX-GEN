@@ -25,6 +25,8 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     vae_loader,
     whisper_transcribe,
     qwen_image_pe,
+    yue2_melody,
+    yue2_abc,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -49,6 +51,8 @@ NODE_CLASS_MAPPINGS = {
     "MlxWhisperTranscribe": whisper_transcribe.MlxWhisperTranscribe,
     "MlxQwenImagePET2I": qwen_image_pe.MlxQwenImagePET2I,
     "MlxQwenImagePEI2I": qwen_image_pe.MlxQwenImagePEI2I,
+    "MlxYue2MelodyFromAudio": yue2_melody.MlxYue2MelodyFromAudio,
+    "MlxYue2LoadABC": yue2_abc.MlxYue2LoadABC,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -73,6 +77,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxWhisperTranscribe": "MLX Whisper 语音转文字",
     "MlxQwenImagePET2I": "Qwen-Image 2.1 T2I 提示词增强",
     "MlxQwenImagePEI2I": "Qwen-Image 2.1 I2I 提示词增强",
+    "MlxYue2MelodyFromAudio": "YuE2 原曲旋律 → ABC 参考",
+    "MlxYue2LoadABC": "YuE2 读取 ABC 文件",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
