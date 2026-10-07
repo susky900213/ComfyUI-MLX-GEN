@@ -90,6 +90,8 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
     if not entry.supported:
         raise NotImplementedError(f"{entry.family} 尚未实现：{entry.notes}")
     comp = entry.components[role]
+    if entry.family == "qwen_image_21":
+        return _qwen21_component_path(role, selection, comp.source)
     kind, resolved = paths.resolve(comp.source, selection, role)
     # Ideogram 4 的权重根目录有 transformer/ 与 unconditional_transformer/ 两个
     # 同级目录。现有 ComfyUI 模型目录只要求用户给 transformer 建一个软链；若没有
@@ -101,6 +103,74 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
             if sibling.is_dir():
                 return "dir", str(sibling)
     return kind, resolved
+
+
+def _qwen21_explicit_component_path(role: str, selection: str) -> tuple[str, str]:
+    """Resolve a real component path without treating another role as this role."""
+    value = str(selection)
+    if not value:
+        return "missing", value
+    raw = Path(value).expanduser()
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        if raw.name == role or raw.parent.name == role or role == "transformer":
+            candidates.append(raw)
+        elif raw.is_dir():
+            candidates.append(raw / role)
+    elif "/" in value:
+        first = value.split("/", 1)[0]
+        if first == role:
+            candidates.extend((paths.MODEL_ROOT / value, paths.component_dir(role) / value))
+        else:
+            candidates.append(paths.component_dir(role) / value)
+    else:
+        candidates.append(paths.component_dir(role) / value)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return "dir", str(paths.normalize_hf_cache_path(candidate.resolve()))
+        if candidate.is_file():
+            # Hugging Face snapshot files are commonly symlinks to an extensionless
+            # blobs/<sha256> path.  Keep the selected .safetensors spelling here:
+            # MLX infers the file format from the path suffix.
+            return "file", str(candidate.absolute())
+    fallback = candidates[0] if candidates else paths.component_dir(role) / value
+    return "missing", str(fallback.resolve())
+
+
+def _qwen21_component_path(role: str, selection: str, source: str) -> tuple[str, str]:
+    """Resolve Qwen 2.1 components, including transformer-file sibling fallback.
+
+    The same widget value is used by the three loader nodes for historical
+    workflow compatibility.  A transformer file therefore must never be
+    returned as the text encoder/tokenizer/VAE path.
+    """
+    if source != "local":
+        return paths.resolve(source, selection, role)
+    explicit_kind, explicit_path = _qwen21_explicit_component_path(role, selection)
+    if explicit_kind != "missing":
+        return explicit_kind, explicit_path
+    if role == "transformer":
+        return explicit_kind, explicit_path
+
+    transformer_kind, transformer_path = _qwen21_explicit_component_path("transformer", selection)
+    if transformer_kind != "file":
+        return explicit_kind, explicit_path
+    transformer = Path(transformer_path)
+    parent = transformer.parent
+    roots = [parent]
+    if parent.name == "transformer":
+        roots.insert(0, parent.parent)
+    elif parent.parent not in roots:
+        roots.append(parent.parent)
+    # Also accept the common layout <root>/<role>/<same-model-name>/..., while
+    # keeping an explicitly selected component path higher priority.
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend((root / role, root / role / transformer.stem))
+    for candidate in candidates:
+        if candidate.is_dir():
+            return "dir", str(paths.normalize_hf_cache_path(candidate.resolve()))
+    return "missing", str(candidates[0] if candidates else parent / role)
 
 
 def resolve_class_kwargs(entry, kind: str, model_config) -> dict[str, Any]:

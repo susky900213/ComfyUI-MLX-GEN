@@ -9,11 +9,13 @@ checkpoint. Run directly (pytest is not required)::
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,8 @@ from comfyui_mlx_gen.nodes.loader import MlxTransformerLoader  # noqa: E402
 from comfyui_mlx_gen.nodes.sampler import MlxKSamplerMLX  # noqa: E402
 from comfyui_mlx_gen.nodes.vae_loader import MlxVAELoader  # noqa: E402
 from comfyui_mlx_gen.qwen_image_21 import sampling  # noqa: E402
+from comfyui_mlx_gen.qwen_image_21 import loader as qwen21_loader  # noqa: E402
+from mlx.utils import tree_flatten  # noqa: E402
 from comfyui_mlx_gen.qwen_image_21.text_encoder import (  # noqa: E402
     QwenImage21TextEncoder,
     encode_prompt,
@@ -54,6 +58,169 @@ from comfyui_mlx_gen.types import (  # noqa: E402
 QWEN_21_NAME = "Qwen-Image-2.1"
 LEGACY_T2I_NAME = "qwen-image-2512-8bit"
 LEGACY_EDIT_NAME = "qwen-image-edit-2511-8bit"
+
+
+def _tiny_transformer(blocks: int = 1) -> QwenImage21Transformer:
+    """Return a small model whose parameter tree still has the production schema."""
+    return QwenImage21Transformer(
+        in_channels=4,
+        out_channels=4,
+        num_layers=blocks,
+        attention_head_dim=16,
+        num_attention_heads=2,
+        context_in_dim=8,
+        mlp_ratio=2,
+        axes_dims_rope=(4, 6, 6),
+    )
+
+
+def _source_key(local_key: str) -> str:
+    prefix = "model.diffusion_model."
+    key = local_key
+    if key.endswith(".img_mlp.proj.weight"):
+        key = key[: -len(".proj.weight")] + ".net.0.proj.weight"
+    elif key.endswith(".img_mlp.out.weight"):
+        key = key[: -len(".out.weight")] + ".net.2.weight"
+    return prefix + key
+
+
+def _bf16_bytes(tensor: mx.array) -> bytes:
+    """Safetensors stores BF16 as its raw two-byte representation."""
+    float32 = np.asarray(tensor.astype(mx.float32))
+    bits = float32.view(np.uint32) >> 16
+    return np.asarray(bits, dtype="<u2").tobytes()
+
+
+def _write_safetensors(
+    path: Path,
+    tensors: dict[str, mx.array],
+    *,
+    metadata: dict[str, str] | None = None,
+    dtype: str = "BF16",
+    offsets: dict[str, list[int]] | None = None,
+    payload: bytes | None = None,
+    header_override: dict | None = None,
+) -> dict:
+    """Write a deliberately small safetensors file for loader validation tests."""
+    if offsets is None and payload is None and header_override is None and dtype == "BF16":
+        arrays = {key: value.astype(mx.bfloat16) for key, value in tensors.items()}
+        mx.save_safetensors(str(path), arrays, metadata=metadata)
+        return qwen21_loader._read_safetensors_header(path)[0]
+    raw_payload = bytearray()
+    header: dict[str, object] = {}
+    for key, tensor in tensors.items():
+        value = _bf16_bytes(tensor)
+        start = len(raw_payload)
+        raw_payload.extend(value)
+        header[key] = {
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "data_offsets": [start, len(raw_payload)],
+        }
+    if offsets:
+        for key, value in offsets.items():
+            header[key]["data_offsets"] = value  # type: ignore[index]
+    if metadata is not None:
+        header["__metadata__"] = metadata
+    if header_override is not None:
+        header = header_override
+    data = bytes(raw_payload) if payload is None else payload
+    encoded = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
+    return header
+
+
+def _single_file_fixture(
+    root: Path,
+    *,
+    blocks: int = 1,
+    metadata: dict[str, str] | None = None,
+    remove: str | None = None,
+    extra: dict[str, mx.array] | None = None,
+    overrides: dict[str, mx.array] | None = None,
+) -> tuple[Path, QwenImage21Transformer, dict[str, mx.array], dict]:
+    root.mkdir(parents=True, exist_ok=True)
+    model = _tiny_transformer(blocks)
+    local = dict(tree_flatten(model.parameters()))
+    if overrides:
+        local.update(overrides)
+    source = {_source_key(key): value for key, value in local.items()}
+    if remove is not None:
+        del source[_source_key(remove)]
+    if extra:
+        source.update(extra)
+    path = root / "transformer.safetensors"
+    header = _write_safetensors(path, source, metadata=metadata or {"format": "mlx", "dtype": "BF16"})
+    return path, model, local, header
+
+
+def _fused_single_file_fixture(root: Path) -> tuple[Path, QwenImage21Transformer, dict[str, mx.array]]:
+    """Build a single-file fixture using Turbo's fused SwiGLU input weights."""
+    root.mkdir(parents=True, exist_ok=True)
+    model = _tiny_transformer()
+    local = dict(tree_flatten(model.parameters()))
+    source: dict[str, mx.array] = {}
+    for key, tensor in local.items():
+        if key.endswith(".img_mlp.gate_layer.weight"):
+            proj_key = key[: -len(".gate_layer.weight")] + ".proj.weight"
+            fused = mx.concatenate([tensor, local[proj_key]], axis=0)
+            source["model.diffusion_model." + key[: -len(".gate_layer.weight")] + ".gate_up.weight"] = fused
+        elif key.endswith(".img_mlp.proj.weight"):
+            continue
+        else:
+            source[_source_key(key)] = tensor
+    path = root / "QwenImage_2.1_turbo_8Steps_bf16.safetensors"
+    _write_safetensors(path, source, metadata={"format": "mlx", "dtype": "BF16"})
+    return path, model, local
+
+
+def _directory_fixture(root: Path, *, blocks: int = 1) -> tuple[Path, QwenImage21Transformer, dict[str, mx.array]]:
+    model = _tiny_transformer(blocks)
+    local = dict(tree_flatten(model.parameters()))
+    root.mkdir()
+    mx.save_safetensors(
+        str(root / "000.safetensors"),
+        {key: value.astype(mx.bfloat16) for key, value in local.items()},
+        metadata={"format": "mlx", "dtype": "BF16"},
+    )
+    return root, model, local
+
+
+def _rewrite_header(path: Path, update) -> dict:
+    header, header_size = qwen21_loader._read_safetensors_header(path)
+    raw = path.read_bytes()
+    payload = raw[8 + header_size :]
+    update(header)
+    encoded = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+    return header
+
+
+def _expect_value_error(action, contains: str) -> None:
+    try:
+        action()
+    except ValueError as exc:
+        assert contains in str(exc), (contains, str(exc))
+    else:
+        raise AssertionError(f"expected ValueError containing {contains!r}")
+
+
+def _load_single_with_model(path: Path, model: QwenImage21Transformer):
+    original = qwen21_loader.build_model
+    qwen21_loader.build_model = lambda role, _path: model
+    try:
+        return qwen21_loader.load("transformer", str(path), quantize=0, precision="bfloat16", log=None)
+    finally:
+        qwen21_loader.build_model = original
+
+
+def _load_directory_with_model(path: Path, model: QwenImage21Transformer):
+    original = qwen21_loader.build_model
+    qwen21_loader.build_model = lambda role, _path: model
+    try:
+        return qwen21_loader.load("transformer", str(path), quantize=0, precision="bfloat16", log=None)
+    finally:
+        qwen21_loader.build_model = original
 
 
 def test_model_root_uses_comfyui_registered_mlx_directory(tmp_path):
@@ -216,6 +383,232 @@ def test_public_loaders_create_qwen_image_21_handles_without_loading_weights(tmp
         assert kind == "dir" and Path(resolved).is_dir()
     finally:
         paths.MODEL_ROOT = old_root
+
+
+def test_qwen21_single_file_bf16_loads_and_maps_each_feed_forward_weight_independently(tmp_path):
+    model = _tiny_transformer()
+    local = dict(tree_flatten(model.parameters()))
+    selected = {
+        "transformer_blocks.0.img_mlp.proj.weight": 1.0,
+        "transformer_blocks.0.img_mlp.out.weight": 2.0,
+        "transformer_blocks.0.img_mlp.gate_layer.weight": 3.0,
+    }
+    overrides = {
+        key: mx.full(local[key].shape, value, dtype=mx.bfloat16)
+        for key, value in selected.items()
+    }
+    path, _unused, _local, header = _single_file_fixture(tmp_path, overrides=overrides)
+    assert header["__metadata__"] == {"dtype": "BF16", "format": "mlx"}
+    assert all(
+        header[_source_key(key)]["dtype"] == "BF16"
+        for key in selected
+    )
+
+    loaded = _load_single_with_model(path, model)
+    actual = dict(tree_flatten(loaded.module.parameters()))
+    mx.eval(*(actual[key] for key in selected))
+    assert loaded.bits is None
+    assert loaded.dtype == "bfloat16"
+    assert Path(loaded.path) == path
+    for key, value in overrides.items():
+        assert float(mx.max(mx.abs(actual[key] - value)).item()) == 0.0
+
+
+def test_qwen21_single_file_splits_turbo_fused_gate_up_weight(tmp_path):
+    path, model, local = _fused_single_file_fixture(tmp_path)
+    gate_key = "transformer_blocks.0.img_mlp.gate_layer.weight"
+    proj_key = "transformer_blocks.0.img_mlp.proj.weight"
+    gate = mx.full(local[gate_key].shape, 3.0, dtype=mx.bfloat16)
+    proj = mx.full(local[proj_key].shape, 5.0, dtype=mx.bfloat16)
+    source_key = "model.diffusion_model." + gate_key[: -len("gate_layer.weight")] + "gate_up.weight"
+    source = {source_key: mx.concatenate([gate, proj], axis=0)}
+    # Rewrite only this block's fused input tensor while retaining every other
+    # source tensor from the complete Turbo-shaped fixture.
+    raw = path.read_bytes()
+    header, header_size = qwen21_loader._read_safetensors_header(path)
+    payload = raw[8 + header_size :]
+    fused_key = next(key for key in header if key.endswith(".img_mlp.gate_up.weight"))
+    start, end = header[fused_key]["data_offsets"]
+    replacement = _bf16_bytes(source[fused_key])
+    assert len(replacement) == end - start
+    payload = payload[:start] + replacement + payload[end:]
+    path.write_bytes(raw[: 8 + header_size] + payload)
+
+    loaded = _load_single_with_model(path, model)
+    actual = dict(tree_flatten(loaded.module.parameters()))
+    mx.eval(actual[gate_key], actual[proj_key])
+    assert float(mx.max(mx.abs(actual[gate_key] - gate)).item()) == 0.0
+    assert float(mx.max(mx.abs(actual[proj_key] - proj)).item()) == 0.0
+
+
+def test_qwen21_single_file_and_directory_loading_follow_dynamic_block_schema(tmp_path):
+    single_path, single_model, expected, _header = _single_file_fixture(tmp_path / "single", blocks=2)
+    loaded_single = _load_single_with_model(single_path, single_model)
+    assert set(dict(tree_flatten(loaded_single.module.parameters()))) == set(expected)
+    assert "transformer_blocks.1.img_mlp.gate_layer.weight" in expected
+
+    directory, directory_model, directory_expected = _directory_fixture(tmp_path / "directory", blocks=2)
+    loaded_directory = _load_directory_with_model(directory, directory_model)
+    assert set(dict(tree_flatten(loaded_directory.module.parameters()))) == set(directory_expected)
+    assert loaded_directory.path == str(directory)
+
+
+def test_qwen21_single_file_accepts_an_extensionless_valid_safetensors_blob(tmp_path):
+    source, model, _local, _header = _single_file_fixture(tmp_path / "source")
+    blob = tmp_path / "blob"
+    blob.write_bytes(source.read_bytes())
+
+    loaded = _load_single_with_model(blob, model)
+
+    assert loaded.path == str(blob)
+
+
+def test_qwen21_single_file_rejects_missing_and_unexpected_keys(tmp_path):
+    missing_path, missing_model, _local, _header = _single_file_fixture(
+        tmp_path / "missing",
+        remove="transformer_blocks.0.img_mlp.gate_layer.weight",
+    )
+    _expect_value_error(
+        lambda: _load_single_with_model(missing_path, missing_model),
+        "缺 1 个 transformer 参数",
+    )
+
+    extra_path, extra_model, _local, _header = _single_file_fixture(
+        tmp_path / "extra",
+        extra={"model.diffusion_model.unexpected.weight": mx.ones((1,), dtype=mx.bfloat16)},
+    )
+    _expect_value_error(
+        lambda: _load_single_with_model(extra_path, extra_model),
+        "本地模块没有的键",
+    )
+
+
+def test_qwen21_single_file_validates_metadata_dtype_offsets_overlap_bounds_and_size(tmp_path):
+    malformed_metadata, metadata_model, _local, _header = _single_file_fixture(
+        tmp_path / "metadata"
+    )
+    _rewrite_header(
+        malformed_metadata,
+        lambda header: header.__setitem__("__metadata__", {"format": 1}),
+    )
+    _expect_value_error(
+        lambda: _load_single_with_model(malformed_metadata, metadata_model),
+        "metadata 必须是 string object",
+    )
+
+    unsupported_dtype, dtype_model, _local, _header = _single_file_fixture(tmp_path / "dtype")
+    first_key = next(key for key in _rewrite_header(unsupported_dtype, lambda _header: None) if key != "__metadata__")
+    _rewrite_header(
+        unsupported_dtype,
+        lambda header: header[first_key].__setitem__("dtype", "F8"),
+    )
+    _expect_value_error(
+        lambda: _load_single_with_model(unsupported_dtype, dtype_model),
+        "只支持 F16/BF16/F32",
+    )
+
+    bad_size, size_model, _local, _header = _single_file_fixture(tmp_path / "size")
+    first_key = next(key for key in _rewrite_header(bad_size, lambda _header: None) if key != "__metadata__")
+    _rewrite_header(
+        bad_size,
+        lambda header: header[first_key].__setitem__(
+            "data_offsets", [
+                header[first_key]["data_offsets"][0],
+                header[first_key]["data_offsets"][1] - 1,
+            ]
+        ),
+    )
+    _expect_value_error(lambda: _load_single_with_model(bad_size, size_model), "字节数不符")
+
+    out_of_bounds, bounds_model, _local, _header = _single_file_fixture(tmp_path / "bounds")
+    first_key = next(key for key in _rewrite_header(out_of_bounds, lambda _header: None) if key != "__metadata__")
+    _rewrite_header(
+        out_of_bounds,
+        lambda header: header[first_key].__setitem__("data_offsets", [0, 10**9]),
+    )
+    _expect_value_error(lambda: _load_single_with_model(out_of_bounds, bounds_model), "header 非法")
+
+    overlap, overlap_model, _local, _header = _single_file_fixture(tmp_path / "overlap")
+    header = _rewrite_header(overlap, lambda _header: None)
+    norm_keys = [
+        key
+        for key in header
+        if key.endswith(".attn.norm_k.weight") or key.endswith(".attn.norm_q.weight")
+    ]
+    assert len(norm_keys) == 2
+    first_range = header[norm_keys[0]]["data_offsets"]
+    _rewrite_header(
+        overlap,
+        lambda current: current[norm_keys[1]].__setitem__("data_offsets", first_range),
+    )
+    _expect_value_error(lambda: _load_single_with_model(overlap, overlap_model), "data_offsets 重叠")
+
+
+def test_qwen21_single_file_rejects_malformed_header_and_non_transformer_roles(tmp_path):
+    empty = tmp_path / "empty"
+    empty.touch()
+    _expect_value_error(
+        lambda: _load_single_with_model(empty, _tiny_transformer()),
+        "无法读取 safetensors header",
+    )
+
+    non_safetensors = tmp_path / "not-a-safetensors-file"
+    non_safetensors.write_bytes(b"not a safetensors file")
+    _expect_value_error(
+        lambda: _load_single_with_model(non_safetensors, _tiny_transformer()),
+        "无法读取 safetensors header",
+    )
+
+    malformed = tmp_path / "malformed.safetensors"
+    malformed.write_bytes(struct.pack("<Q", 1) + b"{" + b"\x00")
+    model = _tiny_transformer()
+    _expect_value_error(lambda: _load_single_with_model(malformed, model), "无法读取 safetensors header")
+
+    valid, _model, _local, _header = _single_file_fixture(tmp_path / "valid")
+    _expect_value_error(
+        lambda: qwen21_loader.load("vae", str(valid), quantize=0, precision="bfloat16", log=None),
+        "只支持 transformer role",
+    )
+
+
+def test_qwen21_pipeline_dispatches_single_transformer_and_falls_back_to_sibling_components(tmp_path):
+    root = tmp_path / "Qwen-Image-2.1"
+    transformer_dir = root / "transformer"
+    transformer_dir.mkdir(parents=True)
+    transformer = transformer_dir / "Qwen-Image-2.1.safetensors"
+    transformer.write_bytes(b"fixture")
+    (root / "vae").mkdir()
+
+    entry = entry_for(QWEN_IMAGE_21_FAMILY)
+    kind, resolved = pipeline.component_path(entry, "transformer", str(transformer))
+    assert kind == "file" and Path(resolved).resolve() == transformer.resolve()
+    kind, resolved = pipeline.component_path(entry, "vae", str(transformer))
+    assert kind == "dir" and Path(resolved).resolve() == (root / "vae").resolve()
+
+    (root / "vae").rmdir()
+    kind, resolved = pipeline.component_path(entry, "vae", str(transformer))
+    assert kind == "missing"
+    assert Path(resolved) != transformer
+
+
+def test_qwen21_pipeline_preserves_safetensors_suffix_for_hf_blob_symlink(tmp_path):
+    root = tmp_path / "Qwen-Image-2.1"
+    transformer_dir = root / "transformer"
+    transformer_dir.mkdir(parents=True)
+    blob = tmp_path / "blobs" / "c5b30c48037b085fee9a582835bd823509abee9b08754bf212cc4085278ec64f"
+    blob.parent.mkdir()
+    blob.write_bytes(b"fixture")
+    transformer = transformer_dir / "QwenImage_2.1_turbo_8Steps_bf16.safetensors"
+    transformer.symlink_to(blob)
+
+    kind, resolved = pipeline.component_path(
+        entry_for(QWEN_IMAGE_21_FAMILY), "transformer", str(transformer)
+    )
+
+    assert kind == "file"
+    assert Path(resolved) == transformer
+    assert Path(resolved).suffix == ".safetensors"
+    assert Path(resolved).is_symlink()
 
 
 def test_dynamic_schedule_and_latent_contract():
@@ -596,4 +989,16 @@ if __name__ == "__main__":
         test_model_root_registers_shared_directory_when_mlx_is_not_configured(root)
         test_config_detection_identifies_a_local_qwen_image_21_checkpoint(root)
         test_public_loaders_create_qwen_image_21_handles_without_loading_weights(root)
+    parameterized_tests = [
+        test_qwen21_single_file_bf16_loads_and_maps_each_feed_forward_weight_independently,
+        test_qwen21_single_file_splits_turbo_fused_gate_up_weight,
+        test_qwen21_single_file_and_directory_loading_follow_dynamic_block_schema,
+        test_qwen21_single_file_rejects_missing_and_unexpected_keys,
+        test_qwen21_single_file_validates_metadata_dtype_offsets_overlap_bounds_and_size,
+        test_qwen21_single_file_rejects_malformed_header_and_non_transformer_roles,
+        test_qwen21_pipeline_dispatches_single_transformer_and_falls_back_to_sibling_components,
+    ]
+    for test in parameterized_tests:
+        with tempfile.TemporaryDirectory() as directory:
+            test(Path(directory))
     print("全部通过：Qwen-Image 2.1 隔离、T2I/多图编辑 KV、64 通道 latent 与 RGBA VAE 契约有效。")

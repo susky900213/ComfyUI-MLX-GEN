@@ -20,26 +20,31 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mlx.utils import tree_flatten  # noqa: E402
 
-from comfyui_mlx_gen.qwen_image_21.loader import build_model  # noqa: E402
+from comfyui_mlx_gen.qwen_image_21.loader import (  # noqa: E402
+    _read_safetensors_header,
+    _validate_single_transformer_header,
+    build_model,
+)
 
 
 def mapped_shape(role: str, key: str, shape: tuple[int, ...]):
+    """Return one or more local keys and their header-only shapes."""
     if role == "text_encoder":
         vision_prefix = "model.visual."
         if key.startswith(vision_prefix):
             local = "visual." + key[len(vision_prefix):]
             if local == "visual.patch_embed.proj.weight":
                 shape = (shape[0], math.prod(shape[1:]))
-            return local, shape
+            return [(local, shape)]
         prefix = "model.language_model."
         if not key.startswith(prefix):
             return None
         local = key[len(prefix):]
         if local == "embed_tokens.weight":
-            return local, shape
+            return [(local, shape)]
         if not local.startswith("layers.") or int(local.split(".")[1]) >= 36:
             return None
-        return local, shape
+        return [(local, shape)]
     if role == "vae":
         if not key.startswith(("encoder.", "quant_conv.", "decoder.", "post_quant_conv.")) or ".time_conv." in key:
             return None
@@ -47,8 +52,22 @@ def mapped_shape(role: str, key: str, shape: tuple[int, ...]):
             shape = (shape[0],)
         elif key.endswith(".weight") and len(shape) == 4:
             shape = (shape[0], shape[2], shape[3], shape[1])
-        return key, shape
-    return key, shape
+        return [(key, shape)]
+    if role == "transformer" and key.endswith(".img_mlp.gate_up.weight"):
+        # Turbo single-file exports fuse the SwiGLU gate and up projections as
+        # [gate; up].  The MLX module stores them as separate Linear weights.
+        base = key[: -len(".gate_up.weight")]
+        if len(shape) != 2 or shape[0] % 2:
+            return [(key, shape)]
+        half = shape[0] // 2
+        local_prefix = "model.diffusion_model."
+        if base.startswith(local_prefix):
+            base = base[len(local_prefix):]
+        return [
+            (base + ".gate_layer.weight", (half, shape[1])),
+            (base + ".proj.weight", (half, shape[1])),
+        ]
+    return [(key, shape)]
 
 
 def validate_component(snapshot: Path, role: str) -> None:
@@ -67,7 +86,8 @@ def validate_component(snapshot: Path, role: str) -> None:
                 if converted is None:
                     ignored += 1
                 else:
-                    source[converted[0]] = converted[1]
+                    for local_key, local_shape in converted:
+                        source[local_key] = local_shape
     missing = sorted(set(expected) - set(source))
     extra = sorted(set(source) - set(expected))
     mismatched = [
@@ -86,11 +106,29 @@ def validate_component(snapshot: Path, role: str) -> None:
     )
 
 
+def validate_transformer_file(path: Path) -> None:
+    """Validate a transformer-only single file without loading tensor payloads."""
+    header, header_size = _read_safetensors_header(path)
+    model = build_model("transformer", path)
+    expected = {key: tuple(value.shape) for key, value in tree_flatten(model.parameters())}
+    plan = _validate_single_transformer_header(header, expected, path, header_size)
+    fused = sum(kind == "gate_up" for _, kind in plan.values())
+    print(
+        f"[OK] transformer 单文件: {len(plan)} 个源 tensor 映射到 {len(expected)} 个本地参数；"
+        f"gate_up={fused}；未读取 tensor data"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("snapshot", type=Path)
     args = parser.parse_args()
     snapshot = args.snapshot.expanduser().resolve()
+    if snapshot.is_file():
+        validate_transformer_file(snapshot)
+        return
+    if not snapshot.is_dir():
+        raise FileNotFoundError(f"Qwen-Image 2.1 snapshot 不存在: {snapshot}")
     for role in ("transformer", "text_encoder", "vae"):
         validate_component(snapshot, role)
 

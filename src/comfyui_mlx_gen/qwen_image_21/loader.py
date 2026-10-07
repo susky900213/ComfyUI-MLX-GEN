@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gc
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -26,6 +27,25 @@ GROUP_SIZE = 64
 EVAL_CHUNK = 8
 _DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
 _FLOAT_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
+_SAFETENSORS_FLOAT_DTYPES = {"F16", "BF16", "F32"}
+_SAFETENSORS_ITEMSIZE = {"F16": 2, "BF16": 2, "F32": 4}
+
+# Zabin/Qwen_Image_2.1_Turbo_8Steps is a transformer-only export.  Unlike the
+# directory export, it has no config.json, so these values must be kept here
+# rather than silently asking an unrelated mflux ModelConfig for defaults.
+DEFAULT_TRANSFORMER_CONFIG: dict[str, Any] = {
+    "patch_size": 1,
+    "in_channels": 64,
+    "out_channels": 64,
+    "num_layers": 32,
+    "attention_head_dim": 128,
+    "num_attention_heads": 32,
+    "context_in_dim": 4096,
+    "mlp_ratio": 3,
+    "axes_dims_rope": (16, 56, 56),
+    "eps": 1e-6,
+    "causal_condition": True,
+}
 
 
 @dataclass(frozen=True)
@@ -47,8 +67,15 @@ def read_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"Qwen-Image 2.1 配置不是合法 JSON（{file}）: {exc}") from exc
 
 
+def _transformer_config(path: str | Path) -> dict[str, Any]:
+    root = Path(path)
+    if root.is_file():
+        return dict(DEFAULT_TRANSFORMER_CONFIG)
+    return read_config(root)
+
+
 def build_model(role: str, path: str | Path) -> nn.Module:
-    config = read_config(path)
+    config = _transformer_config(path) if role == "transformer" else read_config(path)
     if role == "transformer":
         return QwenImage21Transformer(
             patch_size=int(config.get("patch_size", 1)),
@@ -139,6 +166,265 @@ def _source_to_local(role: str, key: str, tensor: mx.array) -> tuple[str, mx.arr
     return None
 
 
+def _read_safetensors_header(path: str | Path) -> tuple[dict[str, Any], int]:
+    """读取 safetensors header，不把任何 tensor data 映射进内存。"""
+    file = Path(path)
+    try:
+        size = file.stat().st_size
+        with file.open("rb") as handle:
+            raw_size = handle.read(8)
+            if len(raw_size) != 8:
+                raise ValueError("header 长度字段不完整")
+            header_size = struct.unpack("<Q", raw_size)[0]
+            if header_size <= 0 or header_size > size - 8:
+                raise ValueError(f"header 长度非法：{header_size}")
+            raw_header = handle.read(header_size)
+            if len(raw_header) != header_size:
+                raise ValueError("header 内容不完整")
+        header = json.loads(raw_header.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, struct.error, ValueError) as exc:
+        raise ValueError(f"无法读取 safetensors header {file}: {exc}") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header 不是 object：{file}")
+    return header, header_size
+
+
+def _validate_single_file_metadata(header: dict[str, Any], path: Path) -> None:
+    metadata = header.get("__metadata__", {})
+    if not isinstance(metadata, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in metadata.items()
+    ):
+        raise ValueError(f"Qwen-Image 2.1 单文件 metadata 必须是 string object：{path}")
+    # Zabin 的 Int8 Convrot layout 尚未在 MLX 侧验证。不要把带量化 recipe 的
+    # 文件当作普通 F16/BF16 权重静默加载；这种文件必须先有专门的转换器。
+    markers = ("quant", "int8", "convrot", "bits", "group_size", "scales", "biases")
+    metadata_text = json.dumps(metadata, ensure_ascii=False).casefold()
+    if any(marker in metadata_text for marker in markers):
+        raise ValueError(
+            f"Qwen-Image 2.1 单文件包含未支持的量化/Convrot metadata：{path}"
+        )
+
+
+def _single_transformer_mapping(
+    source_key: str,
+    source_shape: tuple[int, ...],
+    expected: dict[str, tuple[int, ...]],
+) -> tuple[tuple[str, ...], str]:
+    """Return target keys and mapping kind for one ComfyUI source key."""
+    prefix = "model.diffusion_model."
+    if not source_key.startswith(prefix):
+        raise ValueError(
+            "Qwen-Image 2.1 单文件只能包含 model.diffusion_model.* transformer 权重，"
+            f"收到 {source_key}"
+        )
+    local = source_key[len(prefix):]
+    if local.endswith(".img_mlp.gate_up.weight"):
+        # The Turbo single-file export uses the fused SwiGLU input projection:
+        # [gate; up].  The MLX module keeps the two Linear layers separate so
+        # that its forward pass can apply SiLU(gate) * up.
+        base = local[: -len(".gate_up.weight")]
+        gate_key = base + ".gate_layer.weight"
+        proj_key = base + ".proj.weight"
+        if len(source_shape) != 2:
+            raise ValueError(
+                f"Qwen-Image 2.1 fused gate_up 必须是二维权重：{source_key}={source_shape}"
+            )
+        if gate_key not in expected or proj_key not in expected:
+            raise ValueError(f"Qwen-Image 2.1 单文件存在本地模块没有的键：{source_key}")
+        gate_shape = expected[gate_key]
+        proj_shape = expected[proj_key]
+        if gate_shape != proj_shape or source_shape != (gate_shape[0] * 2, gate_shape[1]):
+            raise ValueError(
+                f"Qwen-Image 2.1 fused gate_up 形状不符: {source_key} checkpoint={source_shape}, "
+                f"module gate={gate_shape}, up={proj_shape}"
+            )
+        return (gate_key, proj_key), "gate_up"
+    if local.endswith(".img_mlp.net.0.proj.weight"):
+        # ComfyUI's Qwen Image FeedForward is GELU, not a fused GEGLU: net.0
+        # is the input projection and net.2 is the separate output projection.
+        local = local[: -len(".net.0.proj.weight")] + ".proj.weight"
+    elif local.endswith(".img_mlp.net.2.weight"):
+        local = local[: -len(".net.2.weight")] + ".out.weight"
+    key = local
+    if key not in expected:
+        raise ValueError(f"Qwen-Image 2.1 单文件存在本地模块没有的键：{source_key}")
+    if source_shape != expected[key]:
+        raise ValueError(
+            f"Qwen-Image 2.1 单文件形状不符: {source_key} checkpoint={source_shape}, "
+            f"module={expected[key]}"
+        )
+    return (key,), "direct"
+
+
+def _validate_single_transformer_header(
+    header: dict[str, Any],
+    expected: dict[str, tuple[int, ...]],
+    path: Path,
+    header_size: int,
+) -> dict[str, tuple[tuple[str, ...], str]]:
+    """Validate source schema and return a tensor-data-free conversion plan."""
+    _validate_single_file_metadata(header, path)
+    data_size = path.stat().st_size - 8 - header_size
+    if data_size < 0:
+        raise ValueError(f"Qwen-Image 2.1 单文件 header 超出文件：{path}")
+    plan: dict[str, tuple[tuple[str, ...], str]] = {}
+    target_sources: dict[str, str] = {}
+    block_indexes: set[int] = set()
+    data_ranges: list[tuple[int, int, str]] = []
+    for source_key, spec in header.items():
+        if source_key == "__metadata__":
+            continue
+        if not isinstance(spec, dict):
+            raise ValueError(f"Qwen-Image 2.1 单文件 tensor header 不是 object：{source_key}")
+        dtype = spec.get("dtype")
+        shape = spec.get("shape")
+        offsets = spec.get("data_offsets")
+        if dtype not in _SAFETENSORS_FLOAT_DTYPES:
+            raise ValueError(
+                f"Qwen-Image 2.1 单文件只支持 F16/BF16/F32，{source_key} 是 {dtype!r}"
+            )
+        if (
+            not isinstance(shape, list)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in shape)
+            or not isinstance(offsets, list)
+            or len(offsets) != 2
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in offsets)
+            or offsets[0] < 0
+            or offsets[1] < offsets[0]
+            or offsets[1] > data_size
+        ):
+            raise ValueError(f"Qwen-Image 2.1 单文件 tensor header 非法：{source_key}")
+        source_shape = tuple(shape)
+        expected_bytes = _SAFETENSORS_ITEMSIZE[dtype]
+        for dimension in source_shape:
+            expected_bytes *= dimension
+        if offsets[1] - offsets[0] != expected_bytes:
+            raise ValueError(
+                f"Qwen-Image 2.1 单文件 tensor 字节数不符：{source_key}，"
+                f"header={offsets[1] - offsets[0]}，expected={expected_bytes}"
+            )
+        data_ranges.append((offsets[0], offsets[1], source_key))
+        targets, kind = _single_transformer_mapping(source_key, source_shape, expected)
+        if source_key in plan:
+            raise ValueError(f"Qwen-Image 2.1 单文件键重复：{source_key}")
+        plan[source_key] = (targets, kind)
+        if source_key.startswith("model.diffusion_model.transformer_blocks."):
+            parts = source_key.split(".")
+            if len(parts) <= 3 or parts[2] != "transformer_blocks" or not parts[3].isdigit():
+                raise ValueError(f"Qwen-Image 2.1 单文件 block 键非法：{source_key}")
+            block_indexes.add(int(parts[3]))
+        for target in targets:
+            previous = target_sources.get(target)
+            if previous is not None:
+                raise ValueError(
+                    f"Qwen-Image 2.1 单文件多个 source 键映射到同一参数 {target}："
+                    f"{previous} 与 {source_key}"
+                )
+            target_sources[target] = source_key
+    previous_end = 0
+    previous_key = ""
+    for start, end, source_key in sorted(data_ranges):
+        if start < previous_end:
+            raise ValueError(
+                f"Qwen-Image 2.1 单文件 tensor data_offsets 重叠：{previous_key} 与 {source_key}"
+            )
+        previous_end = max(previous_end, end)
+        previous_key = source_key
+
+    expected_blocks = {
+        int(parts[1])
+        for key in expected
+        if (parts := key.split("."))[:1] == ["transformer_blocks"]
+        and len(parts) > 2
+        and parts[1].isdigit()
+    }
+    if block_indexes != expected_blocks:
+        missing = sorted(expected_blocks - block_indexes)
+        extra = sorted(block_indexes - expected_blocks)
+        raise ValueError(
+            f"Qwen-Image 2.1 单文件 transformer block 结构不完整：missing={missing[:5]}, extra={extra[:5]}"
+        )
+    missing = sorted(set(expected) - set(target_sources))
+    if missing:
+        raise ValueError(
+            f"Qwen-Image 2.1 单文件缺 {len(missing)} 个 transformer 参数，前几个是 {missing[:5]}"
+        )
+    return plan
+
+
+def _single_transformer_entries(
+    source_key: str,
+    tensor: mx.array,
+    expected: dict[str, tuple[int, ...]],
+) -> list[tuple[str, mx.array]]:
+    targets, kind = _single_transformer_mapping(source_key, tuple(tensor.shape), expected)
+    if kind == "gate_up":
+        gate, proj = mx.split(tensor, 2, axis=0)
+        return [(targets[0], gate), (targets[1], proj)]
+    return [(targets[0], tensor)]
+
+
+def _load_single_transformer(
+    path: Path,
+    quantize: int | None,
+    precision: str,
+    log: Callable[[str], None] | None,
+) -> LoadedQwenImage21Component:
+    # Hugging Face snapshot files can resolve to extensionless blobs/<sha256>
+    # paths.  Validate the safetensors header instead of trusting the filename;
+    # _read_safetensors_header also gives explicit errors for empty/truncated or
+    # otherwise malformed files.
+    header, header_size = _read_safetensors_header(path)
+    module = build_model("transformer", path)
+    expected = {key: tuple(value.shape) for key, value in tree_flatten(module.parameters())}
+    plan = _validate_single_transformer_header(header, expected, path, header_size)
+
+    if precision not in _DTYPES:
+        raise ValueError(f"未知精度 {precision}（可选：{', '.join(_DTYPES)}）")
+
+    bits = int(quantize) if quantize else None
+    if bits not in (None, 4, 8):
+        raise ValueError(f"Qwen-Image 2.1 在线量化只支持 4 / 8 位或 0，收到 {quantize}")
+    if bits:
+        nn.quantize(module, group_size=GROUP_SIZE, bits=bits, class_predicate=_quantizable)
+    quantized_modules = {
+        name: child
+        for name, child in module.named_modules()
+        if isinstance(child, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    }
+    dtype = _DTYPES[precision]
+    loaded: set[str] = set()
+    if log:
+        log(f"[Qwen-Image 2.1 加载] transformer 单文件: {path.name}")
+    raw = mx.load(str(path))
+    entries: list[tuple[str, mx.array]] = []
+    for source_key, source_tensor in raw.items():
+        if source_key not in plan:
+            raise ValueError(f"Qwen-Image 2.1 单文件 header/data 不一致：{source_key}")
+        for key, tensor in _single_transformer_entries(source_key, source_tensor, expected):
+            if key in loaded:
+                raise ValueError(f"Qwen-Image 2.1 单文件参数重复：{key}")
+            if tensor.dtype in _FLOAT_DTYPES:
+                tensor = tensor.astype(dtype)
+            entries.extend(_quantize_entry(key, tensor, quantized_modules))
+            loaded.add(key)
+    if set(expected) != loaded:
+        missing = sorted(set(expected) - loaded)
+        raise ValueError(f"Qwen-Image 2.1 单文件数据缺参数，前几个是 {missing[:5]}")
+    module.update(tree_unflatten(entries), strict=False)
+    _eval(entries)
+    del raw, entries
+    gc.collect()
+    mx.clear_cache()
+    if log:
+        log(
+            f"[Qwen-Image 2.1 加载] transformer 单文件完成：{len(loaded)} 个参数，"
+            f"{precision}{f' / q{bits}' if bits else ''}"
+        )
+    return LoadedQwenImage21Component("transformer", module, bits, precision, str(path))
+
+
 def _shards(path: str | Path) -> list[Path]:
     root = Path(path)
     files = sorted(root.glob("*.safetensors"))
@@ -185,13 +471,19 @@ def load(
     log: Callable[[str], None] | None = print,
 ) -> LoadedQwenImage21Component:
     root = Path(path)
-    if not root.is_dir():
-        raise FileNotFoundError(f"Qwen-Image 2.1 {role} 目录不存在: {root}")
     if precision not in _DTYPES:
         raise ValueError(f"未知精度 {precision}（可选：{', '.join(_DTYPES)}）")
     bits = int(quantize) if quantize else None
     if bits not in (None, 4, 8):
         raise ValueError(f"Qwen-Image 2.1 在线量化只支持 4 / 8 位或 0，收到 {quantize}")
+    if root.is_file():
+        if role != "transformer":
+            raise ValueError(
+                f"Qwen-Image 2.1 单文件只支持 transformer role，收到 {role}: {root}"
+            )
+        return _load_single_transformer(root, bits, precision, log)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Qwen-Image 2.1 {role} 目录不存在: {root}")
     # Convolutional VAE has no Linear/Embedding worth quantizing; retaining q4/q8 in its
     # handle is harmless, but claiming it was quantized would be misleading.
     if role == "vae":
