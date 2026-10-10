@@ -478,6 +478,24 @@ def prompt_encoding_key(clip, text: str, ref_cache_key: str = "") -> str:
     )
 
 
+def sampler_cache_key(model_handle, params: dict[str, Any], config_name: str) -> str:
+    """返回采样结果缓存键，并隔离不同的 Transformer / LoRA 配置。
+
+    ``params`` 本身不包含模型句柄。若只用参数生成 key，先跑无 LoRA、再用
+    相同 seed/尺寸/步数跑带 LoRA 的工作流时，会直接复用旧 latent，看起来就像
+    LoRA 没有生效。``MlxModelHandle`` 是 dataclass，且包含完整的 ``loras``
+    （文件路径 + strength），交给 ``runtime.cache_key`` 会稳定地区分这些配置。
+    """
+    return runtime.cache_key(
+        {
+            "kind": "noise",
+            "params": params,
+            "config": config_name,
+            "model": model_handle,
+        }
+    )
+
+
 def release_encoder(clip, cache) -> None:
     """释放一条普通图片文本编码器 bundle；编码结果仍留在 prompt cache。"""
     cache.evict("module", runtime.cache_key({"kind": "module", "clip": clip}))
@@ -1890,12 +1908,10 @@ def run_sampler(defn, model_handle, comps, params, cache):
             defn, comps, params, cache, model_config, guidance, progress.update
         )
 
-    key = runtime.cache_key(
-        {
-            "kind": "noise",
-            "params": params,
-            "config": "qwen-image-2.1" if model_config is None else model_config.model_name,
-        }
+    key = sampler_cache_key(
+        model_handle,
+        params,
+        "qwen-image-2.1" if model_config is None else model_config.model_name,
     )
     latents, hit = cache.get_or_create("component_weights", key, sample)
     if hit:

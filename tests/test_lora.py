@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -25,6 +26,7 @@ from comfyui_mlx_gen.h3.weights.h3_lora import (  # noqa: E402
 )
 from comfyui_mlx_gen.h3.weights.h3_lora_mapping import MiniMaxH3LoRAMapping  # noqa: E402
 from comfyui_mlx_gen.nodes.lora import MlxClipLoraApply, MlxModelLoraApply  # noqa: E402
+from comfyui_mlx_gen.qwen_image_21.transformer import QwenImage21Transformer  # noqa: E402
 from comfyui_mlx_gen.types import LoraRef, MlxClipHandle, MlxModelHandle, entry_for  # noqa: E402
 
 FAILED: list[str] = []
@@ -53,6 +55,7 @@ expected_mapping_names = {
     "flux2": "Flux2LoRAMapping",
     "qwen_image": "QwenLoRAMapping",
     "qwen_edit": "QwenLoRAMapping",
+    "qwen_image_21": "QwenImage21LoRAMapping",
     "ideogram4": "Ideogram4LoRAMapping",
 }
 for family, class_name in expected_mapping_names.items():
@@ -72,6 +75,21 @@ check(
     "支持矩阵包含全部图片家族和 MiniMax-H3",
     set(transformer_lora.supported_families()) == {*expected_mapping_names, "minimax_h3"},
     str(transformer_lora.supported_families()),
+)
+qwen21_targets = {target.model_path for target in transformer_lora.mapping_for_family("qwen_image_21")}
+check(
+    "Qwen-Image 2.1 mapping 覆盖 attention list 路径和三路 image MLP",
+    qwen21_targets
+    == {
+        "transformer_blocks.{block}.attn.to_q",
+        "transformer_blocks.{block}.attn.to_k",
+        "transformer_blocks.{block}.attn.to_v",
+        "transformer_blocks.{block}.attn.to_out.0",
+        "transformer_blocks.{block}.img_mlp.proj",
+        "transformer_blocks.{block}.img_mlp.out",
+        "transformer_blocks.{block}.img_mlp.gate_layer",
+    },
+    str(sorted(qwen21_targets)),
 )
 check_raises(
     "音频家族 LoRA 明确拒绝",
@@ -297,6 +315,134 @@ check(
 )
 
 
+# --------------------------------------------------------- 6. Qwen-Image 2.1 小模型实际应用
+with tempfile.TemporaryDirectory() as temporary:
+    old_root = paths.MODEL_ROOT
+    paths.MODEL_ROOT = Path(temporary)
+    (paths.MODEL_ROOT / "lora").mkdir()
+    first_path = paths.MODEL_ROOT / "lora" / "qwen21-first.safetensors"
+    second_path = paths.MODEL_ROOT / "lora" / "qwen21-second.safetensors"
+    first_down = mx.array([[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, -0.5, 0.0]])
+    first_up = mx.array([[0.2, 0.0], [0.0, 0.3], [0.1, 0.0], [0.0, -0.2]])
+    second_down = mx.array([[0.5, 0.0, 0.0, 0.0], [0.0, -0.5, 0.0, 0.0]])
+    second_up = mx.array([[0.1, 0.0], [0.0, 0.1], [0.1, 0.0], [0.0, 0.1]])
+    mx.save_safetensors(
+        str(first_path),
+        {
+            "diffusion_model.transformer_blocks.0.attn.to_out.0.lora_A.weight": first_down,
+            "diffusion_model.transformer_blocks.0.attn.to_out.0.lora_B.weight": first_up,
+            "diffusion_model.transformer_blocks.0.attn.to_out.0.alpha": mx.array(2.0),
+            "diffusion_model.transformer_blocks.0.img_mlp.gate_layer.lora_A.weight": first_down,
+            "diffusion_model.transformer_blocks.0.img_mlp.gate_layer.lora_B.weight": mx.concatenate(
+                [first_up, first_up], axis=0
+            ),
+        },
+    )
+    mx.save_safetensors(
+        str(second_path),
+        {
+            "base_model.model.transformer_blocks.0.attn.to_out.0.lora_A.default.weight": second_down,
+            "base_model.model.transformer_blocks.0.attn.to_out.0.lora_B.default.weight": second_up,
+            "transformer_blocks.0.img_mlp.proj.lora_A.weight": second_down,
+            "transformer_blocks.0.img_mlp.proj.lora_B.weight": mx.concatenate(
+                [second_up, second_up], axis=0
+            ),
+        },
+    )
+    model = QwenImage21Transformer(
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        attention_head_dim=2,
+        num_attention_heads=2,
+        context_in_dim=4,
+        mlp_ratio=2,
+        axes_dims_rope=(2, 2, 2),
+    )
+    mx.eval(model.parameters())
+    base_out = mx.array(model.transformer_blocks[0].attn.to_out[0].weight)
+    sample = mx.array([[1.0, 2.0, 3.0, 4.0]])
+    try:
+        resolved, strengths = transformer_lora.apply_transformer_loras(
+            "qwen_image_21",
+            model,
+            (
+                LoraRef("qwen21-first.safetensors", 0.5),
+                LoraRef("qwen21-second.safetensors", 0.25),
+            ),
+        )
+        result = model.transformer_blocks[0].attn.to_out[0](sample)
+    finally:
+        paths.MODEL_ROOT = old_root
+    expected = sample @ base_out.T
+    expected = expected + 0.5 * (2.0 / 2.0) * ((sample @ first_down.T) @ first_up.T)
+    expected = expected + 0.25 * ((sample @ second_down.T) @ second_up.T)
+    from mflux.models.common.lora.layer.fused_linear_lora_layer import FusedLoRALinear
+    from mflux.models.common.lora.layer.linear_lora_layer import LoRALinear
+
+    check(
+        "Qwen-Image 2.1 LoRA 支持 to_out.0 列表路径、PEFT/default、多适配器和 alpha/strength",
+        resolved == [str(first_path.absolute()), str(second_path.absolute())]
+        and strengths == [0.5, 0.25]
+        and isinstance(model.transformer_blocks[0].attn.to_out[0], FusedLoRALinear)
+        and isinstance(model.transformer_blocks[0].img_mlp.gate_layer, LoRALinear)
+        and isinstance(model.transformer_blocks[0].img_mlp.proj, LoRALinear)
+        and np.allclose(np.asarray(result), np.asarray(expected), atol=2e-3, rtol=2e-3),
+        f"resolved={resolved}, strengths={strengths}",
+    )
+
+
+def _quantize_tiny_qwen21(model):
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda _path, module: isinstance(module, nn.Linear)
+        and int(module.weight.shape[-1]) % 32 == 0,
+    )
+    return model
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    old_root = paths.MODEL_ROOT
+    paths.MODEL_ROOT = Path(temporary)
+    (paths.MODEL_ROOT / "lora").mkdir()
+    quant_path = paths.MODEL_ROOT / "lora" / "qwen21-quant.safetensors"
+    mx.save_safetensors(
+        str(quant_path),
+        {
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_A.weight": mx.zeros((2, 32)),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_B.weight": mx.zeros((32, 2)),
+        },
+    )
+    quantized = _quantize_tiny_qwen21(
+        QwenImage21Transformer(
+            in_channels=4,
+            out_channels=4,
+            num_layers=1,
+            attention_head_dim=16,
+            num_attention_heads=2,
+            context_in_dim=32,
+            mlp_ratio=2,
+            axes_dims_rope=(4, 6, 6),
+        )
+    )
+    base_layer = quantized.transformer_blocks[0].attn.to_q
+    try:
+        transformer_lora.apply_transformer_loras(
+            "qwen_image_21", quantized, (LoraRef("qwen21-quant.safetensors", 1.0),)
+        )
+    finally:
+        paths.MODEL_ROOT = old_root
+    quantized_lora = quantized.transformer_blocks[0].attn.to_q
+    check(
+        "Qwen-Image 2.1 LoRA 保留 q4 packed base Linear",
+        isinstance(quantized_lora, LoRALinear)
+        and isinstance(quantized_lora.linear, nn.QuantizedLinear)
+        and quantized_lora.linear is base_layer,
+    )
+
+
 class BadShapeLoader:
     @staticmethod
     def load_and_apply_lora(**kwargs):
@@ -347,7 +493,7 @@ with tempfile.TemporaryDirectory() as temporary:
         paths.MODEL_ROOT = old_root
 
 
-# ----------------------------------------------------- 6. strength=0、缓存隔离、CLIP 拒绝
+# ----------------------------------------------------- 7. strength=0、缓存隔离、CLIP 拒绝
 check(
     "strength=0 被严格跳过",
     transformer_lora.active_loras((LoraRef("a.safetensors", 0.0),)) == (),
@@ -376,6 +522,31 @@ lora_key_2 = pipeline.h3_component_cache_key(
 check(
     "H3 基础模型、LoRA 强度与组合使用隔离缓存键",
     len({base_key, lora_key_1, lora_key_2}) == 3,
+)
+qwen21_base = MlxModelHandle(
+    model_type="qwen_image_21",
+    model_path="Qwen-Image-2.1",
+    quantize=8,
+    precision="bfloat16",
+    compile=False,
+    compile_cache_limit=0,
+)
+qwen21_lora = replace(qwen21_base, loras=(LoraRef("style.safetensors", 1.0),))
+check(
+    "Qwen-Image 2.1 transformer 缓存键包含 LoRA 组合",
+    pipeline.transformer_cache_key(qwen21_base) != pipeline.transformer_cache_key(qwen21_lora),
+)
+noise_params = {
+    "seed": 42,
+    "steps": 20,
+    "height": 1024,
+    "width": 1024,
+    "batch_size": 1,
+}
+check(
+    "采样 latent 缓存键隔离基础模型与 LoRA 模型",
+    pipeline.sampler_cache_key(qwen21_base, noise_params, "qwen-image-2.1")
+    != pipeline.sampler_cache_key(qwen21_lora, noise_params, "qwen-image-2.1"),
 )
 clip = MlxClipHandle(
     model_type="z_image",

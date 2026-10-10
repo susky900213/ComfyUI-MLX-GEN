@@ -24,6 +24,7 @@ _IMAGE_MAPPING_IMPORTS = {
     "flux2": "mflux.models.flux2.weights.flux2_lora_mapping:Flux2LoRAMapping",
     "qwen_image": "mflux.models.qwen.weights.qwen_lora_mapping:QwenLoRAMapping",
     "qwen_edit": "mflux.models.qwen.weights.qwen_lora_mapping:QwenLoRAMapping",
+    "qwen_image_21": "comfyui_mlx_gen.qwen_image_21.lora_mapping:QwenImage21LoRAMapping",
     "ideogram4": "mflux.models.ideogram4.weights.ideogram4_lora_mapping:Ideogram4LoRAMapping",
 }
 
