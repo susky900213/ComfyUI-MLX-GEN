@@ -48,7 +48,12 @@ _TYPE_CAPS: dict[str, int] = {
 
 
 class Cache:
-    def __init__(self) -> None:
+    def __init__(self, caps: dict[str, int] | None = None) -> None:
+        # Most nodes use the conservative process-wide limits above.  A node
+        # that deliberately owns a complete short-lived batch (for example,
+        # one reference condition per storyboard panel) may provide larger
+        # limits without changing the behaviour of unrelated workflows.
+        self._caps = {**_TYPE_CAPS, **(caps or {})}
         self._data: dict[str, OrderedDict[str, Any]] = {}
 
     def get_or_create(self, type_: str, key: str, factory: Callable[[], Any]) -> tuple[Any, bool]:
@@ -60,7 +65,7 @@ class Cache:
             return bucket[key], True
         value = factory()
         bucket[key] = value
-        cap = _TYPE_CAPS.get(type_, 4)
+        cap = self._caps.get(type_, 4)
         while len(bucket) > cap:
             _old_key, old_value = bucket.popitem(last=False)
             _dispose(old_value)

@@ -1665,7 +1665,7 @@ def _sample_qwen_image_21(defn, comps, params, cache, guidance, on_progress=None
             "Qwen-Image 2.1 只能使用 flow_match_euler_discrete scheduler，"
             f"收到 {params['scheduler_name']!r}"
         )
-    height, width = qwen21_sampling.validate_dimensions(params["height"], params["width"])
+    height, width = qwen21_sampling.aligned_dimensions(params["height"], params["width"])
     latent_h, latent_w = height // 16, width // 16
     positive = cached_encoding(cache, params["positive_encoding_key"], "正")
     negative = (
@@ -1955,7 +1955,11 @@ def decode_latents(defn, comps, latents, height, width):
         return vae.decode(unpacked)
     if defn.family == "qwen_image_21":
         unpacked = qwen21_sampling.unpack_latents(latents, height, width)
-        return vae.decode(unpacked)
+        decoded = vae.decode(unpacked)
+        # Sampling uses the next 32-pixel boundary so the DiT can form 2×2
+        # latent blocks.  Restore the exact dimensions entered by the user.
+        requested_height, requested_width = qwen21_sampling.validate_dimensions(height, width)
+        return decoded[..., :requested_height, :requested_width]
     if defn.family == "flux2":
         if latents.ndim == 2:
             latents = latents[None, ...]  # [seq, C] → [1, seq, C]

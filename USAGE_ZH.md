@@ -113,6 +113,49 @@ mlx/
 模型下拉框是在扫描模型目录后生成的。新放入模型后如果下拉框没有更新，请完整重启
 ComfyUI，而不只是刷新浏览器。
 
+### 1.4 漫画分镜自动拆分：`MLX 漫画分镜自动拆分`
+
+这个节点用于把一张漫画/故事板总图拆成后续 Qwen-Image 2.1 编辑用的图片 batch。
+默认 `split_mode=auto` 时**不需要填写分镜数量**：节点会在当前图像内分析横向、纵向的
+空白 gutter、边框和均匀分隔带，并递归判断应该切成几个面板。例如规则的 2×3 分镜图会
+自动输出 6 张图，顺序默认为从上到下、从左到右。
+
+输入和输出：
+
+- `images`：ComfyUI `IMAGE`，可以是单张图或 batch；batch 中每张源图会独立检测，结果
+  按源图顺序合并。
+- `split_mode`：推荐 `auto`。`grid`、`horizontal`、`vertical` 是自动识别不理想时的
+  手动兜底模式，此时使用 `grid_rows` / `grid_columns`。
+- `margin`、`separator_width`：忽略外边距和分隔带宽度；扫描图边框较宽时适当增大
+  `separator_width`。
+- `expansion_pixels`：在检测框外向四周扩展的像素数，适合不希望切到人物或对白边缘的情况。
+- `min_panel_width`、`min_panel_height`、`auto_sensitivity`、`max_panels`：自动检测的
+  尺寸过滤、敏感度和安全上限。小面板被过滤或页面纹理复杂时，优先调整这几个参数。
+- `output_width` / `output_height`：输出 batch 必须统一尺寸；填 `0` 会使用本次检测到的
+  最大宽/高。`fit_mode=aspect_fit_pad` 会保持比例并补边，通常比 `stretch` 更适合 Qwen
+  编辑；输出尺寸过小而 `fit_mode=pad` 无法容纳面板时，请改用比例补边。
+- `panels`：统一尺寸的 `IMAGE` batch，可直接接到现有的 Qwen-Image 2.1 编辑工作流的
+  参考图输入。
+- `panel_masks`：对应的 `MASK` batch；比例补边区域为 0，实际面板区域为 1。
+- `panel_report`：包含每张源图的面板数量、源图坐标、裁剪坐标和输出有效区域的 JSON
+  字符串，便于调试或后处理。
+
+推荐连接方式：
+
+```text
+Load Image
+    → MLX 漫画分镜自动拆分（split_mode=auto）
+        → panels → Qwen-Image 2.1 编辑链路的参考图输入
+        → panel_masks（可选）
+        → panel_report（可选，接到字符串预览/保存节点）
+```
+
+自动模式是基于图像结构的本地检测，不会加载视觉 Transformer，也不会理解没有边界的
+语义分镜。面板之间没有明显空白/边框、面板严重倾斜、背景和 gutter 颜色相同，或存在
+大量贯穿画面的装饰线时，检测可能合并或误切；此时请切换到 `grid` / `horizontal` /
+`vertical`，并检查 `panel_report` 中的坐标。它不会修改现有 Qwen 模型、VAE 或采样器，
+只是为后续工作流准备 `IMAGE` batch。
+
 ## 2. 模型放置总表
 
 下表中的“目录名”与示例工作流序列化的默认值一致。模型仓库只是常见来源；下载后仍需按

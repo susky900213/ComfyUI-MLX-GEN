@@ -51,6 +51,7 @@ from .. import pipeline, runtime
 from ..cache import CACHE
 from ..h3 import pipeline as h3_pipeline
 from ..h3.latent_creator.h3_layout import valid_frame_counts
+from ..qwen_image_21 import sampling as qwen21_sampling
 from ..types import condition, entry_for, model, model_types, ref_images, validate_model_family
 
 SCHEDULERS = [
@@ -64,8 +65,9 @@ SCHEDULERS = [
     "yue2_midpoint",
 ]
 KV_CACHE_MODES = ["auto", "off"]
-# 画布档位：图片链路原有的几档 + MiniMax-H3 的推荐档位（H3 必须是 32 的倍数，
-# 且宽高比要在 [1/4, 4] 之内；见 h3/pipeline.make_plan）
+# H3 二阶段节点和命令行工具仍复用这些推荐档位；公共 MlxKSamplerMLX 的图片
+# width / height 则使用可手输的 INT widget。Qwen-Image 2.1 对非 32 倍数的尺寸
+# 会在内部向上对齐，解码后裁回用户填写的尺寸。
 WIDTH_OPTIONS = [256, 352, 384, 512, 544, 640, 768, 960, 1024, 1280, 1344, 1536, 2048]
 HEIGHT_OPTIONS = [256, 352, 384, 512, 544, 640, 768, 960, 1024, 1280, 1344, 1536]
 # MiniMax-H3 只接受 17n+5 的帧数（124 ~ 345，其余值直接不在下拉里）
@@ -96,8 +98,28 @@ class MlxKSamplerMLX:
                     },
                 ),
                 "steps": ("INT", {"default": entry.default_steps, "min": 1, "max": 100}),
-                "width": (WIDTH_OPTIONS, {"default": 512}),
-                "height": (HEIGHT_OPTIONS, {"default": 512}),
+                # 不使用下拉档位：Qwen-Image 2.1 等模型可以直接填自定义画布。
+                # step 只影响前端加减按钮，任意 32–4096 范围内的整数都可输入。
+                "width": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": 32,
+                        "max": 4096,
+                        "step": 32,
+                        "tooltip": "自定义画布宽度；非 32 倍数会在内部对齐后裁回",
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": 32,
+                        "max": 4096,
+                        "step": 32,
+                        "tooltip": "自定义画布高度；非 32 倍数会在内部对齐后裁回",
+                    },
+                ),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4}),
                 # 初值取「第一个大类」的 default_guidance（本机是 z_image 的 1.0）；
                 # Qwen 编辑请在 2.5~4.0（该大类登记的是 2.5，工作流里显式写 2.5）
@@ -193,6 +215,11 @@ class MlxKSamplerMLX:
         validate_model_family(model.model_type, model.model_path)
         if not entry.supported:
             raise NotImplementedError(f"{model.model_type} 尚未实现：{entry.notes}")
+
+        if entry.family == "qwen_image_21":
+            # 只做基础范围校验；非 32 倍数会在 Qwen 2.1 采样内部对齐，不能在
+            # 这里拒绝，否则自定义画布仍然无法使用。
+            qwen21_sampling.validate_dimensions(height, width)
 
         # MiniMax-H3：一条打包序列里同时去噪视频与音频（guidance 蒸馏模型，每步只有
         # 一次前向），所以 scheduler / guidance / 负向条件三个 widget 都不看；

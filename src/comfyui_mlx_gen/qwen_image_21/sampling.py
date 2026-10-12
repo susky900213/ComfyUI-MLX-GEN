@@ -10,22 +10,32 @@ import numpy as np
 
 def validate_dimensions(height: int, width: int) -> tuple[int, int]:
     height, width = int(height), int(width)
-    if height < 32 or width < 32 or height % 32 or width % 32:
-        raise ValueError(
-            f"Qwen-Image 2.1 的宽高必须是 32 的倍数且至少 32，收到 {width}×{height}"
-        )
+    if height < 32 or width < 32:
+        raise ValueError(f"Qwen-Image 2.1 的宽高必须至少为 32，收到 {width}×{height}")
     return height, width
 
 
-def create_noise(seed: int, height: int, width: int, dtype=mx.bfloat16) -> mx.array:
+def aligned_dimensions(height: int, width: int) -> tuple[int, int]:
+    """Return the internal canvas used by the 2×2 latent-block transformer.
+
+    The public canvas may have arbitrary integer dimensions.  Qwen-Image 2.1
+    operates on VAE latents in 2×2 blocks, so each latent side must be even;
+    rounding the pixel canvas up to the next 32-pixel boundary satisfies that
+    contract.  The decoder crops the result back to the public dimensions.
+    """
     height, width = validate_dimensions(height, width)
+    return ((height + 31) // 32 * 32, (width + 31) // 32 * 32)
+
+
+def create_noise(seed: int, height: int, width: int, dtype=mx.bfloat16) -> mx.array:
+    height, width = aligned_dimensions(height, width)
     mx.random.seed(int(seed))
     latent_h, latent_w = height // 16, width // 16
     return mx.random.normal((1, latent_h * latent_w, 64)).astype(dtype)
 
 
 def unpack_latents(latents: mx.array, height: int, width: int) -> mx.array:
-    height, width = validate_dimensions(height, width)
+    height, width = aligned_dimensions(height, width)
     if latents.ndim == 2:
         latents = latents[None]
     batch, sequence, channels = latents.shape

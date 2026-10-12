@@ -397,7 +397,9 @@ def _load_single_transformer(
     loaded: set[str] = set()
     if log:
         log(f"[Qwen-Image 2.1 加载] transformer 单文件: {path.name}")
-    raw = mx.load(str(path))
+    # Hugging Face blob cache paths may have no suffix, so MLX cannot infer the
+    # format from the filename even though the header was already validated.
+    raw = mx.load(str(path), format="safetensors")
     entries: list[tuple[str, mx.array]] = []
     for source_key, source_tensor in raw.items():
         if source_key not in plan:

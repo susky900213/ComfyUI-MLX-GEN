@@ -623,6 +623,24 @@ def test_dynamic_schedule_and_latent_contract():
     assert sampling.unpack_latents(latent, 32, 32).shape == (1, 64, 1, 2, 2)
 
 
+def test_sampler_exposes_custom_qwen21_canvas_inputs():
+    required = MlxKSamplerMLX.INPUT_TYPES()["required"]
+    for name in ("width", "height"):
+        input_type, options = required[name]
+        assert input_type == "INT"
+        assert options["default"] == 512
+        assert options["min"] == 32
+        assert options["max"] == 4096
+        assert options["step"] == 32
+
+    assert sampling.validate_dimensions(896, 1152) == (896, 1152)
+    assert sampling.validate_dimensions(896, 1150) == (896, 1150)
+    assert sampling.aligned_dimensions(896, 1150) == (896, 1152)
+    custom = sampling.create_noise(7, 33, 47, dtype=mx.float32)
+    assert custom.shape == (1, 4 * 4, 64)
+    assert sampling.unpack_latents(custom, 33, 47).shape == (1, 64, 1, 4, 4)
+
+
 def test_sampler_requires_the_same_qwen21_reference_on_both_condition_branches():
     clip = MlxClipHandle(
         model_type=QWEN_IMAGE_21_FAMILY,

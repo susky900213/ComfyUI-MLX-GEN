@@ -25,6 +25,9 @@ from .vae_encoder import MlxVAEEncoder
 from .vae_loader import MlxVAELoader
 from .save import MlxSaveImage
 from .pil_to_torch import MlxPilToTorch
+from .directory_images import MlxLoadImagesFromDirectory, MlxSaveImagesToDirectory
+from .comic_storyboard_splitter import MlxComicStoryboardSplitter
+from .storyboard_batch_edit import MlxQwenImage21StoryboardBatchEdit
 from .whisper_transcribe import MlxWhisperTranscribe
 from .qwen_image_pe import MlxQwenImagePEI2I, MlxQwenImagePET2I
 from .yue2_melody import MlxYue2MelodyFromAudio
@@ -54,6 +57,10 @@ __all__ = [
     "MlxVAEDecodeRawPIL",
     "MlxSaveImage",
     "MlxPilToTorch",
+    "MlxLoadImagesFromDirectory",
+    "MlxSaveImagesToDirectory",
+    "MlxComicStoryboardSplitter",
+    "MlxQwenImage21StoryboardBatchEdit",
     "MlxWhisperTranscribe",
     "MlxQwenImagePET2I",
     "MlxQwenImagePEI2I",
