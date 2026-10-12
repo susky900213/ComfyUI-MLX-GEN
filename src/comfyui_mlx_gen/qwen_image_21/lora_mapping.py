@@ -16,6 +16,16 @@ from mflux.models.common.lora.mapping.lora_mapping import LoRAMapping, LoRATarge
 
 def _target(module_path: str, source_path: str) -> LoRATarget:
     """Build the standard Diffusers/Comfy LoRA spellings for one local layer."""
+    # LyCORIS/ai-toolkit flattens module paths for LoKr keys, for example:
+    # ``transformer_blocks.0.attn.to_q`` becomes
+    # ``lycoris_transformer_blocks_0_attn_to_q``.  mflux already implements
+    # the LoKr math; the mapping only needs to expose these source spellings.
+    flattened_source = source_path.replace(".", "_")
+    lokr_bases = [
+        f"lycoris_{flattened_source}",
+        f"lycoris__{flattened_source}",
+        f"lora_unet_{flattened_source}",
+    ]
     return LoRATarget(
         model_path=module_path,
         possible_up_patterns=[
@@ -42,7 +52,10 @@ def _target(module_path: str, source_path: str) -> LoRATarget:
             f"{source_path}.alpha",
             f"diffusion_model.{source_path}.alpha",
             f"transformer.{source_path}.alpha",
+            *(f"{base}.alpha" for base in lokr_bases),
         ],
+        possible_lokr_w1_patterns=[f"{base}.lokr_w1" for base in lokr_bases],
+        possible_lokr_w2_patterns=[f"{base}.lokr_w2" for base in lokr_bases],
     )
 
 

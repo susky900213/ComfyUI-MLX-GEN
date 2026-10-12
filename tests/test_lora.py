@@ -91,6 +91,17 @@ check(
     },
     str(sorted(qwen21_targets)),
 )
+qwen21_lokr_patterns = [
+    pattern
+    for target in transformer_lora.mapping_for_family("qwen_image_21")
+    for pattern in target.possible_lokr_w1_patterns + target.possible_lokr_w2_patterns
+]
+check(
+    "Qwen-Image 2.1 mapping 覆盖 LyCORIS/LoKr 扁平键",
+    "lycoris_transformer_blocks_{block}_attn_to_q.lokr_w1" in qwen21_lokr_patterns
+    and "lora_unet_transformer_blocks_{block}_img_mlp_out.lokr_w2" in qwen21_lokr_patterns,
+    str(qwen21_lokr_patterns[:8]),
+)
 check_raises(
     "音频家族 LoRA 明确拒绝",
     ValueError,
@@ -441,6 +452,95 @@ with tempfile.TemporaryDirectory() as temporary:
         and isinstance(quantized_lora.linear, nn.QuantizedLinear)
         and quantized_lora.linear is base_layer,
     )
+
+
+# --------------------------------------------------------- 6b. Qwen-Image 2.1 LyCORIS/LoKr
+with tempfile.TemporaryDirectory() as temporary:
+    old_root = paths.MODEL_ROOT
+    paths.MODEL_ROOT = Path(temporary)
+    (paths.MODEL_ROOT / "lora").mkdir()
+    lokr_path = paths.MODEL_ROOT / "lora" / "qwen21-lokr.safetensors"
+    mx.save_safetensors(
+        str(lokr_path),
+        {
+            "lycoris_transformer_blocks_0_attn_to_q.alpha": mx.array(1.0),
+            "lycoris_transformer_blocks_0_attn_to_q.lokr_w1": mx.eye(2),
+            "lycoris_transformer_blocks_0_attn_to_q.lokr_w2": mx.eye(2),
+        },
+    )
+    lokr_model = QwenImage21Transformer(
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        attention_head_dim=2,
+        num_attention_heads=2,
+        context_in_dim=4,
+        mlp_ratio=2,
+        axes_dims_rope=(2, 2, 2),
+    )
+    mx.eval(lokr_model.parameters())
+    lokr_base = mx.array(lokr_model.transformer_blocks[0].attn.to_q.weight)
+    lokr_input = mx.array([[1.0, 2.0, 3.0, 4.0]])
+    try:
+        lokr_resolved, lokr_strengths = transformer_lora.apply_transformer_loras(
+            "qwen_image_21", lokr_model, (LoraRef("qwen21-lokr.safetensors", 0.5),)
+        )
+        lokr_output = lokr_model.transformer_blocks[0].attn.to_q(lokr_input)
+    finally:
+        paths.MODEL_ROOT = old_root
+    from mflux.models.common.lora.layer.linear_lokr_layer import LoKrLinear
+
+    check(
+        "Qwen-Image 2.1 LyCORIS/LoKr 真正包装目标 Linear",
+        lokr_resolved == [str(lokr_path.absolute())]
+        and lokr_strengths == [0.5]
+        and isinstance(lokr_model.transformer_blocks[0].attn.to_q, LoKrLinear)
+        and np.allclose(
+            np.asarray(lokr_output),
+            np.asarray(lokr_input @ lokr_base.T + 0.5 * lokr_input),
+            atol=2e-3,
+            rtol=2e-3,
+        ),
+        f"resolved={lokr_resolved}, strengths={lokr_strengths}",
+    )
+
+
+# A legacy 60-block Qwen-Image LoKr must fail before mflux mutates the model.
+with tempfile.TemporaryDirectory() as temporary:
+    old_root = paths.MODEL_ROOT
+    paths.MODEL_ROOT = Path(temporary)
+    (paths.MODEL_ROOT / "lora").mkdir()
+    incompatible_path = paths.MODEL_ROOT / "lora" / "legacy-qwen-lokr.safetensors"
+    mx.save_safetensors(
+        str(incompatible_path),
+        {
+            "lycoris_transformer_blocks_1_attn_to_q.lokr_w1": mx.eye(2),
+            "lycoris_transformer_blocks_1_attn_to_q.lokr_w2": mx.eye(2),
+        },
+    )
+    incompatible_model = QwenImage21Transformer(
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        attention_head_dim=2,
+        num_attention_heads=2,
+        context_in_dim=4,
+        mlp_ratio=2,
+        axes_dims_rope=(2, 2, 2),
+    )
+    try:
+        check_raises(
+            "不兼容的旧 Qwen LoKr 在修改模型前明确拒绝",
+            RuntimeError,
+            "只有 1 个 block",
+            lambda: transformer_lora.apply_transformer_loras(
+                "qwen_image_21",
+                incompatible_model,
+                (LoraRef("legacy-qwen-lokr.safetensors", 1.0),),
+            ),
+        )
+    finally:
+        paths.MODEL_ROOT = old_root
 
 
 class BadShapeLoader:

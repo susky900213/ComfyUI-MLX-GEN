@@ -10,6 +10,7 @@ MiniMax-H3 的模型实现位于本插件内，且已发布的 ComfyUI LoRA 还�
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -131,6 +132,8 @@ def apply_transformer_loras(
         + ", ".join(f"{Path(path).name}@{scale:g}" for path, scale in zip(resolved, scales))
     )
     try:
+        if family == "qwen_image_21":
+            _validate_qwen_image_21_lora_compatibility(resolved, transformer, mapping)
         applied_paths, applied_scales = loader.load_and_apply_lora(
             lora_mapping=mapping,
             transformer=transformer,
@@ -147,6 +150,147 @@ def apply_transformer_loras(
         ) from exc
     print(f"[MLX LoRA] {family}/{role}: 已成功应用 {len(applied_paths)} 个适配器")
     return list(applied_paths), list(applied_scales)
+
+
+def _match_lora_pattern(pattern: str, key: str) -> int | None:
+    """Match one mflux mapping pattern and return its block number.
+
+    Qwen's LyCORIS keys flatten dots to underscores, so using a normal path
+    split here would be incorrect.  The mapping has already limited the
+    pattern to one target; this helper only resolves ``{block}``.
+    """
+    if "{block}" not in pattern:
+        return 0 if pattern == key else None
+    prefix, suffix = pattern.split("{block}", 1)
+    if not key.startswith(prefix) or not key.endswith(suffix):
+        return None
+    block_text = key[len(prefix) : len(key) - len(suffix) if suffix else None]
+    if not block_text.isdigit():
+        return None
+    return int(block_text)
+
+
+def _target_for_lokr_key(mapping: list[Any], key: str) -> tuple[Any, int] | None:
+    """Find the mapping target named by a LoKr factor key."""
+    suffix = ".lokr_w1"
+    if not key.endswith(suffix):
+        return None
+    for target in mapping:
+        for pattern in target.possible_lokr_w1_patterns:
+            block = _match_lora_pattern(pattern, key)
+            if block is not None:
+                return target, block
+    return None
+
+
+def _get_module_by_path(module: Any, path: str) -> Any:
+    """Resolve an MLX module path, including list indexes such as ``to_out.0``."""
+    current = module
+    for part in path.split("."):
+        if part.isdigit():
+            current = current[int(part)]
+        elif isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            current = getattr(current, part)
+    return current
+
+
+def _validate_qwen_image_21_lora_compatibility(
+    resolved: list[str], transformer: Any, mapping: list[Any]
+) -> None:
+    """Reject a known-incompatible Qwen LoKr before mutating the base model.
+
+    ``mflux`` supports LoKr itself, but it can only report a mismatch after it
+    has started replacing target modules.  Qwen-Image 2.1 has 32 blocks with
+    4096-wide attention, while older Qwen-Image LoKr files commonly have 60
+    blocks with 3072-wide attention.  Reading only safetensors headers lets us
+    turn that late, ambiguous failure into an actionable error.
+    """
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        # mflux already depends on safetensors; if an unusual installation does
+        # not expose the Python package, let its normal loader report the error.
+        return
+
+    for path in resolved:
+        try:
+            with safe_open(path, framework="numpy") as file:
+                keys = list(file.keys())
+                lokr_keys = [key for key in keys if key.endswith(".lokr_w1")]
+                if not lokr_keys:
+                    continue
+                metadata = file.metadata() or {}
+                block_numbers = {
+                    int(match.group(1))
+                    for key in lokr_keys
+                    if (match := re.search(r"transformer_blocks_(\d+)_", key))
+                }
+                block_count = len(getattr(transformer, "transformer_blocks", ()))
+                too_many_blocks = block_numbers and max(block_numbers) >= block_count
+                mismatch: tuple[str, tuple[int, int], tuple[int, int]] | None = None
+
+                for w1_key in lokr_keys:
+                    match = _target_for_lokr_key(mapping, w1_key)
+                    if match is None:
+                        continue
+                    target, block = match
+                    w2_key = w1_key[: -len(".lokr_w1")] + ".lokr_w2"
+                    if w2_key not in keys:
+                        continue
+                    target_path = target.model_path.format(block=block)
+                    try:
+                        target_module = _get_module_by_path(transformer, target_path)
+                        expected_out, packed_input = target_module.weight.shape
+                        bits = getattr(target_module, "bits", None)
+                        expected_input = (
+                            int(packed_input) * (32 // int(bits))
+                            if bits is not None
+                            else int(packed_input)
+                        )
+                        w1_shape = tuple(file.get_slice(w1_key).get_shape())
+                        w2_shape = tuple(file.get_slice(w2_key).get_shape())
+                        if len(w1_shape) != 2 or len(w2_shape) != 2:
+                            continue
+                        actual = (
+                            int(w1_shape[0]) * int(w2_shape[0]),
+                            int(w1_shape[1]) * int(w2_shape[1]),
+                        )
+                        expected = (int(expected_out), expected_input)
+                        if actual != expected and mismatch is None:
+                            mismatch = (target_path, actual, expected)
+                    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                        # An unsupported target is left to mflux, which will
+                        # include the exact target path in its normal error.
+                        continue
+
+                if too_many_blocks or mismatch is not None:
+                    base_model = metadata.get("ss_base_model_version", "未知")
+                    details: list[str] = []
+                    if too_many_blocks:
+                        details.append(
+                            f"LoRA 包含最高第 {max(block_numbers)} 个 transformer block，"
+                            f"当前 2.1 模型只有 {block_count} 个 block"
+                        )
+                    if mismatch is not None:
+                        target_path, actual, expected = mismatch
+                        details.append(
+                            f"目标 {target_path} 的 LoKr 重建尺寸为 {actual[0]}×{actual[1]}，"
+                            f"当前模型需要 {expected[0]}×{expected[1]}"
+                        )
+                    raise ValueError(
+                        f"LoRA {Path(path).name} 与 Qwen-Image 2.1 Transformer 架构不兼容："
+                        + "；".join(details)
+                        + f"。文件 metadata 的 ss_base_model_version={base_model!r}。"
+                        "这通常表示它是旧版 qwen_image LoRA，而不是 Qwen-Image 2.1 LoRA；"
+                        "请换用包含 32 个 transformer_blocks、且目标维度为 4096 的 2.1 LoRA。"
+                    )
+                # A file with only unsupported names should retain mflux's
+                # detailed unmatched-key error rather than being mislabeled by
+                # this preflight.
+        except OSError as exc:
+            raise ValueError(f"无法读取 LoRA 文件头 {Path(path).name}: {exc}") from exc
 
 
 def _base_linear_shape(linear: Any) -> tuple[int, int]:
