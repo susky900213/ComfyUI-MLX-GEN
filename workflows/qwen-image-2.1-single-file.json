@@ -92,7 +92,7 @@
       "outputs": [{"name": "latents", "type": "latents", "links": [6], "slot_index": 0}],
       "properties": {"Node name for S&R": "MlxKSamplerMLX"},
       "title": "Qwen-Image 2.1 T2I（40 步 / prefix KV）",
-      "widgets_values": [42, "randomize", 40, 1024, 1024, 1, 1.0, "flow_match_euler_discrete", 124, 12.0, 3.0, "auto"]
+      "widgets_values": [42, 40, 1024, 1024, 1, 1.0, "flow_match_euler_discrete", 124, 12.0, 3.0, "auto"]
     },
     {
       "id": 7,

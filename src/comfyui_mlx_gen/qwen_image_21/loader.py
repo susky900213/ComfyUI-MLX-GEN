@@ -3,7 +3,10 @@
 The 13 GiB transformer and 16 GiB text encoder must not follow mflux's
 ``load-all -> quantize-copy`` path.  This loader constructs the final module
 shape first, then consumes one safetensors shard at a time and immediately
-converts/quantizes every tensor before releasing the shard.
+converts/quantizes every tensor before releasing the shard.  The native MLX
+export is handled separately: its ``weight/scales/biases`` tensors are already
+quantized and must be installed as-is, never passed through ``mx.quantize`` a
+second time.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ _DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32
 _FLOAT_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
 _SAFETENSORS_FLOAT_DTYPES = {"F16", "BF16", "F32"}
 _SAFETENSORS_ITEMSIZE = {"F16": 2, "BF16": 2, "F32": 4}
+_NATIVE_MODEL_TYPE = "qwen_image21"
+_NATIVE_ROLE_BITS = {"transformer": "dit_bits", "text_encoder": "te_bits"}
 
 # Zabin/Qwen_Image_2.1_Turbo_8Steps is a transformer-only export.  Unlike the
 # directory export, it has no config.json, so these values must be kept here
@@ -67,9 +72,69 @@ def read_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"Qwen-Image 2.1 配置不是合法 JSON（{file}）: {exc}") from exc
 
 
+def _native_quantization(path: str | Path, role: str) -> tuple[int, int] | None:
+    """Return ``(group_size, bits)`` for a native MLX component, if present.
+
+    The native export stores its quantization recipe in the model-root config,
+    while the component configs remain normal Diffusers configs.  A component
+    can therefore need to look one or two directories above its own config.
+    Merely having a ``quantization`` key is not enough: require the explicit
+    ``qwen_image21`` model type so a future Diffusers config cannot accidentally
+    enter this path.
+    """
+    if role not in _NATIVE_ROLE_BITS:
+        return None
+    value = Path(path)
+    roots = [value.parent, value.parent.parent] if value.is_file() else [value, value.parent, value.parent.parent]
+    seen: set[Path] = set()
+    for root in roots:
+        root = root.resolve()
+        if root in seen:
+            continue
+        seen.add(root)
+        config_path = root / "config.json"
+        if not config_path.is_file():
+            continue
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Qwen-Image 2.1 native 配置不是合法 JSON（{config_path}）: {exc}") from exc
+        if config.get("model_type") != _NATIVE_MODEL_TYPE:
+            continue
+        quantization = config.get("quantization")
+        if not isinstance(quantization, dict):
+            raise ValueError(f"Qwen-Image 2.1 native 配置缺少 quantization object: {config_path}")
+        try:
+            group_size = int(quantization["group_size"])
+            bits = int(quantization[_NATIVE_ROLE_BITS[role]])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Qwen-Image 2.1 native 配置缺少 {role} 的 group_size/bits: {config_path}"
+            ) from exc
+        if group_size <= 0 or bits not in (4, 8):
+            raise ValueError(
+                f"Qwen-Image 2.1 native 配置不支持 group_size={group_size}, bits={bits}: {config_path}"
+            )
+        return group_size, bits
+    return None
+
+
 def _transformer_config(path: str | Path) -> dict[str, Any]:
     root = Path(path)
     if root.is_file():
+        # A native single-file export may keep transformer/config.json beside
+        # the file.  The older Zabin export has no config and still uses the
+        # production defaults below.
+        for parent in (root.parent, root.parent.parent):
+            config = parent / "config.json"
+            if config.is_file():
+                value = json.loads(config.read_text(encoding="utf-8"))
+                # A sibling transformer/config.json is the real architecture
+                # config.  The model-root native config only contains the
+                # quantization recipe, so it intentionally falls through to
+                # DEFAULT_TRANSFORMER_CONFIG here.
+                if isinstance(value, dict) and value.get("model_type") != _NATIVE_MODEL_TYPE:
+                    return value
         return dict(DEFAULT_TRANSFORMER_CONFIG)
     return read_config(root)
 
@@ -465,6 +530,147 @@ def _quantize_entry(
     return values
 
 
+def _native_to_local(
+    role: str, source_key: str, tensor: mx.array
+) -> tuple[str, mx.array] | None:
+    """Map a native parameter and preserve the existing layout conversions."""
+    suffix = ""
+    base = source_key
+    if source_key.endswith(".scales"):
+        suffix, base = ".scales", source_key[: -len(".scales")]
+    elif source_key.endswith(".biases"):
+        suffix, base = ".biases", source_key[: -len(".biases")]
+    converted = _source_to_local(role, base, tensor)
+    if converted is None:
+        return None
+    return converted[0] + suffix, converted[1]
+
+
+def _native_local_key(role: str, source_key: str) -> str | None:
+    """Map a native parameter name without retaining a header tensor."""
+    converted = _native_to_local(role, source_key, mx.zeros((1,), dtype=mx.float32))
+    return converted[0] if converted is not None else None
+
+
+def _native_shards(path: str | Path) -> list[Path]:
+    root = Path(path)
+    if root.is_file():
+        return [root]
+    return _shards(root)
+
+
+def _native_quantized_parents(path: str | Path, role: str) -> set[str]:
+    """Read native qparameter names from headers, without mapping tensor data."""
+    parents: set[str] = set()
+    for shard in _native_shards(path):
+        header, _header_size = _read_safetensors_header(shard)
+        for source_key in header:
+            if source_key.endswith(".scales"):
+                local = _native_local_key(role, source_key)
+                if local is not None:
+                    parents.add(local[: -len(".scales")])
+    return parents
+
+
+def _load_native(
+    role: str,
+    path: str | Path,
+    group_size: int,
+    bits: int,
+    precision: str,
+    log: Callable[[str], None] | None,
+) -> LoadedQwenImage21Component:
+    """Load the native MLX ``weight/scales/biases`` representation directly."""
+    root = Path(path)
+    module = build_model(role, root)
+    base_expected = {key: tuple(value.shape) for key, value in tree_flatten(module.parameters())}
+    quantized_parents = _native_quantized_parents(root, role)
+    missing_weights = sorted(
+        parent for parent in quantized_parents if f"{parent}.weight" not in base_expected
+    )
+    if missing_weights:
+        raise ValueError(
+            f"Qwen-Image 2.1 native {role} 的量化参数没有对应模块：{missing_weights[:5]}"
+        )
+
+    def predicate(path_name: str, child: nn.Module) -> bool:
+        return path_name in quantized_parents and isinstance(child, (nn.Linear, nn.Embedding))
+
+    # This creates only the destination module structure.  No checkpoint
+    # tensor is passed to mx.quantize; all pre-quantized tensors are loaded
+    # below as weight/scales/biases.
+    nn.quantize(module, group_size=group_size, bits=bits, class_predicate=predicate)
+    quantized_modules = {
+        name: child
+        for name, child in module.named_modules()
+        if isinstance(child, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    }
+    missing_modules = sorted(quantized_parents - set(quantized_modules))
+    if missing_modules:
+        raise ValueError(
+            f"Qwen-Image 2.1 native {role} 的量化模块未能建立：{missing_modules[:5]}"
+        )
+
+    expected_values = dict(tree_flatten(module.parameters()))
+    expected = {key: tuple(value.shape) for key, value in expected_values.items()}
+    loaded: dict[str, tuple[int, ...]] = {}
+    dtype = _DTYPES[precision]
+    if log:
+        log(
+            f"[Qwen-Image 2.1 加载] {role}: native MLX q{bits}, "
+            f"group_size={group_size}"
+        )
+
+    for shard in _native_shards(root):
+        if log:
+            log(f"[Qwen-Image 2.1 加载] {role}: {shard.name}")
+        raw = mx.load(str(shard), format="safetensors")
+        entries: list[tuple[str, mx.array]] = []
+        for source_key, source_tensor in raw.items():
+            converted = _native_to_local(role, source_key, source_tensor)
+            if converted is None:
+                continue
+            key, tensor = converted
+            if key not in expected:
+                raise ValueError(
+                    f"Qwen-Image 2.1 native {role} 权重存在本地模块没有的键 "
+                    f"{key}（来自 {source_key}）"
+                )
+            shape = tuple(tensor.shape)
+            if shape != expected[key]:
+                raise ValueError(
+                    f"Qwen-Image 2.1 native {role} 形状不符: {key} "
+                    f"checkpoint={shape}, module={expected[key]}"
+                )
+            if key in loaded:
+                raise ValueError(f"Qwen-Image 2.1 native {role} 权重跨 shard 重复: {key}")
+            parent, _, leaf = key.rpartition(".")
+            if parent in quantized_modules and leaf in {"scales", "biases"}:
+                # MLX QuantizedLinear stores qparams as float32 even though
+                # this export serializes them as BF16.
+                tensor = source_tensor.astype(expected_values[key].dtype)
+            elif source_tensor.dtype in _FLOAT_DTYPES:
+                tensor = source_tensor.astype(dtype)
+            entries.append((key, tensor))
+            loaded[key] = shape
+        if entries:
+            module.update(tree_unflatten(entries), strict=False)
+            _eval(entries)
+        del raw, entries
+        gc.collect()
+        mx.clear_cache()
+
+    missing = sorted(set(expected) - set(loaded))
+    if missing:
+        raise ValueError(
+            f"Qwen-Image 2.1 native {role} 缺 {len(missing)} 个参数，前几个是 {missing[:5]}；"
+            "请确认组件软链指向官方 Qwen-Image-2.1 native 子目录"
+        )
+    if log:
+        log(f"[Qwen-Image 2.1 加载] {role} native 完成：{len(loaded)} 个参数")
+    return LoadedQwenImage21Component(role, module, bits, precision, str(root))
+
+
 def load(
     role: str,
     path: str,
@@ -483,6 +689,15 @@ def load(
             raise ValueError(
                 f"Qwen-Image 2.1 单文件只支持 transformer role，收到 {role}: {root}"
             )
+        native = _native_quantization(root, role)
+        if native is not None:
+            group_size, native_bits = native
+            if bits not in (None, native_bits):
+                raise ValueError(
+                    f"Qwen-Image 2.1 native checkpoint 已是 q{native_bits}，"
+                    f"不能按 q{bits} 再量化；请使用 quantize=0/{native_bits}"
+                )
+            return _load_native(role, root, group_size, native_bits, precision, log)
         return _load_single_transformer(root, bits, precision, log)
     if not root.is_dir():
         raise FileNotFoundError(f"Qwen-Image 2.1 {role} 目录不存在: {root}")
@@ -490,6 +705,16 @@ def load(
     # handle is harmless, but claiming it was quantized would be misleading.
     if role == "vae":
         bits = None
+
+    native = _native_quantization(root, role)
+    if native is not None:
+        group_size, native_bits = native
+        if bits not in (None, native_bits):
+            raise ValueError(
+                f"Qwen-Image 2.1 native checkpoint 已是 q{native_bits}，"
+                f"不能按 q{bits} 再量化；请使用 quantize=0/{native_bits}"
+            )
+        return _load_native(role, root, group_size, native_bits, precision, log)
 
     module = build_model(role, root)
     expected = {key: tuple(value.shape) for key, value in tree_flatten(module.parameters())}

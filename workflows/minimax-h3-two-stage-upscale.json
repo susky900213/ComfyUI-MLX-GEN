@@ -248,7 +248,6 @@
       "title": "① 一阶段：640×352 / 124 帧 / 8 步，停在第 4 步（σ_video 0.9231 / σ_audio 0.75），输出 denoised (x0) 交给放大网络",
       "widgets_values": [
         20260920,
-        "randomize",
         8,
         640,
         352,
@@ -357,7 +356,6 @@
       "title": "③ 二阶段：从 σ=0.7 接着走 4 步（总步数 8；音频跟视频同一 p 刻度收尾）",
       "widgets_values": [
         20260921,
-        "randomize",
         4,
         0.7,
         "follow_video"

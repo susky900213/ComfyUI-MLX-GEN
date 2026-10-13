@@ -1,0 +1,333 @@
+{
+  "id": "mlx-qwen-image-2-1-folder-batch-edit",
+  "revision": 0,
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        360,
+        240
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxClipLoader"
+      },
+      "title": "Qwen3-VL-8B（含视觉塔）",
+      "widgets_values": [
+        "qwen_image_21",
+        "text_encoder",
+        "Qwen-Image-2.1",
+        "bfloat16",
+        262144,
+        8
+      ]
+    },
+    {
+      "id": 2,
+      "type": "MlxTransformerLoader",
+      "pos": [
+        440,
+        40
+      ],
+      "size": [
+        380,
+        220
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxTransformerLoader"
+      },
+      "title": "Qwen-Image 2.1 统一 DiT",
+      "widgets_values": [
+        "qwen_image_21",
+        "Qwen-Image-2.1",
+        8,
+        "bfloat16",
+        false,
+        2
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MlxVAELoader",
+      "pos": [
+        40,
+        340
+      ],
+      "size": [
+        360,
+        220
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAELoader"
+      },
+      "title": "Qwen-Image 2.1 RGBA VAE（逐张编码 + 解码）",
+      "widgets_values": [
+        "qwen_image_21",
+        "Qwen-Image-2.1",
+        "bfloat16",
+        0,
+        "vae"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MlxQwenImage21FolderEdit",
+      "pos": [
+        900,
+        80
+      ],
+      "size": [
+        620,
+        720
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "link": 1,
+          "slot_index": 1
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2,
+          "slot_index": 2
+        },
+        {
+          "name": "model",
+          "type": "model",
+          "link": 3,
+          "slot_index": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "saved_files",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "success_count",
+          "type": "INT",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxQwenImage21FolderEdit"
+      },
+      "title": "Qwen-Image 2.1 文件夹逐张编辑（图片文字改为中文）",
+      "widgets_values": [
+        "",
+        "真实世界风格。人物的面部、发型、服装和身体比例保持原样，保持原图的构图和镜头视角，不要改变人物身份，不要改变人物数量，不要改变主体的动作和姿态，不要改变原图背景。如果图片中有任何文字、招牌、字幕、标签、包装文字或对话框，请识别其原意，将文字全部替换为准确、自然、清晰、可读的简体中文，并保持原文字的位置、字号层级、字体风格、颜色、方向和排版布局；没有文字时不要额外添加文字。",
+        "模糊，低清晰度，人物身份改变，人物数量改变，脸部变形，肢体畸形，英文文字，日文文字，韩文文字，乱码文字，不可读文字，错误翻译，水印，黑边，裁切主体",
+        42,
+        40,
+        1.0,
+        "flow_match_euler_discrete",
+        "auto",
+        1.0,
+        "采样时降分辨率"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "MlxPilToTorch",
+      "pos": [
+        1580,
+        220
+      ],
+      "size": [
+        340,
+        160
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "link": 4,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        },
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": null,
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxPilToTorch"
+      },
+      "title": "批量结果转为 ComfyUI 预览图像",
+      "widgets_values": []
+    },
+    {
+      "id": 6,
+      "type": "PreviewImage",
+      "pos": [
+        1980,
+        220
+      ],
+      "size": [
+        300,
+        280
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "预览批量生成结果",
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      3,
+      0,
+      4,
+      1,
+      "mlx_vae"
+    ],
+    [
+      2,
+      1,
+      0,
+      4,
+      2,
+      "CLIP"
+    ],
+    [
+      3,
+      2,
+      0,
+      4,
+      3,
+      "model"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "images"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

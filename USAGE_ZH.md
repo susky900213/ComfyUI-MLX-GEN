@@ -1053,17 +1053,17 @@ Qwen 编辑的参考 latent 与目标宽高强绑定。把 `MlxVAEEncoder` 的 `
 先确认 ComfyUI 加载的是当前仓库，而不是另一个同名插件副本。重启后重新导入
 `workflows/` 中的最新 JSON；仍有问题时删除异常节点并从 `MLX/Gen` 菜单重新添加。
 
-如果错位表现为**提交时报 `scheduler: 124` / `steps: 640` / `guidance: minimax_h3`
-这类毫无道理的校验错误**，那是 seed 的伴随 widget 少了值：
+如果错位表现为**提交时报 `scheduler: randomize` / `steps: randomize`**，或节点上
+提示词、steps、guidance、scheduler 整体错位，通常是把 seed 的 UI 伴随控件错误地
+写进了 `widgets_values`：
 
-- ComfyUI 前端对任何名叫 `seed` / `noise_seed` 的 widget 都会自动插一个
-  `control_after_generate` 伴随 widget（与节点定义里有没有声明无关）；
-- 所以工作流 JSON 的 `widgets_values` 必须在 seed 后面写上它的值
-  （`fixed` / `increment` / `decrement` / `randomize`），漏写就会让后面**所有**
-  widget 错位一格；
-- 仓库里的工作流（含 `MlxKSamplerMLX` 的 22 份）已按这个规则序列化，
-  `python tools/check_workflows_against_comfyui.py` 会挡住漏写的版本；
-- 自己早先保存的工作流若报这个错，重新导入/保存一次（前端会自己补齐）即可。
+- ComfyUI 前端确实会显示 `control_after_generate`（`fixed` / `increment` /
+  `decrement` / `randomize`），但这个 UI 控件使用 `serialize: false`，不会进入
+  工作流 JSON；因此 `widgets_values` 中必须是 `seed` 后直接接 `steps`；
+- 仓库里的工作流已按这个实际序列化规则修正，
+  `python tools/check_workflows_against_comfyui.py` 会检查 widget 的真实顺序；
+- 早先保存的旧工作流请重新导入最新 JSON，或删除异常采样节点后从 `MLX/Gen`
+  菜单重新添加；不要手动在 seed 后补 `randomize`。
 
 ### 8.9 同一个工作流突然慢了一倍以上（Z-Image 1024² 从 ~2s/步 变成 ~5s/步）
 

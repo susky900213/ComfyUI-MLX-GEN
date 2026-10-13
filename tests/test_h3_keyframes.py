@@ -1201,7 +1201,7 @@ for workflow_name, expected_mode in workflow_modes.items():
         and sorted(item["widgets_values"][4] for item in vae_workflow_nodes)
         == ["audio_vae", "vae"]
         and keyframe_workflow_node["widgets_values"] == [640, 352]
-        and sampler_workflow_node["widgets_values"][3:5] == [640, 352]
+        and sampler_workflow_node["widgets_values"][2:4] == [640, 352]
         and text_workflow_node["inputs"][1]["name"] == "h3_keyframes"
         and keyframe_text_link[1:5]
         == [keyframe_workflow_node["id"], 0, text_workflow_node["id"], 1]
@@ -1349,9 +1349,9 @@ for workflow_name, (required_types, has_anchor, expected_checkpoint) in WORKFLOW
         and (
             visual["widgets_values"][:2] if visual["type"] == "MlxH3MotionReferenceWithImageCondition"
             else visual["widgets_values"][-2:]
-        ) == sampler["widgets_values"][3:5]
-        # seed 后面必须写前端插的 control_after_generate，否则整排 widget 会错位一格
-        and sampler["widgets_values"][1] in {"fixed", "increment", "decrement", "randomize"}
+        ) == sampler["widgets_values"][2:4]
+        # control_after_generate 只显示在前端，不进入 widgets_values；
+        # 因此采样器的宽高位于 seed 后的第 3、4 个序列化 widget。
         # 没有锚点时不该接视频 VAE；有锚点时必须接
         and (
             (visual["inputs"][1]["link"] is not None) == has_anchor
@@ -1399,9 +1399,9 @@ check(
     }
     # 步数按适配器标称填 4（填 50 步等于白装）；H3 不看 scheduler，
     # 但写 minimax_h3 才不会让采样节点打印「已忽略 scheduler」的提示
-    # （widgets：0 seed / 1 control_after_generate / 2 steps / … / 7 scheduler）
-    and accel_nodes[accel_sampler_id]["widgets_values"][2] == 4
-    and accel_nodes[accel_sampler_id]["widgets_values"][7] == "minimax_h3"
+    # （widgets：0 seed / 1 steps / 2 width / 3 height / … / 6 scheduler）
+    and accel_nodes[accel_sampler_id]["widgets_values"][1] == 4
+    and accel_nodes[accel_sampler_id]["widgets_values"][6] == "minimax_h3"
     and accel_nodes[accel_lora_id]["widgets_values"]
     == ["minimax_h3_ref2v_lightx2v_turbo_4step_v0.1_resized_avg_rank_20_bf16.safetensors",
         1.0]

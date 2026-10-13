@@ -14,8 +14,8 @@
       → MlxH3SecondPassSampler（剩余 σ + 音频三模式）
       → 既有 MlxVaeLoader / MlxVAEDecoder / MlxPilToTorch / CreateVideo / SaveVideo
 
-widgets 的顺序必须与各节点 `INPUT_TYPES` 完全一致，且 seed 后面要紧跟前端自动插入的
-`control_after_generate` 值（漏写会让后面所有 widget 错位一格）；
+widgets 的顺序必须与各节点 `INPUT_TYPES` 完全一致。seed 的
+`control_after_generate` 只显示在前端且不序列化，因此 seed 后面直接接 steps；
 `tools/check_workflows_against_comfyui.py` 会把这些都校验一遍。
 """
 
@@ -206,7 +206,7 @@ def graph(
     node_spec(2, "MlxTextEncoder", "H3 提示词（三段式：画面 / 音效 / 配乐）",
               [["clip", "CLIP"]], [["condition", "condition"]],
               [PROMPT], [420, 120], [420, 360], 4),
-    # widgets 顺序：seed / control_after_generate / steps / width / height /
+    # widgets 顺序：seed / steps / width / height /
     #               num_frames / video_shift / audio_shift / stop_at_step / output_mode
         node_spec(6, "MlxH3FirstPassSampler",
                   f"① 一阶段：640×352 / 124 帧 / {first_steps} 步，停在第 {stop_at_step} 步"
@@ -214,7 +214,7 @@ def graph(
                   f"输出 denoised (x0) 交给放大网络",
               [["model", "model"], ["positive", "condition"], ["negative", "condition"]],
               [["latents", "latents"]],
-              [20260920, "randomize", first_steps, 640, 352, 124, 12.0, 3.0, stop_at_step,
+              [20260920, first_steps, 640, 352, 124, 12.0, 3.0, stop_at_step,
                "denoised (x0)"],
               [880, 120], [460, 420], 5),
     # widgets 顺序：model_name / scale / precision（没有长宽！目标画布由上一段推导）
@@ -223,14 +223,14 @@ def graph(
               [["latents", "latents"]], [["latents", "latents"]],
               [upscaler_name(), 2.0, "bfloat16"],
               [1380, 120], [460, 200], 6),
-    # widgets 顺序：seed / control_after_generate / steps / start_at_sigma / audio_mode
+    # widgets 顺序：seed / steps / start_at_sigma / audio_mode
         node_spec(8, "MlxH3SecondPassSampler",
                   f"③ 二阶段：从 σ={start_at_sigma:g} 接着走 {second_steps} 步"
                   f"（总步数 {stop_at_step + second_steps}；音频跟视频同一 p 刻度收尾）",
               [["model", "model"], ["positive", "condition"], ["negative", "condition"],
                ["latents", "latents"]],
               [["latents", "latents"]],
-              [20260921, "randomize", second_steps, start_at_sigma, "follow_video"],
+              [20260921, second_steps, start_at_sigma, "follow_video"],
               [1380, 400], [460, 300], 7),
     node_spec(9, "MlxVAEDecoder", "④ 解码（视频 VAE + 音频 VAE 共用同一条 latent）",
               [["vae", "mlx_vae"], ["latents", "latents"], ["audio_vae", "mlx_vae"]],

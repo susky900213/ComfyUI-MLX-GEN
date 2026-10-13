@@ -17,6 +17,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from PIL import Image
+from mlx import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -223,6 +224,52 @@ def _load_directory_with_model(path: Path, model: QwenImage21Transformer):
         qwen21_loader.build_model = original
 
 
+class _TinyNativeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(64, 64)
+        self.embedding = nn.Embedding(32, 64)
+
+    def __call__(self, x):
+        return self.linear(x) + self.embedding(mx.array([0]))[None]
+
+
+def _native_fixture(root: Path) -> tuple[Path, dict[str, mx.array]]:
+    """Create a tiny native MLX checkpoint with real U32/BF16 qparams."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen_image21",
+                "quantization": {"group_size": 64, "dit_bits": 8, "te_bits": 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_model = _TinyNativeModel()
+    nn.quantize(
+        source_model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda path, _module: path == "linear",
+    )
+    source = {
+        key: value.astype(mx.bfloat16) if value.dtype in (mx.float16, mx.float32, mx.bfloat16) else value
+        for key, value in dict(tree_flatten(source_model.parameters())).items()
+    }
+    mx.save_safetensors(str(root / "model.safetensors"), source)
+    return root, source
+
+
+def _load_native_with_tiny_model(path: Path):
+    original = qwen21_loader.build_model
+    qwen21_loader.build_model = lambda role, _path: _TinyNativeModel()
+    try:
+        return qwen21_loader.load("transformer", str(path), quantize=0, precision="bfloat16", log=None)
+    finally:
+        qwen21_loader.build_model = original
+
+
 def test_model_root_uses_comfyui_registered_mlx_directory(tmp_path):
     registered_root = tmp_path / "shared-models" / "mlx"
 
@@ -327,6 +374,19 @@ def test_config_detection_identifies_a_local_qwen_image_21_checkpoint(tmp_path):
     )
     assert detect_model_family(checkpoint) == QWEN_IMAGE_21_FAMILY
 
+    native = tmp_path / "native-q8"
+    native.mkdir()
+    (native / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen_image21",
+                "quantization": {"group_size": 64, "dit_bits": 8, "te_bits": 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert detect_model_family(native) == QWEN_IMAGE_21_FAMILY
+
 
 def test_validation_keeps_qwen_image_21_out_of_legacy_families():
     validate_model_family("qwen_image", LEGACY_T2I_NAME)
@@ -368,14 +428,22 @@ def test_public_loaders_create_qwen_image_21_handles_without_loading_weights(tmp
         model = MlxTransformerLoader().load(
             QWEN_IMAGE_21_FAMILY, QWEN_21_NAME, 8, "bfloat16", False, 0
         )[0]
+        dense_model = MlxTransformerLoader().load(
+            QWEN_IMAGE_21_FAMILY, QWEN_21_NAME, 0, "bfloat16", False, 0
+        )[0]
         clip = MlxClipLoader().load(
             QWEN_IMAGE_21_FAMILY, "text_encoder", QWEN_21_NAME, "bfloat16", 512, 8
+        )[0]
+        dense_clip = MlxClipLoader().load(
+            QWEN_IMAGE_21_FAMILY, "text_encoder", QWEN_21_NAME, "bfloat16", 512, 0
         )[0]
         vae = MlxVAELoader().load(
             QWEN_IMAGE_21_FAMILY, QWEN_21_NAME, "bfloat16", 0, "vae"
         )[0]
         assert (model.model_type, model.quantize) == (QWEN_IMAGE_21_FAMILY, 8)
         assert (clip.model_type, clip.quantize) == (QWEN_IMAGE_21_FAMILY, 8)
+        assert model.cache_key != dense_model.cache_key
+        assert clip.cache_key != dense_clip.cache_key
         assert (vae.model_type, vae.role) == (QWEN_IMAGE_21_FAMILY, "vae")
         kind, resolved = pipeline.component_path(
             entry_for(QWEN_IMAGE_21_FAMILY), "transformer", QWEN_21_NAME
@@ -439,6 +507,38 @@ def test_qwen21_single_file_splits_turbo_fused_gate_up_weight(tmp_path):
     mx.eval(actual[gate_key], actual[proj_key])
     assert float(mx.max(mx.abs(actual[gate_key] - gate)).item()) == 0.0
     assert float(mx.max(mx.abs(actual[proj_key] - proj)).item()) == 0.0
+
+
+def test_qwen21_native_mlx_checkpoint_loads_qparams_without_requantizing(tmp_path):
+    root, source = _native_fixture(tmp_path / "native")
+    loaded = _load_native_with_tiny_model(root)
+    actual = dict(tree_flatten(loaded.module.parameters()))
+
+    assert loaded.bits == 8
+    assert isinstance(loaded.module.linear, nn.QuantizedLinear)
+    assert not isinstance(loaded.module.embedding, nn.QuantizedEmbedding)
+    for key in ("linear.weight", "linear.scales", "linear.biases", "linear.bias", "embedding.weight"):
+        assert key in actual
+        assert actual[key].shape == source[key].shape
+        mx.eval(actual[key], source[key])
+        assert float(mx.max(mx.abs(actual[key].astype(mx.float32) - source[key].astype(mx.float32))).item()) == 0.0
+    assert actual["linear.weight"].dtype == source["linear.weight"].dtype == mx.uint32
+    assert actual["linear.scales"].dtype == mx.float32
+    assert actual["linear.biases"].dtype == mx.float32
+    assert actual["linear.bias"].dtype == actual["embedding.weight"].dtype == mx.bfloat16
+
+
+def test_qwen21_native_checkpoint_rejects_a_second_quantization_request(tmp_path):
+    root, _source = _native_fixture(tmp_path / "native")
+    original = qwen21_loader.build_model
+    qwen21_loader.build_model = lambda role, _path: _TinyNativeModel()
+    try:
+        _expect_value_error(
+            lambda: qwen21_loader.load("transformer", str(root), quantize=4, precision="bfloat16", log=None),
+            "不能按 q4 再量化",
+        )
+    finally:
+        qwen21_loader.build_model = original
 
 
 def test_qwen21_single_file_and_directory_loading_follow_dynamic_block_schema(tmp_path):
@@ -1010,6 +1110,8 @@ if __name__ == "__main__":
     parameterized_tests = [
         test_qwen21_single_file_bf16_loads_and_maps_each_feed_forward_weight_independently,
         test_qwen21_single_file_splits_turbo_fused_gate_up_weight,
+        test_qwen21_native_mlx_checkpoint_loads_qparams_without_requantizing,
+        test_qwen21_native_checkpoint_rejects_a_second_quantization_request,
         test_qwen21_single_file_and_directory_loading_follow_dynamic_block_schema,
         test_qwen21_single_file_rejects_missing_and_unexpected_keys,
         test_qwen21_single_file_validates_metadata_dtype_offsets_overlap_bounds_and_size,

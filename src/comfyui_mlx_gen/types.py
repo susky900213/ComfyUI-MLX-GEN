@@ -57,7 +57,7 @@ _QWEN_IMAGE_21_RE = re.compile(
     re.IGNORECASE,
 )
 _QWEN_IMAGE_21_ARCH_RE = re.compile(
-    r"qwenimage(?:v?2[_-]?1|21)",
+    r"qwen[_-]?image(?:v?2[_-]?1|21)",
     re.IGNORECASE,
 )
 _QWEN_IMAGE_EDIT_RE = re.compile(

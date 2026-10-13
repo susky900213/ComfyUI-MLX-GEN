@@ -107,7 +107,7 @@
       "outputs": [{"name": "latents", "type": "latents", "links": [6], "slot_index": 0}],
       "properties": {"Node name for S&R": "MlxKSamplerMLX"},
       "title": "YuE2：使用 ABC 文件旋律（32 步 / 约 8 秒）",
-      "widgets_values": [42, "randomize", 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0, "auto", "melody", 200]
+      "widgets_values": [42, 32, 512, 512, 1, 1.0, "yue2_midpoint", 124, 12.0, 3.0, "auto", "melody", 200]
     },
     {
       "id": 7,

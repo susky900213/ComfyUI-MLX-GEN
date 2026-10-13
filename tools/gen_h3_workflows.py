@@ -231,10 +231,9 @@ def base_nodes(prompt, *, sampler_wh=(640, 352), checkpoint=CKPT_BASE,
                   [["model", "model"], ["positive", "condition"], ["negative", "condition"],
                    ["ref_images", "mlx_ref_images"]],
                   [["latents", "latents"]],
-                  # seed 后面必须紧跟 control_after_generate 的值：ComfyUI 前端会给
-                  # 名叫 seed 的 widget 自动插一个伴随 widget，工作流里漏写这个值
-                  # 会让后面所有 widget 错位一格（提交时报 scheduler=124 这类怪错）
-                  [20260917, "randomize", steps, sampler_wh[0], sampler_wh[1], 1, 1.0,
+                  # control_after_generate 只显示在前端，使用 serialize=false；它不在
+                  # widgets_values 中，所以 seed 后面必须直接接 steps。
+                  [20260917, steps, sampler_wh[0], sampler_wh[1], 1, 1.0,
                    scheduler, 124, 12.0, 3.0, "auto"],
                   [820, 120], [420, 420], 6),
         node_spec(6, "MlxVAEDecodeRawPIL",

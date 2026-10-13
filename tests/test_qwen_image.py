@@ -280,7 +280,7 @@ expected_widget_counts = {
     "MlxTextEncoder": 1,
     "MlxTransformerLoader": 6,
     "MlxVAELoader": 5,
-    "MlxKSamplerMLX": 12,
+    "MlxKSamplerMLX": 11,
     "MlxVAEDecoder": 1,
     "MlxSaveImage": 2,
     "MlxPilToTorch": 0,
@@ -339,9 +339,9 @@ check(
 )
 check(
     "采样默认值 = seed 0 / 20 steps / 1024² / batch 1 / CFG 4.0 / flow-match"
-    "（seed 后面跟着前端插的 control_after_generate）",
+    "（control_after_generate 只显示在前端，不序列化）",
     sampler_node["widgets_values"][:8]
-    == [0, "randomize", 20, 1024, 1024, 1, 4.0, "flow_match_euler_discrete"],
+    == [0, 20, 1024, 1024, 1, 4.0, "flow_match_euler_discrete", 124],
     str(sampler_node["widgets_values"]),
 )
 check(

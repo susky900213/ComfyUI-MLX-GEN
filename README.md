@@ -583,7 +583,8 @@ MiniMax-H3、YuE2、Breeze-TTS-2、Ideogram 4 与 Qwen-Image 专项测试都不�
 每份工作流的槽名、类型与 widget 取值（ComfyUI 自带节点只查存在性），并检查
 「视觉条件 → 该用哪一档 transformer」是否与声明一致；其中 `widgets_values` 会按
 **前端真正渲染出来的 widget 列表**比对 —— `seed` 后面那个前端自动插的
-`control_after_generate` 也必须写进 JSON，漏写就会让整排 widget 错位一格
+`control_after_generate` 只显示在前端，不写进 JSON；如果手动把 `randomize` 写入
+`widgets_values`，反而会让 seed 后面的 steps / guidance / scheduler 整排错位
 （详见 `USAGE_ZH.md` §8.8）；`tools/gen_h3_workflows.py`
 则用于重新生成后七份 H3 工作流。
 
