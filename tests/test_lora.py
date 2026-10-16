@@ -53,6 +53,7 @@ def check_raises(label, exc_type, message_part, call):
 expected_mapping_names = {
     "z_image": "ZImageLoRAMapping",
     "flux2": "Flux2LoRAMapping",
+    "flux3": "Flux3LoRAMapping",
     "qwen_image": "QwenLoRAMapping",
     "qwen_edit": "QwenLoRAMapping",
     "qwen_image_21": "QwenImage21LoRAMapping",

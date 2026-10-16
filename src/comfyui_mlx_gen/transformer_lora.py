@@ -23,6 +23,7 @@ from .types import LoraRef
 _IMAGE_MAPPING_IMPORTS = {
     "z_image": "mflux.models.z_image.weights.z_image_lora_mapping:ZImageLoRAMapping",
     "flux2": "mflux.models.flux2.weights.flux2_lora_mapping:Flux2LoRAMapping",
+    "flux3": "comfyui_mlx_gen.flux3.lora_mapping:Flux3LoRAMapping",
     "qwen_image": "mflux.models.qwen.weights.qwen_lora_mapping:QwenLoRAMapping",
     "qwen_edit": "mflux.models.qwen.weights.qwen_lora_mapping:QwenLoRAMapping",
     "qwen_image_21": "comfyui_mlx_gen.qwen_image_21.lora_mapping:QwenImage21LoRAMapping",

@@ -24,6 +24,9 @@ T2I_TEMPLATE = (
 IMAGE_TOKEN_ID = 151655
 VISION_START_TOKEN_ID = 151652
 VISION_END_TOKEN_ID = 151653
+IMAGE_TOKEN = "<|image_pad|>"
+VISION_START_TOKEN = "<|vision_start|>"
+VISION_END_TOKEN = "<|vision_end|>"
 
 
 class QwenImage21TextEncoder(Qwen3VLTextModel):
@@ -65,6 +68,21 @@ def system_token_count(tokenizer: Any) -> int:
     return len(tokenizer(raw, add_special_tokens=False)["input_ids"])
 
 
+def _image_prompt_prefix(image_count: int) -> str:
+    """Return the Qwen3-VL image slots in processor/list order.
+
+    Qwen3-VL does not define ``<image1>``, ``<image2>`` or any other numbered
+    image token.  The processor receives an image list and replaces one
+    ``<|image_pad|>`` block per item, in that same list order.  Keep the
+    ordering contract in the Python list rather than inventing numbered text
+    tokens that the tokenizer would split into ordinary language tokens.
+    """
+    if image_count < 1:
+        return ""
+    slot = f"{VISION_START_TOKEN}{IMAGE_TOKEN}{VISION_END_TOKEN}"
+    return slot * int(image_count)
+
+
 def encode_prompt(
     text_encoder: QwenImage21TextEncoder,
     tokenizer: Any,
@@ -74,18 +92,17 @@ def encode_prompt(
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Return the official pre-norm Qwen3-VL conditioning for T2I or image editing.
 
-    Every visual placeholder is expanded to the number of merged Qwen3-VL tokens for its
-    image.  The returned ``image_pad_mask`` deliberately remains at VLM-token granularity;
-    the DiT expands each ``True`` slot to the corresponding 2×2 VAE-latent block.
+    The image list is the only image-to-slot mapping, matching Qwen3-VL's
+    processor contract: item ``i`` in ``images`` fills the ``i``-th visual
+    block.  Every visual placeholder is expanded to the number of merged
+    Qwen3-VL tokens for its image.  The returned ``image_pad_mask`` deliberately
+    remains at VLM-token granularity; the DiT expands each ``True`` slot to the
+    corresponding 2×2 VAE-latent block.
     """
     prompt = prompt if prompt else " "
     selected = list(images or [])
     if selected:
-        refs = " ".join(
-            f"<image{index + 1}><|vision_start|><|image_pad|><|vision_end|>"
-            for index in range(len(selected))
-        )
-        raw = T2I_TEMPLATE.format(f"{refs}{prompt}")
+        raw = T2I_TEMPLATE.format(f"{_image_prompt_prefix(len(selected))}{prompt}")
     else:
         raw = T2I_TEMPLATE.format(prompt)
     encoded = tokenizer(raw, add_special_tokens=False)

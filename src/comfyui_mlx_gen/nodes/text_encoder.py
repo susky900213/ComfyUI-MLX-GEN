@@ -82,6 +82,12 @@ class MlxTextEncoder:
         if ref_images is not None and not isinstance(ref_images, MlxReferenceImages):
             raise ValueError("ref_images 必须连接「MLX VAE 编码」的输出")
         if ref_images is not None and entry.family != "qwen_image_21":
+            if entry.family == "flux3":
+                raise ValueError(
+                    "FLUX 3 的参考图不能连接到 MlxTextEncoder.ref_images；"
+                    "请断开这条连线，并将 MlxVAEEncoder 的 ref_images 只连接到 "
+                    "MlxKSamplerMLX.ref_images。FLUX 3 不通过文本编码器接收参考图"
+                )
             raise ValueError(
                 f"MlxTextEncoder 的 ref_images 只供 qwen_image_21 原生编辑使用，当前是 {entry.family}"
             )

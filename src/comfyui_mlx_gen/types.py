@@ -39,13 +39,16 @@ ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留�
 h3_keyframes = "mlx_h3_keyframes"
 
 
-# --- Qwen family detection -------------------------------------------------
+# --- checkpoint family detection -------------------------------------------
 #
-# Qwen-Image 2.1 没有经过验证的实现，最危险的行为是让它沿用旧的
-# ``qwen_image``（2512）组件。这里的检测故意只识别明确的 Qwen-Image 名称或
-# 本地 config.json 内容；未知名称不会猜测成 2.1，宁可继续由调用方按原有路径
-# 报「找不到权重」。
+# Qwen-Image 2.1 没有经过验证的 legacy 实现，最危险的行为是让它沿用旧的
+# ``qwen_image``（2512）组件；FLUX 3 同样不能沿用 Flux.2。这里的检测只对
+# 明确的 family 名称或本地 config.json 内容做硬拦截；未知名称不会猜测成新
+# family，宁可继续由调用方按原有路径报「找不到权重」。
 QWEN_IMAGE_21_FAMILY = "qwen_image_21"
+# FLUX 3 has an independent MLX implementation below.  Keep the marker in the
+# shared detector so a FLUX 3 checkpoint can never be routed to Flux.2.
+FLUX3_FAMILY = "flux3"
 # Qwen-Image 2.1 的 Qwen3-VL text_config.max_position_embeddings。
 # 该值包含提示词模板和编辑模式中的视觉 token；不要再用 512/4096 这类过小的工作流默认值。
 QWEN_IMAGE_21_MAX_LENGTH = 262_144
@@ -68,11 +71,16 @@ _QWEN_IMAGE_RE = re.compile(
     r"(?<![a-z0-9])qwen[\s._/-]*image(?![\s._/-]*edit)(?![a-z0-9])",
     re.IGNORECASE,
 )
+_FLUX3_RE = re.compile(r"(?<![a-z0-9])flux[\s._/-]*3(?![0-9])", re.IGNORECASE)
 
 
 def _family_from_text(value: str) -> str | None:
-    """从一个路径、repo id 或 config 文本中识别明确的 Qwen family。"""
+    """从路径、repo id 或 config 文本中识别需要隔离的 family。"""
     text = str(value)
+    # FLUX 3 没有可复用的 Flux.2 MLX 契约；先返回 unsupported marker，避免
+    # 后面的 legacy family 逻辑或 ModelConfig 前缀匹配接管它。
+    if _FLUX3_RE.search(text):
+        return FLUX3_FAMILY
     # 2.1 必须先于 generic qwen-image 检查，否则会被旧 T2I family 吞掉。
     if _QWEN_IMAGE_21_RE.search(text) or _QWEN_IMAGE_21_ARCH_RE.search(text):
         return QWEN_IMAGE_21_FAMILY
@@ -103,9 +111,10 @@ def _config_candidates(value: str | Path) -> tuple[Path, ...]:
 
 
 def detect_model_family(name_or_path: str | Path) -> str | None:
-    """检测明确的 Qwen-Image family。
+    """检测明确的 Qwen-Image 或 FLUX 3 family。
 
-    返回值目前是 ``qwen_image_21``、``qwen_image``、``qwen_edit`` 或 ``None``。
+    返回值可能是 ``flux3``、``qwen_image_21``、``qwen_image``、
+    ``qwen_edit`` 或 ``None``。
     2.1 支持 ``Qwen-Image-2.1`` / ``qwen_image_2_1`` / ``Qwen-Image-21`` 等
     明确写法；对于没有明确名称的本地 checkpoint，只读取其根目录附近的
     ``config.json``，且不把未知架构猜成 legacy Qwen。
@@ -133,12 +142,22 @@ def detect_model_family(name_or_path: str | Path) -> str | None:
 
 
 def validate_model_family(model_type: str, name_or_path: str | Path) -> str | None:
-    """校验选择的 family 与明确检测出的 Qwen 权重是否一致。
+    """校验选择的 family 与明确检测出的 checkpoint family 是否一致。
 
     未识别的普通路径保持现有行为；但 ``qwen_image_21`` 不接受未能明确确认的
-    路径。这样新 family 不会成为一个可以随意套在 legacy 权重上的别名。
+    FLUX 3 只能与独立的 ``flux3`` family 一起使用；这样它不会成为一个
+    可以套在 Flux.2 上的别名。
     """
     detected = detect_model_family(name_or_path)
+    if detected == FLUX3_FAMILY and model_type != FLUX3_FAMILY:
+        raise NotImplementedError(
+            "检测到 FLUX 3 Image Klein checkpoint，但当前选择的不是 flux3；"
+            "不会把 FLUX 3 路由到 Flux.2 或其它模型族"
+        )
+    if model_type == FLUX3_FAMILY and detected not in (None, FLUX3_FAMILY):
+        raise ValueError(
+            f"权重 {name_or_path!s} 被检测为 {detected}，不是 FLUX 3；请使用对应的 model_type"
+        )
     if detected is None:
         if model_type == QWEN_IMAGE_21_FAMILY:
             raise ValueError(
@@ -407,7 +426,7 @@ class MlxReferenceImages:
     vae_cache_key: str = ""  # 与 MlxVaeHandle.cache_key 同源（诊断用）
     precision: str = ""
     quantize: int = 0
-    edit_kind: str = "flux2"  # "flux2" | "qwen_edit" | "qwen_image_21"
+    edit_kind: str = "flux2"  # "flux2" | "flux3" | "qwen_edit" | "qwen_image_21"
     cond_grid: tuple[int, int, int] | None = None  # qwen_edit：(1, height//16, width//16)
     seq_len: int = 0  # 参考图 token 数（诊断/打印用）
 
@@ -546,6 +565,33 @@ FLUX2_KLEIN = MlxModelEntry(
         "已对接文生图（txt2img）；权重定义只写了 9b（flux.2-klein-9b-*），"
         "4b / base 需要另加配置。默认 guidance=1.0（klein 蒸馏模型不开 CFG），"
         "调度器请用 flow_match_euler_discrete。"
+    ),
+)
+
+FLUX3_KLEIN = MlxModelEntry(
+    family=FLUX3_FAMILY,
+    weight_def="comfyui_mlx_gen.flux3.weight_definition:Flux3WeightDefinition",
+    components=_components(
+        transformer="comfyui_mlx_gen.flux3.dit:Flux3Transformer",
+        # BFL publishes the FLUX 3 autoencoder as flux2-vae in the ComfyUI
+        # package; the MLX Flux2VAE implementation is the same 32→128 VAE.
+        vae="mflux.models.flux2.model.flux2_vae.vae:Flux2VAE",
+        text_encoder="comfyui_mlx_gen.flux3.text_encoder:Flux3TextEncoder",
+        tokenizer_name="qwen3vl_4b",
+    ),
+    default_config="",
+    default_steps=16,
+    default_scheduler="flux3_flow_map",
+    default_guidance=1.0,
+    supports_compile=True,
+    prompt_encoder="comfyui_mlx_gen.flux3.text_encoder:encode_prompt",
+    prompt_encoder_args={},
+    latent_creator="comfyui_mlx_gen.flux3.latent_creator:Flux3LatentCreator",
+    supported=True,
+    notes=(
+        "已对接 FLUX 3 Image Klein 的官方 Diffusers 目录格式：distilled flow-map "
+        "默认 16 步、无 CFG；目录名包含 base 时使用 base CFG 采样（默认 50 步、guidance 3.5）。"
+        "支持最多 10 张 VAE 参考图。ComfyUI 单文件 NVFP4/ConvRot 权重需先转换为 MLX/HF 目录格式。"
     ),
 )
 
@@ -781,6 +827,7 @@ BREEZE_TTS2 = MlxModelEntry(
 MODEL_DEFS: dict[str, MlxModelEntry] = {
     "z_image": Z_IMAGE,
     "flux2": FLUX2_KLEIN,
+    "flux3": FLUX3_KLEIN,
     "qwen_edit": QWEN_EDIT,
     "qwen_image": QWEN_IMAGE,
     "qwen_image_21": QWEN_IMAGE_21,

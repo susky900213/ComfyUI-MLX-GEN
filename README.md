@@ -5,6 +5,8 @@ Transformer、文本编码器和 VAE 只在实际消费它们的节点中延迟�
 
 完整的安装、模型目录、节点和示例工作流说明见：[中文使用手册](USAGE_ZH.md)。
 Qwen-Image 2.1 用户可直接阅读：[Qwen-Image 2.1 下载、安装与使用指南](QWEN_IMAGE_21_USAGE_ZH.md)。
+FLUX 3 Image Klein 的模型放置、单图/多图编辑连线和实现约定见：
+[FLUX 3 编辑实现说明](FLUX3_EDIT_IMPLEMENTATION.md)。
 
 ## Breeze-TTS-2 本地语音生成
 

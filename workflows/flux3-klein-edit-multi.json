@@ -1,0 +1,308 @@
+{
+  "id": "mlx-flux3-klein-edit-multi",
+  "revision": 0,
+  "last_node_id": 17,
+  "last_link_id": 17,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [40, 40],
+      "size": [360, 220],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "CLIP", "type": "CLIP", "links": [1, 2], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxClipLoader"},
+      "title": "FLUX 3 Klein 条件加载（Qwen3-VL-4B）",
+      "widgets_values": ["flux3", "text_encoder", "flux-3-image-klein", "bfloat16", 4096, 0]
+    },
+    {
+      "id": 2,
+      "type": "MlxTransformerLoader",
+      "pos": [40, 320],
+      "size": [360, 240],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "model", "type": "model", "links": [5], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxTransformerLoader"},
+      "title": "FLUX 3 Klein distilled Transformer",
+      "widgets_values": ["flux3", "flux-3-image-klein", 8, "bfloat16", true, 2]
+    },
+    {
+      "id": 3,
+      "type": "MlxTextEncoder",
+      "pos": [40, 650],
+      "size": [380, 190],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [{"name": "clip", "type": "CLIP", "link": 1, "slot_index": 0}],
+      "outputs": [{"name": "condition", "type": "condition", "links": [3], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "FLUX 3 Klein 多图参考指令",
+      "widgets_values": ["以第一张图的人物为主体，使用第二张图的服装和第三张图的背景风格，保持人物身份与构图自然统一，写实摄影风格"]
+    },
+    {
+      "id": 4,
+      "type": "MlxTextEncoder",
+      "pos": [40, 880],
+      "size": [380, 190],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [{"name": "clip", "type": "CLIP", "link": 2, "slot_index": 0}],
+      "outputs": [{"name": "condition", "type": "condition", "links": [4], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "FLUX 3 Klein 负向提示词（distilled 不使用 CFG）",
+      "widgets_values": [""]
+    },
+    {
+      "id": 5,
+      "type": "LoadImage",
+      "pos": [470, 40],
+      "size": [320, 320],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [6], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "title": "参考图 1（主体）",
+      "widgets_values": ["reference_1.png"]
+    },
+    {
+      "id": 6,
+      "type": "LoadImage",
+      "pos": [470, 400],
+      "size": [320, 320],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [7], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "title": "参考图 2（服装 / 人物细节）",
+      "widgets_values": ["reference_2.png"]
+    },
+    {
+      "id": 7,
+      "type": "LoadImage",
+      "pos": [470, 760],
+      "size": [320, 320],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [8], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "title": "参考图 3（背景 / 风格）",
+      "widgets_values": ["reference_3.png"]
+    },
+    {
+      "id": 8,
+      "type": "LoadImage",
+      "pos": [840, 760],
+      "size": [320, 320],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": null, "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "title": "参考图 4（可选，手动接入 image4）",
+      "widgets_values": ["reference_4.png"]
+    },
+    {
+      "id": 9,
+      "type": "MlxRefImageSet",
+      "pos": [840, 40],
+      "size": [380, 250],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {"name": "image1", "type": "IMAGE", "link": 6, "slot_index": 0},
+        {"name": "image2", "type": "IMAGE", "link": 7, "slot_index": 1},
+        {"name": "image3", "type": "IMAGE", "link": 8, "slot_index": 2},
+        {"name": "image4", "type": "IMAGE", "link": null, "slot_index": 3}
+      ],
+      "outputs": [
+        {"name": "ref_source", "type": "mlx_ref_image_src", "links": [9], "slot_index": 0},
+        {"name": "count", "type": "INT", "links": null, "slot_index": 1},
+        {"name": "report", "type": "STRING", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxRefImageSet"},
+      "title": "FLUX 3 有序多图参考集（顺序对应第一张 / 第二张 / 第三张）",
+      "widgets_values": []
+    },
+    {
+      "id": 10,
+      "type": "MlxVAELoader",
+      "pos": [470, 1140],
+      "size": [360, 220],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "vae", "type": "mlx_vae", "links": [10, 12], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxVAELoader"},
+      "title": "FLUX 3 VAE（参考图编码 + 输出解码共用）",
+      "widgets_values": ["flux3", "flux-3-image-klein", "bfloat16", 8, "vae"]
+    },
+    {
+      "id": 11,
+      "type": "MlxVAEEncoder",
+      "pos": [1260, 40],
+      "size": [400, 290],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 10, "slot_index": 0},
+        {"name": "images", "type": "IMAGE", "link": null, "slot_index": 1},
+        {"name": "ref_source", "type": "mlx_ref_image_src", "link": 9, "slot_index": 2}
+      ],
+      "outputs": [
+        {"name": "ref_images", "type": "mlx_ref_images", "links": [11], "slot_index": 0},
+        {"name": "width", "type": "INT", "links": null, "slot_index": 1},
+        {"name": "height", "type": "INT", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxVAEEncoder"},
+      "title": "FLUX 3 多图 VAE 编码（保留各图尺寸与顺序，最多 4 张）",
+      "widgets_values": [4, "aspect_area_crop", 0, 0]
+    },
+    {
+      "id": 12,
+      "type": "MlxKSamplerMLX",
+      "pos": [1700, 300],
+      "size": [400, 500],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "model", "link": 5, "slot_index": 0},
+        {"name": "positive", "type": "condition", "link": 3, "slot_index": 1},
+        {"name": "negative", "type": "condition", "link": 4, "slot_index": 2},
+        {"name": "ref_images", "type": "mlx_ref_images", "link": 11, "slot_index": 3}
+      ],
+      "outputs": [{"name": "latents", "type": "latents", "links": [13], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxKSamplerMLX"},
+      "title": "FLUX 3 Klein 多图参考生成（16 步 / flow-map / 无 CFG）",
+      "widgets_values": [0, 16, 1024, 1024, 1, 1.0, "flux3_flow_map", 124, 12.0, 3.0, "auto"]
+    },
+    {
+      "id": 13,
+      "type": "MlxVAEDecoder",
+      "pos": [2140, 300],
+      "size": [360, 280],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 12, "slot_index": 0},
+        {"name": "latents", "type": "latents", "link": 13, "slot_index": 1}
+      ],
+      "outputs": [{"name": "images", "type": "images", "links": [14, 15], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxVAEDecoder"},
+      "widgets_values": [-1]
+    },
+    {
+      "id": 14,
+      "type": "MlxSaveImage",
+      "pos": [2560, 300],
+      "size": [360, 180],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "images", "link": 14, "slot_index": 0}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "MlxSaveImage"},
+      "widgets_values": ["flux3-klein-edit-multi", "<auto>"]
+    },
+    {
+      "id": 15,
+      "type": "MlxPilToTorch",
+      "pos": [2560, 550],
+      "size": [360, 160],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "images", "link": 15, "slot_index": 0}],
+      "outputs": [
+        {"name": "images", "type": "IMAGE", "links": [16, 17], "slot_index": 0},
+        {"name": "masks", "type": "MASK", "links": null, "slot_index": 1},
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxPilToTorch"},
+      "widgets_values": []
+    },
+    {
+      "id": 16,
+      "type": "SaveImage",
+      "pos": [2980, 550],
+      "size": [320, 280],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "IMAGE", "link": 16, "slot_index": 0}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "SaveImage"},
+      "widgets_values": ["ComfyUI-MLX-GEN-flux3-klein-multi"]
+    },
+    {
+      "id": 17,
+      "type": "PreviewImage",
+      "pos": [2980, 870],
+      "size": [320, 280],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "IMAGE", "link": 17, "slot_index": 0}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "PreviewImage"},
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 1, 0, 3, 0, "CLIP"],
+    [2, 1, 0, 4, 0, "CLIP"],
+    [3, 3, 0, 12, 1, "condition"],
+    [4, 4, 0, 12, 2, "condition"],
+    [5, 2, 0, 12, 0, "model"],
+    [6, 5, 0, 9, 0, "IMAGE"],
+    [7, 6, 0, 9, 1, "IMAGE"],
+    [8, 7, 0, 9, 2, "IMAGE"],
+    [9, 9, 0, 11, 2, "mlx_ref_image_src"],
+    [10, 10, 0, 11, 0, "mlx_vae"],
+    [11, 11, 0, 12, 3, "mlx_ref_images"],
+    [12, 10, 0, 13, 0, "mlx_vae"],
+    [13, 12, 0, 13, 1, "latents"],
+    [14, 13, 0, 14, 0, "images"],
+    [15, 13, 0, 15, 0, "images"],
+    [16, 15, 0, 16, 0, "IMAGE"],
+    [17, 15, 0, 17, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {"scale": 1, "offset": [0, 0]},
+    "workflow_notes": "FLUX 3 Image Klein distilled 多图参考生成模板。默认接入 3 张有序参考图，LoadImage 4 可手动接入 MlxRefImageSet.image4。参考图通过 ref_source 保留各自尺寸与顺序；提示词中的第一张 / 第二张 / 第三张对应 image1 / image2 / image3。当前未进行真实 Metal 数值推理验证。"
+  },
+  "version": "0.4"
+}

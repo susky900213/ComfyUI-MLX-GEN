@@ -58,6 +58,9 @@ from .progress import SamplingProgress
 from .qwen_image_21 import loader as qwen21_loader, sampling as qwen21_sampling
 from .qwen_image_21.text_encoder import encode_prompt as encode_qwen21_prompt
 from .qwen_image_21.transformer import QwenImage21KVCache
+from .flux3 import config as flux3_config
+from .flux3 import text_encoder as flux3_text_encoder
+from .flux3 import dit as flux3_dit
 from .types import (
     MlxH3VisualCondition,
     MlxLatentHandle,
@@ -90,6 +93,8 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
     if not entry.supported:
         raise NotImplementedError(f"{entry.family} 尚未实现：{entry.notes}")
     comp = entry.components[role]
+    if entry.family == "flux3" and role == "tokenizer":
+        return paths.resolve(comp.source, selection, "text_encoder")
     if entry.family == "qwen_image_21":
         return _qwen21_component_path(role, selection, comp.source)
     kind, resolved = paths.resolve(comp.source, selection, role)
@@ -217,6 +222,12 @@ def component_class_kwargs(entry, role: str, path: str, model_config) -> dict[st
             return {"config": initializer._transformer_config(Path(path))}
         if role == "text_encoder":
             return initializer._text_encoder_kwargs(Path(path))
+    if entry.family == "flux3":
+        if role == "transformer":
+            return flux3_config.transformer_kwargs(path, selection=str(path))
+        if role == "text_encoder":
+            return flux3_config.text_encoder_kwargs(path)
+        return {}
     return resolve_class_kwargs(entry, role, model_config)
 
 
@@ -266,7 +277,9 @@ def prepare_components(
                 # 必须按 ModelConfig 的 overrides 建，否则用默认构造参数会建出
                 # 错误维度、加载权重对不上）；按当前 role 的目录名现算 config，
                 # 再只留构造函数接受的键（overrides 里混着运行时开关）。
-                model_config = weights.config_for_path(selection, entry.default_config)
+                model_config = (
+                    None if entry.family == "flux3" else weights.config_for_path(selection, entry.default_config)
+                )
                 class_kwargs = component_class_kwargs(entry, role, path, model_config)
                 # quantize=None → 用权重自带的档位（QuantizationResolution.resolve）
                 instance, _bits = components.create_and_load(
@@ -398,7 +411,7 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
     _ensure_image_family(entry, "MLX 采样器")
     model_config = (
         None
-        if entry.family == "qwen_image_21"
+        if entry.family in ("qwen_image_21", "flux3")
         else weights.config_for_path(model_handle.model_path, entry.default_config)
     )
 
@@ -461,7 +474,7 @@ def create_latents(defn, seed, height, width, batch_size) -> list[Any]:
             for i in range(batch_size)
         ]
     latent_creator = runtime.import_object(defn.latent_creator)
-    if defn.family == "flux2":
+    if defn.family in ("flux2", "flux3"):
         return [
             latent_creator.prepare_packed_latents(
                 seed=seed + i, height=height, width=width, batch_size=1
@@ -572,6 +585,10 @@ def encode_text(
                 text,
                 max_length=max_length,
                 images=reference_images,
+            )
+        if defn.family == "flux3":
+            return flux3_text_encoder.encode_prompt(
+                comps["tokenizer"], comps["text_encoder"], text, max_length=max_length
             )
         prompt_encoder = runtime.import_object(defn.prompt_encoder)
         if defn.family == "flux2":
@@ -783,6 +800,8 @@ REFERENCE_MIN_DIM = 16  # 参考图每条边必须是 16 的倍数（vae scale 8
 REFERENCE_T_COORD_BASE = 10  # 第 i 张参考图的 grid ids t 坐标 = 10 + 10 * i（目标图是 0）
 REFERENCE_T_COORD_STEP = 10
 RESIZE_MODES = ("aspect_area_crop", "keep_resolution")
+FLUX3_REFERENCE_MAX_AREA = 4096 * 4096
+FLUX3_REFERENCE_MULTIPLE = 16
 
 
 def reference_image_cache_key(vae_handle, image_digest: str, params: dict[str, Any]) -> str:
@@ -880,6 +899,90 @@ def encode_reference_images(
 
     value, _hit = cache.get_or_create("ref_encoding", cache_key, build)
     return value
+
+
+def encode_flux3_reference_images(
+    vae,
+    images: Sequence[Any],
+    cache,
+    cache_key: str,
+    max_reference_images: int,
+    resize_mode: str,
+):
+    """Encode FLUX 3 references as official 128-channel image-condition tokens.
+
+    FLUX 3 intentionally does not use Flux.2's approximately-1MP reference
+    resize.  Each reference keeps its own resolution; only images larger than
+    4096² pixels are downscaled, and every image is then center-cropped to the
+    16-pixel VAE/packing grid.  The input-list order is retained both in the
+    concatenated token sequence and in the negative ``l`` RoPE coordinate.
+    """
+    helpers = runtime.import_object(
+        "mflux.models.flux2.variants.edit.flux2_klein_edit_helpers:_Flux2KleinEditHelpers"
+    )
+    image_util = runtime.import_object("mflux.utils.image_util:ImageUtil")
+    vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")
+    latent_creator = runtime.import_object("comfyui_mlx_gen.flux3.latent_creator:Flux3LatentCreator")
+    selected = list(images)[: min(10, max(1, int(max_reference_images)))]
+
+    def build():
+        packed: list[Any] = []
+        ids: list[Any] = []
+        use_w = use_h = 0
+        for index, pil in enumerate(selected):
+            prepared = prepare_flux3_reference_image(pil, resize_mode)
+            if index == 0:
+                use_w, use_h = prepared.width, prepared.height
+            encoded = vae_util.encode(vae=vae, image=image_util.to_array(prepared), tiling_config=None)
+            encoded = helpers.ensure_4d_latents(encoded)
+            encoded = helpers.crop_to_even_spatial(encoded)
+            encoded = latent_creator.patchify_latents(encoded)
+            encoded = helpers.bn_normalize_vae_encoded_latents(encoded, vae=vae)
+            packed.append(latent_creator.pack_latents(encoded))
+            item_ids = latent_creator.prepare_grid_ids(
+                encoded, t_coord=0, layer_coord=-(index + 1)
+            )
+            ids.append(item_ids)
+        return mx.concatenate(packed, axis=1), mx.concatenate(ids, axis=1), use_w, use_h
+
+    value, _hit = cache.get_or_create("ref_encoding", cache_key, build)
+    return value
+
+
+def prepare_flux3_reference_image(pil, resize_mode: str):
+    """Apply the official FLUX 3 reference-image preprocessing contract.
+
+    The official processor preserves each reference's own aspect ratio and
+    resolution, downscaling only when its area exceeds 4096² pixels, then
+    center-crops to the 16-pixel packed-VAE grid.  ``keep_resolution`` remains
+    available as an explicit memory-risking override for local workflows; the
+    default ``auto``/``aspect_area_crop`` path follows the official limit.
+    """
+    if resize_mode not in ("auto", "aspect_area_crop", "keep_resolution"):
+        raise ValueError(
+            "FLUX 3 参考图只支持 auto / aspect_area_crop / keep_resolution，"
+            f"收到 {resize_mode}"
+        )
+    from PIL import Image as PILImage
+
+    prepared = pil.convert("RGB")
+    if resize_mode != "keep_resolution" and prepared.width * prepared.height > FLUX3_REFERENCE_MAX_AREA:
+        scale = math.sqrt(FLUX3_REFERENCE_MAX_AREA / (prepared.width * prepared.height))
+        new_width = max(FLUX3_REFERENCE_MULTIPLE, int(prepared.width * scale))
+        new_height = max(FLUX3_REFERENCE_MULTIPLE, int(prepared.height * scale))
+        prepared = prepared.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+
+    width = prepared.width - prepared.width % FLUX3_REFERENCE_MULTIPLE
+    height = prepared.height - prepared.height % FLUX3_REFERENCE_MULTIPLE
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"FLUX 3 参考图太小（每边至少 {FLUX3_REFERENCE_MULTIPLE} 像素）: {prepared.size}"
+        )
+    if (width, height) == prepared.size:
+        return prepared
+    left = (prepared.width - width) // 2
+    top = (prepared.height - height) // 2
+    return prepared.crop((left, top, left + width, top + height))
 
 
 def cached_reference(cache, key: str):
@@ -1286,6 +1389,84 @@ def _sample_flux2(defn, comps, params, cache, model_config, guidance, on_progres
     stacked = mx.concatenate(final, axis=0)  # [B, seq, C]
     mx.eval(stacked)
     return stacked
+
+
+def _flux3_schedule(steps: int, alpha: float = 6.93) -> mx.array:
+    t = mx.linspace(1.0, 0.0, int(steps) + 1)
+    return alpha * t / (1.0 + (alpha - 1.0) * t)
+
+
+def _flux3_pack_sample(text, reference, image, sample_index: int) -> flux3_dit.Flux3Packed:
+    text_data = text[0][0] if text[0].ndim == 3 else text[0]
+    text_ids = text[1][0] if text[1].ndim == 3 else text[1]
+    image_data = image[0][0] if image[0].ndim == 3 else image[0]
+    image_ids = image[1][0] if image[1].ndim == 3 else image[1]
+    data = {"image": image_data, "image_cond": mx.zeros((0, 128), dtype=image_data.dtype), "text": text_data}
+    ids = {"image": image_ids, "image_cond": mx.zeros((0, 4), dtype=mx.float32), "text": text_ids}
+    indices = {
+        "image": [(0, int(image_data.shape[0]))],
+        "image_cond": [(0, 0)],
+        "text": [(0, int(text_data.shape[0]))],
+    }
+    if reference is not None:
+        data["image_cond"] = reference[0][0] if reference[0].ndim == 3 else reference[0]
+        ids["image_cond"] = reference[1][0] if reference[1].ndim == 3 else reference[1]
+        indices["image_cond"] = [(0, int(data["image_cond"].shape[0]))]
+    timesteps = {
+        "image": mx.full((int(image_data.shape[0]),), 0.0, dtype=image_data.dtype),
+        "image_cond": mx.zeros((int(data["image_cond"].shape[0]),), dtype=image[0].dtype),
+        "text": mx.zeros((int(text_data.shape[0]),), dtype=text_data.dtype),
+    }
+    return flux3_dit.Flux3Packed(data=data, ids=ids, timesteps=timesteps, mode_indices=indices)
+
+
+def _sample_flux3(defn, comps, params, cache, guidance, on_progress=None):
+    """FLUX 3 Klein sampling: flow-map distilled or base CFG Euler flow."""
+    transformer = comps["transformer"]
+    positive = cached_encoding(cache, params["positive_encoding_key"], "正")
+    base = bool(params.get("flux3_base", False))
+    negative = cached_encoding(cache, params["negative_encoding_key"], "负") if base and guidance > 1.0 else None
+    references = cached_reference(cache, params["ref_cache_key"])[0:2] if params.get("ref_cache_key") else None
+    schedule = _flux3_schedule(params["steps"])
+    creator = runtime.import_object(defn.latent_creator)
+    final = []
+
+    for batch_index in range(int(params["batch_size"])):
+        image, image_ids, _h, _w = creator.prepare_packed_latents(
+            seed=int(params["seed"]) + batch_index,
+            height=int(params["height"]), width=int(params["width"]), batch_size=1,
+        )
+        image = image[0]
+        image_ids = image_ids[0]
+        if base:
+            neg_pack = _flux3_pack_sample(negative, references, (image, image_ids), 0)
+            pos_pack = _flux3_pack_sample(positive, references, (image, image_ids), 0)
+        else:
+            pos_pack = _flux3_pack_sample(positive, references, (image, image_ids), 0)
+
+        current = image
+        for step in range(int(params["steps"])):
+            t = float(schedule[step])
+            dt = float(schedule[step + 1] - schedule[step])
+            pos_pack.data["image"] = current
+            pos_pack.timesteps["image"] = mx.full((current.shape[0],), t, dtype=current.dtype)
+            target = mx.array([float(schedule[step + 1])], dtype=current.dtype)
+            if not base:
+                noise = transformer(pos_pack, timesteps_ref=target)
+            else:
+                neg_pack.data["image"] = current
+                neg_pack.timesteps["image"] = pos_pack.timesteps["image"]
+                neg_noise = transformer(neg_pack)
+                pos_noise = transformer(pos_pack)
+                noise = neg_noise + float(guidance) * (pos_noise - neg_noise)
+            current = current + dt * noise
+            mx.eval(current)
+            if on_progress is not None:
+                on_progress()
+        final.append(current)
+    result = mx.stack(final, axis=0)
+    mx.eval(result)
+    return result
 
 
 def _is_m1_or_m2() -> bool:
@@ -1853,7 +2034,7 @@ def run_sampler(defn, model_handle, comps, params, cache):
         raise NotImplementedError(f"{defn.family} 尚未实现：{defn.notes}")
     model_config = (
         None
-        if defn.family == "qwen_image_21"
+        if defn.family in ("qwen_image_21", "flux3")
         else weights.config_for_path(model_handle.model_path, defn.default_config)
     )
     # 只有**明确声明**不支持 CFG（False，如 z-image-turbo）才清零；
@@ -1886,6 +2067,8 @@ def run_sampler(defn, model_handle, comps, params, cache):
                 return _sample_qwen_image_21(
                     defn, comps, params, cache, guidance, progress.update
                 )
+            if defn.family == "flux3":
+                return _sample_flux3(defn, comps, params, cache, guidance, progress.update)
             raise NotImplementedError(
                 f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit / "
                 "qwen_image_21 的 edit 路径）"
@@ -1894,6 +2077,8 @@ def run_sampler(defn, model_handle, comps, params, cache):
             return _sample_flux2(
                 defn, comps, params, cache, model_config, guidance, progress.update
             )
+        if defn.family == "flux3":
+            return _sample_flux3(defn, comps, params, cache, guidance, progress.update)
         if defn.family == "qwen_image":
             return _sample_qwen_image(
                 defn, comps, params, cache, model_config, guidance, progress.update
@@ -1911,7 +2096,7 @@ def run_sampler(defn, model_handle, comps, params, cache):
     key = sampler_cache_key(
         model_handle,
         params,
-        "qwen-image-2.1" if model_config is None else model_config.model_name,
+        "flux3" if defn.family == "flux3" else ("qwen-image-2.1" if model_config is None else model_config.model_name),
     )
     latents, hit = cache.get_or_create("component_weights", key, sample)
     if hit:
@@ -1963,6 +2148,11 @@ def decode_latents(defn, comps, latents, height, width):
     if defn.family == "flux2":
         if latents.ndim == 2:
             latents = latents[None, ...]  # [seq, C] → [1, seq, C]
+        unpacked = latent_creator.unpack_latents(latents, height, width)
+        return vae.decode_packed_latents(unpacked)
+    if defn.family == "flux3":
+        if latents.ndim == 2:
+            latents = latents[None]
         unpacked = latent_creator.unpack_latents(latents, height, width)
         return vae.decode_packed_latents(unpacked)
     if defn.family in ("qwen_edit", "qwen_image") and latents.ndim == 2:

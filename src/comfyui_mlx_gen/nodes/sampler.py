@@ -57,6 +57,7 @@ from ..types import condition, entry_for, model, model_types, ref_images, valida
 SCHEDULERS = [
     "linear",
     "flow_match_euler_discrete",
+    "flux3_flow_map",
     "seedvr2_euler",
     "ideogram4_default",
     "ideogram4_quality",
@@ -429,12 +430,12 @@ class MlxKSamplerMLX:
                         f"{int(width)}×{int(height)} 不一致；"
                         "请把「MLX VAE 编码」的 width/height 输出接到采样器的 width/height"
                     )
-            elif entry.family != "flux2":
+            elif entry.family not in ("flux2", "flux3"):
                 raise NotImplementedError(
-                    f"{model.model_type} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit / qwen_image_21）"
+                    f"{model.model_type} 暂不支持参考图编辑（目前只有 flux2 / flux3 / qwen_edit / qwen_image_21）"
                 )
-            elif ref_images.edit_kind != "flux2":
-                raise ValueError("参考图不是按 flux2 语义编码的")
+            elif ref_images.edit_kind not in ("flux2", "flux3"):
+                raise ValueError("参考图不是按 flux2 / flux3 语义编码的")
             ref_key = ref_images.cache_key
             ref_count = int(ref_images.count)
 
@@ -458,6 +459,16 @@ class MlxKSamplerMLX:
             "ref_count": ref_count,
             "kv_cache": kv_cache,
         }
+        if entry.family == "flux3":
+            if int(width) % 16 or int(height) % 16:
+                raise ValueError("FLUX 3 的 width / height 必须是 16 的倍数")
+            is_base = "base" in str(model.model_path).lower()
+            params["flux3_base"] = is_base
+            if not is_base:
+                params["steps"] = int(steps) or 16
+                params["guidance"] = 1.0
+                params["scheduler_name"] = "flux3_flow_map"
+                params["steps"] = 16 if int(steps) == entry_for(model_types()[0]).default_steps else int(steps)
         if entry.family == "ideogram4":
             if not positive.text.strip():
                 raise ValueError("Ideogram 4 的正向 caption 不能为空")

@@ -36,6 +36,7 @@ from comfyui_mlx_gen.qwen_image_21 import loader as qwen21_loader  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 from comfyui_mlx_gen.qwen_image_21.text_encoder import (  # noqa: E402
     QwenImage21TextEncoder,
+    _image_prompt_prefix,
     encode_prompt,
 )
 from comfyui_mlx_gen.qwen_image_21.transformer import (  # noqa: E402
@@ -849,6 +850,86 @@ def test_tiny_multimodal_prompt_has_one_slot_per_2x2_latent_block():
     assert bool(mx.all(mx.isfinite(hidden)).item())
 
 
+def test_tiny_multireference_prompt_uses_processor_order_without_numbered_tokens():
+    class TinyTokenizer:
+        specials = {
+            "<|image_pad|>": 151655,
+            "<|vision_start|>": 151652,
+            "<|vision_end|>": 151653,
+            "<|im_start|>": 151644,
+            "<|im_end|>": 151645,
+        }
+
+        def __call__(self, text, add_special_tokens=False):
+            ids = []
+            cursor = 0
+            ordered = sorted(self.specials, key=len, reverse=True)
+            while cursor < len(text):
+                match = next((token for token in ordered if text.startswith(token, cursor)), None)
+                if match is not None:
+                    ids.append(self.specials[match])
+                    cursor += len(match)
+                else:
+                    ids.append(100 + ord(text[cursor]) % 100)
+                    cursor += 1
+            return {"input_ids": ids}
+
+    assert "<image1>" not in _image_prompt_prefix(2)
+    assert _image_prompt_prefix(2).count("<|image_pad|>") == 2
+
+    encoder = QwenImage21TextEncoder(
+        vocab_size=151936,
+        hidden_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=128,
+        intermediate_size=256,
+        mrope_section=(24, 20, 20),
+        vision_config={
+            "hidden_size": 16,
+            "depth": 3,
+            "num_heads": 4,
+            "intermediate_size": 32,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "num_position_embeddings": 256,
+            "out_hidden_size": 128,
+            "deepstack_visual_indexes": (0, 1, 2),
+        },
+    )
+    first = Image.new("RGB", (256, 256), (255, 0, 0))
+    second = Image.new("RGB", (256, 256), (0, 255, 0))
+    second_changed = Image.new("RGB", (256, 256), (0, 0, 255))
+    tokenizer = TinyTokenizer()
+
+    hidden, _attention, image_pad_mask = encode_prompt(
+        encoder, tokenizer, "combine both references", images=[first, second]
+    )
+    changed_hidden, _changed_attention, changed_mask = encode_prompt(
+        encoder, tokenizer, "combine both references", images=[first, second_changed]
+    )
+    mx.eval(hidden, image_pad_mask, changed_hidden, changed_mask)
+
+    # Each 256x256 image is 8x8 merged Qwen3-VL tokens.  The two image blocks
+    # are adjacent; the user-turn prefix before them is ordinary text, not a
+    # numbered image token.
+    assert int(mx.sum(image_pad_mask).item()) == 128
+    positions = np.flatnonzero(np.asarray(image_pad_mask[0]))
+    blocks = np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1)
+    assert [len(block) for block in blocks] == [64, 64]
+    assert np.array_equal(np.asarray(image_pad_mask), np.asarray(changed_mask))
+    # Changing only the second image must change the second visual block.  The
+    # first block is causal-prefix input and must remain unchanged.
+    first_start, first_end = int(positions[0]), int(positions[63]) + 1
+    second_start, second_end = int(positions[64]), int(positions[-1]) + 1
+    first_delta = mx.max(mx.abs(hidden[:, first_start:first_end] - changed_hidden[:, first_start:first_end]))
+    second_delta = mx.max(mx.abs(hidden[:, second_start:second_end] - changed_hidden[:, second_start:second_end]))
+    assert float(first_delta.item()) < 1e-5
+    assert float(second_delta.item()) > 1e-4
+
+
 def test_prefix_cache_matches_full_tiny_transformer_forward():
     model = QwenImage21Transformer(
         in_channels=4,
@@ -1093,6 +1174,7 @@ if __name__ == "__main__":
         test_dynamic_schedule_and_latent_contract,
         test_sampler_requires_the_same_qwen21_reference_on_both_condition_branches,
         test_tiny_multimodal_prompt_has_one_slot_per_2x2_latent_block,
+        test_tiny_multireference_prompt_uses_processor_order_without_numbered_tokens,
         test_prefix_cache_matches_full_tiny_transformer_forward,
         test_multireference_edit_prefix_cache_matches_full_forward,
         test_tiny_rgba_vae_reference_encode_contract,

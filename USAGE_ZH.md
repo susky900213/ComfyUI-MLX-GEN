@@ -165,6 +165,7 @@ Load Image
 | --- | --- | --- | --- | --- |
 | Z-Image Turbo 文生图 | `z_image` | `z-image-turbo-8bit` | `transformer`、`text_encoder`、`tokenizer`、`vae` | `AbstractFramework/z-image-turbo-8bit` |
 | FLUX.2 Klein 文生图/编辑 | `flux2` | `flux.2-klein-9b-8bit` | `transformer`、`text_encoder`、`tokenizer`、`vae` | `AbstractFramework/flux.2-klein-9b-8bit` |
+| FLUX 3 Image Klein 文生图/编辑 | `flux3` | `flux-3-image-klein` 或 `flux-3-image-klein-base` | `transformer`、`text_encoder`、`vae`（tokenizer 随 text encoder 解析） | 官方 FLUX 3 Image Klein checkpoint |
 | Qwen-Image 2.1 统一生成/编辑 | `qwen_image_21` | `Qwen-Image-2.1` | `transformer`、`text_encoder`、`tokenizer`、`vae` | `Qwen/Qwen-Image-2.1` |
 | Qwen-Image 2512 文生图 | `qwen_image` | `qwen-image-2512-8bit` | `transformer`、`text_encoder`、`tokenizer`、`vae` | `AbstractFramework/qwen-image-2512-8bit` |
 | Qwen-Image-Edit 2511 | `qwen_edit` | `qwen-image-edit-2511-8bit` | `transformer`、`text_encoder`、`tokenizer`、`vae` | `AbstractFramework/qwen-image-edit-2511-8bit` |
@@ -219,6 +220,35 @@ Qwen-Image 2.1 的官方仓库使用 `processor/` 而不是 `tokenizer/`，不�
 - `qwen_image` 是纯文生图模型，不能连接参考图。
 - `qwen_edit` 是参考图编辑模型，必须连接参考图，并使用 `MlxQwenEditEncoder`。
 - `quantize` 通常按 checkpoint 的实际量化档位选择，例如 8-bit 权重选 `8`。
+
+### 2.1.1 FLUX 3 Image Klein
+
+FLUX 3 使用独立的 `flux3` 模型族，不要把 FLUX 3 checkpoint 选择为 `flux2`。
+详细的单图/多图编辑连线、参考图预处理和 token 顺序见
+[FLUX 3 编辑实现说明](FLUX3_EDIT_IMPLEMENTATION.md)。仓库提供以下示例工作流：
+
+```text
+workflows/flux3-klein-base.json       # Base 文生图
+workflows/flux3-klein-distilled.json  # distilled 文生图
+workflows/flux3-klein-edit.json       # 单图参考编辑
+workflows/flux3-klein-edit-multi.json # 有序多图参考编辑
+```
+
+模型目录按组件分别放置或软链接到 `mlx` 根目录。以 distilled checkpoint 为例：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/
+├── transformer/flux-3-image-klein/
+├── text_encoder/flux-3-image-klein/
+└── vae/flux-3-image-klein/
+```
+
+FLUX 3 的参考图必须通过 `MlxVAEEncoder` 编码后只接到
+`MlxKSamplerMLX.ref_images`，不能接到 `MlxTextEncoder.ref_images`。多图编辑使用
+`MlxRefImageSet` 的 `image1 → image2 → image3 → image4` 顺序连接到
+`MlxVAEEncoder.ref_source`；这个顺序就是模型接收参考图的顺序。普通尺寸的参考图不会
+被压缩到 Flux.2 的约 1MP；实现只会处理超过 `4096²` 像素的图片，并在最后中心裁剪到
+16 像素倍数。
 
 ### 2.2 Ideogram 4 FP8
 

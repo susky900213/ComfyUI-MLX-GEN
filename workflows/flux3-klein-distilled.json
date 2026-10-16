@@ -1,0 +1,203 @@
+{
+  "id": "mlx-flux3-klein-distilled",
+  "revision": 0,
+  "last_node_id": 12,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [40, 40],
+      "size": [360, 220],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "CLIP", "type": "CLIP", "links": [2, 4], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxClipLoader"},
+      "title": "FLUX 3 Klein 条件加载（Qwen3-VL-4B）",
+      "widgets_values": ["flux3", "text_encoder", "flux-3-image-klein", "bfloat16", 4096, 0]
+    },
+    {
+      "id": 2,
+      "type": "MlxTextEncoder",
+      "pos": [40, 320],
+      "size": [380, 190],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [{"name": "clip", "type": "CLIP", "link": 2, "slot_index": 0}],
+      "outputs": [{"name": "condition", "type": "condition", "links": [3], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "FLUX 3 Klein 正向提示词",
+      "widgets_values": ["一座坐落在雾山之间的未来主义玻璃图书馆，清晨金色阳光，电影感，细节丰富"]
+    },
+    {
+      "id": 3,
+      "type": "MlxTextEncoder",
+      "pos": [40, 550],
+      "size": [380, 190],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [{"name": "clip", "type": "CLIP", "link": 4, "slot_index": 0}],
+      "outputs": [{"name": "condition", "type": "condition", "links": [5], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "FLUX 3 Klein 负向提示词（distilled 不使用 CFG）",
+      "widgets_values": [""]
+    },
+    {
+      "id": 4,
+      "type": "MlxTransformerLoader",
+      "pos": [470, 40],
+      "size": [380, 240],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "model", "type": "model", "links": [1], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxTransformerLoader"},
+      "title": "FLUX 3 Klein distilled Transformer",
+      "widgets_values": ["flux3", "flux-3-image-klein", 8, "bfloat16", true, 2]
+    },
+    {
+      "id": 5,
+      "type": "MlxModelLoraApply",
+      "pos": [470, 330],
+      "size": [380, 180],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [{"name": "model", "type": "model", "link": 1, "slot_index": 0}],
+      "outputs": [{"name": "model", "type": "model", "links": [6], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxModelLoraApply"},
+      "title": "可选 Transformer LoRA",
+      "widgets_values": ["<无 LoRA>", 1.0]
+    },
+    {
+      "id": 6,
+      "type": "MlxKSamplerMLX",
+      "pos": [900, 250],
+      "size": [400, 500],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "model", "link": 6, "slot_index": 0},
+        {"name": "positive", "type": "condition", "link": 3, "slot_index": 1},
+        {"name": "negative", "type": "condition", "link": 5, "slot_index": 2}
+      ],
+      "outputs": [{"name": "latents", "type": "latents", "links": [7], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxKSamplerMLX"},
+      "title": "FLUX 3 Klein distilled（16 步 / flow-map / 无 CFG）",
+      "widgets_values": [0, 16, 1024, 1024, 1, 1.0, "flux3_flow_map", 124, 12.0, 3.0, "auto"]
+    },
+    {
+      "id": 7,
+      "type": "MlxVAELoader",
+      "pos": [470, 570],
+      "size": [380, 210],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "vae", "type": "mlx_vae", "links": [8], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxVAELoader"},
+      "title": "FLUX 3 VAE（复用 Flux.2 VAE 定义）",
+      "widgets_values": ["flux3", "flux-3-image-klein", "bfloat16", 8, "vae"]
+    },
+    {
+      "id": 8,
+      "type": "MlxVAEDecoder",
+      "pos": [1360, 250],
+      "size": [360, 280],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 8, "slot_index": 0},
+        {"name": "latents", "type": "latents", "link": 7, "slot_index": 1}
+      ],
+      "outputs": [{"name": "images", "type": "images", "links": [9, 10], "slot_index": 0}],
+      "properties": {"Node name for S&R": "MlxVAEDecoder"},
+      "widgets_values": [-1]
+    },
+    {
+      "id": 9,
+      "type": "MlxSaveImage",
+      "pos": [1780, 250],
+      "size": [360, 180],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "images", "link": 9, "slot_index": 0}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "MlxSaveImage"},
+      "widgets_values": ["flux3-klein-distilled", "<auto>"]
+    },
+    {
+      "id": 10,
+      "type": "MlxPilToTorch",
+      "pos": [1780, 500],
+      "size": [360, 160],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "images", "link": 10, "slot_index": 0}],
+      "outputs": [
+        {"name": "images", "type": "IMAGE", "links": [11, 12], "slot_index": 0},
+        {"name": "masks", "type": "MASK", "links": null, "slot_index": 1},
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxPilToTorch"},
+      "widgets_values": []
+    },
+    {
+      "id": 11,
+      "type": "SaveImage",
+      "pos": [2200, 500],
+      "size": [320, 280],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "IMAGE", "link": 11, "slot_index": 0}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "SaveImage"},
+      "widgets_values": ["ComfyUI-MLX-GEN-flux3-distilled"]
+    },
+    {
+      "id": 12,
+      "type": "PreviewImage",
+      "pos": [2200, 820],
+      "size": [320, 280],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "IMAGE", "link": 12, "slot_index": 0}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "PreviewImage"},
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 4, 0, 5, 0, "model"],
+    [2, 1, 0, 2, 0, "CLIP"],
+    [3, 2, 0, 6, 1, "condition"],
+    [4, 1, 0, 3, 0, "CLIP"],
+    [5, 3, 0, 6, 2, "condition"],
+    [6, 5, 0, 6, 0, "model"],
+    [7, 6, 0, 8, 1, "latents"],
+    [8, 7, 0, 8, 0, "mlx_vae"],
+    [9, 8, 0, 9, 0, "images"],
+    [10, 8, 0, 10, 0, "images"],
+    [11, 10, 0, 11, 0, "IMAGE"],
+    [12, 10, 0, 12, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {"scale": 1, "offset": [0, 0]},
+    "workflow_notes": "FLUX 3 Image Klein distilled 文生图模板。请把三个 loader 的 flux3-image-klein 改成 models/mlx 下实际的 Diffusers/MLX 目录名；当前仓库没有官方权重，因此未做真实 Metal 推理验证。"
+  },
+  "version": "0.4"
+}

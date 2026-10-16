@@ -64,6 +64,8 @@ def resolve_resize_mode(family: str, resize_mode: str) -> str:
         return "aspect_area_crop"
     if family == "qwen_image_21":
         return "auto"
+    if family == "flux3":
+        return "aspect_area_crop"
     return "stretch"
 
 
@@ -88,13 +90,13 @@ def resolve_reference_images(
     if ref_source_handle is not None:
         if not isinstance(ref_source_handle, MlxRefImageSource):
             raise ValueError("ref_source 必须接「MLX 参考图集」（MlxRefImageSet）的输出")
-        if entry.family not in ("flux2", "qwen_image_21"):
+        if entry.family not in ("flux2", "flux3", "qwen_image_21"):
             raise NotImplementedError(
                 f"{entry.family} 还不支持 ref_source 入口（目前只有 flux2 / qwen_image_21）："
                 "qwen_edit 的参考图要按目标尺寸拉伸、文本条件也要带同一批图，"
                 "请继续用「Batch Images」→ images 批次"
             )
-        family_limit = 10 if entry.family == "qwen_image_21" else 8
+        family_limit = 10 if entry.family in ("qwen_image_21", "flux3") else 8
         limit = min(family_limit, max(1, int(max_reference_images)))
         if int(ref_source_handle.count) > limit:
             raise ValueError(
@@ -110,7 +112,7 @@ def resolve_reference_images(
             "尺寸各不相同的多张图用「MLX 参考图集」（MlxRefImageSet）接 ref_source"
         )
     pils = list(image_mod.to_pil_batch(images, preserve_alpha=entry.family == "qwen_image_21"))
-    family_limit = 10 if entry.family == "qwen_image_21" else 8
+    family_limit = 10 if entry.family in ("qwen_image_21", "flux3") else 8
     count = min(len(pils), max(1, int(max_reference_images)), family_limit)
     if count <= 0:
         raise ValueError("参考图为空")
@@ -261,6 +263,32 @@ class MlxVAEEncoder:
             )
             return (handle, use_w, use_h)
 
+        if entry.family == "flux3":
+            if resolved_mode not in ("aspect_area_crop", "keep_resolution", "auto"):
+                raise ValueError(
+                    f"flux3 只支持 auto / aspect_area_crop / keep_resolution，收到 {resolved_mode}"
+                )
+            params = {"count": count, "resize_mode": resolved_mode, "family": "flux3"}
+            cache_key = pipeline.reference_image_cache_key(vae, digest, params)
+            packed, _ids, use_w, use_h = pipeline.encode_flux3_reference_images(
+                vae_module, pils, CACHE, cache_key, count, resolved_mode
+            )
+            handle = MlxReferenceImages(
+                model_type=vae.model_type,
+                vae_path=vae.path,
+                count=count,
+                height=use_h,
+                width=use_w,
+                cache_key=cache_key,
+                vae_cache_key=vae.cache_key,
+                precision=vae.precision,
+                quantize=vae.quantize,
+                edit_kind="flux3",
+                seq_len=int(packed.shape[1]),
+            )
+            print(f"[MlxVAEEncoder] flux3 | {count} 张参考图 → seq={packed.shape[1]}，尺寸 {use_w}×{use_h}")
+            return (handle, use_w, use_h)
+
         if entry.family == "qwen_edit":
             if resolved_mode not in pipeline.QWEN_EDIT_RESIZE_MODES:
                 raise ValueError(
@@ -308,7 +336,7 @@ class MlxVAEEncoder:
             return (handle, use_w, use_h)
 
         raise NotImplementedError(
-            f"{entry.family} 暂不支持参考图编辑（本节点只接 flux2 / qwen_edit 两类；"
+            f"{entry.family} 暂不支持参考图编辑（本节点只接 flux2 / flux3 / qwen_edit；"
             "qwen_image 是文生图大类，要用参考图请改选 qwen_edit 大类 + "
             "qwen-image-edit-2511-8bit 权重）"
         )
