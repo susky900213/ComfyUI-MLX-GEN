@@ -302,12 +302,16 @@ class MlxQwenImage21FolderEdit:
         saved_paths: list[str] = []
         records: list[dict[str, object]] = []
         sampler_components = None
+        encoder_components = None
+        encoder_key = runtime.cache_key({"kind": "module", "clip": clip})
 
-        # Transformer 在整个目录循环中复用；参考图、文本编码和 latent 仍按图片
-        # 使用独立缓存键，并在该图片保存后主动淘汰，绝不会组成一个 batch。
+        # Transformer 和 text_encoder/tokenizer 在整个目录循环中复用；参考图、文本
+        # 编码结果和 latent 仍按图片使用独立缓存键，并在该图片保存后主动淘汰，
+        # 绝不会组成一个 batch。
         runtime.apply_cache_limit(model.compile_cache_limit, label=entry.family)
         try:
             sampler_components = pipeline.prepare_sampler_components(entry, model, cache)
+            encoder_components = pipeline.prepare_encoder(entry, clip, cache, encoder_key)
             for index, source_path in enumerate(ordered_paths):
                 ref_key = ""
                 positive_key = ""
@@ -357,32 +361,26 @@ class MlxQwenImage21FolderEdit:
                     reference = pipeline.cached_qwen21_reference(cache, ref_key)
 
                     # 2) 当前图片自己的正/负条件编码；reference_images 永远只有一张。
-                    encoder_key = runtime.cache_key({"kind": "module", "clip": clip})
-                    encoder_components = pipeline.prepare_encoder(entry, clip, cache, encoder_key)
-                    try:
-                        positive_key = pipeline.prompt_encoding_key(clip, positive_text, ref_key)
-                        negative_key = pipeline.prompt_encoding_key(clip, negative_text, ref_key)
-                        pipeline.encode_text(
-                            entry,
-                            encoder_components,
-                            positive_text,
-                            cache,
-                            positive_key,
-                            reference_images=reference["images"],
-                            max_length=clip.max_length,
-                        )
-                        pipeline.encode_text(
-                            entry,
-                            encoder_components,
-                            negative_text,
-                            cache,
-                            negative_key,
-                            reference_images=reference["images"],
-                            max_length=clip.max_length,
-                        )
-                    finally:
-                        encoder_components = None
-                        pipeline.release_encoder(clip, cache)
+                    positive_key = pipeline.prompt_encoding_key(clip, positive_text, ref_key)
+                    negative_key = pipeline.prompt_encoding_key(clip, negative_text, ref_key)
+                    pipeline.encode_text(
+                        entry,
+                        encoder_components,
+                        positive_text,
+                        cache,
+                        positive_key,
+                        reference_images=reference["images"],
+                        max_length=clip.max_length,
+                    )
+                    pipeline.encode_text(
+                        entry,
+                        encoder_components,
+                        negative_text,
+                        cache,
+                        negative_key,
+                        reference_images=reference["images"],
+                        max_length=clip.max_length,
+                    )
 
                     # 3) 只采当前图片：batch_size=1、ref_count=1。
                     params = {
@@ -483,6 +481,7 @@ class MlxQwenImage21FolderEdit:
         finally:
             pipeline.clear_compiled_predict_caches()
             pipeline.release_sampler_components(entry, model, cache)
+            pipeline.release_encoder(clip, cache)
 
         success_count = len(generated)
         if not success_count:

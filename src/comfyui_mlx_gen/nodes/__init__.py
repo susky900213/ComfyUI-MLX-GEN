@@ -27,8 +27,10 @@ from .save import MlxSaveImage
 from .pil_to_torch import MlxPilToTorch
 from .directory_images import MlxLoadImagesFromDirectory, MlxSaveImagesToDirectory
 from .comic_storyboard_splitter import MlxComicStoryboardSplitter
+from .html_scramble_downloader import MlxDownloadScrambledHtmlImages
 from .storyboard_batch_edit import MlxQwenImage21StoryboardBatchEdit
 from .qwen_image_21_folder_edit import MlxQwenImage21FolderEdit
+from .qwen_image_21_folder_replace import MlxQwenImage21FolderReplace
 from .whisper_transcribe import MlxWhisperTranscribe
 from .qwen_image_pe import MlxQwenImagePEI2I, MlxQwenImagePET2I
 from .yue2_melody import MlxYue2MelodyFromAudio
@@ -61,8 +63,10 @@ __all__ = [
     "MlxLoadImagesFromDirectory",
     "MlxSaveImagesToDirectory",
     "MlxComicStoryboardSplitter",
+    "MlxDownloadScrambledHtmlImages",
     "MlxQwenImage21StoryboardBatchEdit",
     "MlxQwenImage21FolderEdit",
+    "MlxQwenImage21FolderReplace",
     "MlxWhisperTranscribe",
     "MlxQwenImagePET2I",
     "MlxQwenImagePEI2I",

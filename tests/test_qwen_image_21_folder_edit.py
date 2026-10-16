@@ -47,6 +47,7 @@ def _patch_fake_pipeline(monkeypatch, decoded_size=(32, 32)):
     reference_calls: list[tuple[str, int, int, int, str, int, tuple[int, int]]] = []
     text_calls: list[tuple[str, str, int]] = []
     sample_calls: list[dict] = []
+    encoder_lifecycle_calls: list[str] = []
 
     monkeypatch.setattr(folder_module.runtime, "apply_cache_limit", lambda *args, **kwargs: None)
     monkeypatch.setattr(folder_module.runtime, "flush_caches", lambda: None)
@@ -80,9 +81,15 @@ def _patch_fake_pipeline(monkeypatch, decoded_size=(32, 32)):
     monkeypatch.setattr(
         folder_module.pipeline,
         "prepare_encoder",
-        lambda entry, clip_handle, cache, cache_key: {"fake": True},
+        lambda entry, clip_handle, cache, cache_key: (
+            encoder_lifecycle_calls.append("prepare") or {"fake": True}
+        ),
     )
-    monkeypatch.setattr(folder_module.pipeline, "release_encoder", lambda clip_handle, cache: None)
+    monkeypatch.setattr(
+        folder_module.pipeline,
+        "release_encoder",
+        lambda clip_handle, cache: encoder_lifecycle_calls.append("release"),
+    )
     monkeypatch.setattr(
         folder_module.pipeline,
         "prompt_encoding_key",
@@ -124,7 +131,7 @@ def _patch_fake_pipeline(monkeypatch, decoded_size=(32, 32)):
         "to_pil",
         lambda decoded, batch_index=-1: (Image.new("RGB", decoded_size, (decoded, 0, 0)),),
     )
-    return reference_calls, text_calls, sample_calls
+    return reference_calls, text_calls, sample_calls, encoder_lifecycle_calls
 
 
 def test_folder_edit_processes_natural_sorted_images_one_at_a_time(tmp_path, monkeypatch):
@@ -139,7 +146,7 @@ def test_folder_edit_processes_natural_sorted_images_one_at_a_time(tmp_path, mon
     Image.new("RGBA", (64, 96), (30, 0, 0, 255)).save(input_dir / "image1.png")
     (input_dir / "not-an-image.txt").write_text("ignore", encoding="utf-8")
 
-    reference_calls, text_calls, sample_calls = _patch_fake_pipeline(monkeypatch)
+    reference_calls, text_calls, sample_calls, encoder_lifecycle_calls = _patch_fake_pipeline(monkeypatch)
     progress_updates: list[tuple[int, int]] = []
 
     class FakeProgress:
@@ -173,6 +180,7 @@ def test_folder_edit_processes_natural_sorted_images_one_at_a_time(tmp_path, mon
     assert all(call[4] == "keep_resolution" for call in reference_calls)
     assert len(text_calls) == 6  # positive + negative for every source image
     assert all(call[2] == 1 for call in text_calls)
+    assert encoder_lifecycle_calls == ["prepare", "release"]
     assert len(sample_calls) == 3
     assert [call["seed"] for call in sample_calls] == [100, 101, 102]
     assert [(call["width"], call["height"]) for call in sample_calls] == [
@@ -215,7 +223,7 @@ def test_folder_edit_counts_failed_images_in_progress_and_continues(tmp_path, mo
     (input_dir / "image2.png").write_text("not a valid image", encoding="utf-8")
     Image.new("RGBA", (64, 64), (30, 0, 0, 255)).save(input_dir / "image3.png")
 
-    reference_calls, _text_calls, sample_calls = _patch_fake_pipeline(monkeypatch)
+    reference_calls, _text_calls, sample_calls, encoder_lifecycle_calls = _patch_fake_pipeline(monkeypatch)
     progress_updates: list[tuple[int, int]] = []
 
     class FakeProgress:
@@ -247,6 +255,7 @@ def test_folder_edit_counts_failed_images_in_progress_and_continues(tmp_path, mo
     assert len(sample_calls) == 2
     assert result[3] == 2
     assert progress_updates == [(1, 3), (2, 3), (3, 3)]
+    assert encoder_lifecycle_calls == ["prepare", "release"]
     report = json.loads(result[2])
     assert [record["status"] for record in report] == ["success", "error", "success"]
 
@@ -258,7 +267,7 @@ def test_folder_edit_keeps_source_size_and_scales_sampling_canvas(tmp_path, monk
     monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
     Image.new("RGBA", (128, 80), (10, 0, 0, 255)).save(input_dir / "source.png")
 
-    reference_calls, _text_calls, sample_calls = _patch_fake_pipeline(
+    reference_calls, _text_calls, sample_calls, _encoder_lifecycle_calls = _patch_fake_pipeline(
         monkeypatch,
         decoded_size=(128, 80),
     )
@@ -300,7 +309,7 @@ def test_before_timing_downscales_reference_and_sampling_canvas(tmp_path, monkey
     monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
     Image.new("RGBA", (128, 80), (10, 0, 0, 255)).save(input_dir / "source.png")
 
-    reference_calls, _text_calls, sample_calls = _patch_fake_pipeline(monkeypatch)
+    reference_calls, _text_calls, sample_calls, _encoder_lifecycle_calls = _patch_fake_pipeline(monkeypatch)
     monkeypatch.setattr(
         folder_module,
         "SamplingProgress",
@@ -336,7 +345,10 @@ def test_folder_edit_scales_final_image_after_generation(tmp_path, monkeypatch):
     monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
     Image.new("RGBA", (128, 80), (10, 0, 0, 255)).save(input_dir / "source.png")
 
-    reference_calls, _text_calls, sample_calls = _patch_fake_pipeline(monkeypatch, decoded_size=(128, 80))
+    reference_calls, _text_calls, sample_calls, _encoder_lifecycle_calls = _patch_fake_pipeline(
+        monkeypatch,
+        decoded_size=(128, 80),
+    )
     monkeypatch.setattr(
         folder_module,
         "SamplingProgress",
