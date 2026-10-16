@@ -260,6 +260,135 @@ def test_folder_edit_counts_failed_images_in_progress_and_continues(tmp_path, mo
     assert [record["status"] for record in report] == ["success", "error", "success"]
 
 
+def test_folder_edit_skips_existing_outputs_and_keeps_original_indexes(tmp_path, monkeypatch):
+    comfy_input = tmp_path / "comfy-input"
+    input_dir = comfy_input / "mlx_qwen_image_21" / "resume"
+    input_dir.mkdir(parents=True)
+    monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
+    Image.new("RGBA", (64, 64), (10, 0, 0, 255)).save(input_dir / "image1.png")
+    Image.new("RGBA", (64, 64), (20, 0, 0, 255)).save(input_dir / "image2.png")
+    Image.new("RGBA", (64, 64), (30, 0, 0, 255)).save(input_dir / "image3.png")
+    output = input_dir / "image"
+    output.mkdir()
+    Image.new("RGBA", (32, 32), (99, 0, 0, 255)).save(output / "0001_image2.png")
+
+    reference_calls, _text_calls, sample_calls, encoder_lifecycle_calls = _patch_fake_pipeline(monkeypatch)
+    progress_updates: list[tuple[int, int]] = []
+
+    class FakeProgress:
+        def __init__(self, total):
+            self.total = total
+
+        def update(self, amount=1):
+            progress_updates.append((len(progress_updates) + amount, self.total))
+
+    monkeypatch.setattr(folder_module, "SamplingProgress", FakeProgress)
+    vae, clip, model = _handles()
+    result = folder_module.MlxQwenImage21FolderEdit().edit_folder(
+        "mlx_qwen_image_21/resume",
+        vae,
+        clip,
+        model,
+        "保持主体",
+        "模糊",
+        100,
+        2,
+        1.0,
+        "flow_match_euler_discrete",
+        "off",
+    )
+
+    assert len(reference_calls) == 2
+    assert [call["seed"] for call in sample_calls] == [100, 102]
+    assert encoder_lifecycle_calls == ["prepare", "release"]
+    assert [Path(path).name for path in result[1].splitlines()] == [
+        "0000_image1.png",
+        "0001_image2.png",
+        "0002_image3.png",
+    ]
+    assert result[3] == 3
+    report = json.loads(result[2])
+    assert [record["status"] for record in report] == ["success", "skipped", "success"]
+    assert report[1]["output"].endswith("image/0001_image2.png")
+    assert progress_updates == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_folder_edit_all_existing_outputs_skip_model_loading(tmp_path, monkeypatch):
+    comfy_input = tmp_path / "comfy-input"
+    input_dir = comfy_input / "mlx_qwen_image_21" / "already-done"
+    input_dir.mkdir(parents=True)
+    monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
+    Image.new("RGBA", (64, 64), (10, 0, 0, 255)).save(input_dir / "image1.png")
+    Image.new("RGBA", (64, 64), (20, 0, 0, 255)).save(input_dir / "image2.png")
+    output = input_dir / "image"
+    output.mkdir()
+    Image.new("RGBA", (32, 32), (90, 0, 0, 255)).save(output / "0000_image1.png")
+    Image.new("RGBA", (32, 32), (80, 0, 0, 255)).save(output / "0001_image2.png")
+
+    _reference_calls, _text_calls, sample_calls, encoder_lifecycle_calls = _patch_fake_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        folder_module,
+        "SamplingProgress",
+        lambda total: type("Progress", (), {"update": lambda self: None})(),
+    )
+    vae, clip, model = _handles()
+    result = folder_module.MlxQwenImage21FolderEdit().edit_folder(
+        "mlx_qwen_image_21/already-done",
+        vae,
+        clip,
+        model,
+        "保持主体",
+        "模糊",
+        0,
+        1,
+        1.0,
+        "flow_match_euler_discrete",
+        "off",
+    )
+
+    assert sample_calls == []
+    assert encoder_lifecycle_calls == []
+    assert result[3] == 2
+    assert [record["status"] for record in json.loads(result[2])] == ["skipped", "skipped"]
+
+
+def test_folder_edit_reprocesses_corrupt_existing_output(tmp_path, monkeypatch):
+    comfy_input = tmp_path / "comfy-input"
+    input_dir = comfy_input / "mlx_qwen_image_21" / "corrupt-output"
+    input_dir.mkdir(parents=True)
+    monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
+    Image.new("RGBA", (64, 64), (10, 0, 0, 255)).save(input_dir / "source.png")
+    output = input_dir / "image"
+    output.mkdir()
+    (output / "0000_source.png").write_text("incomplete", encoding="utf-8")
+
+    _reference_calls, _text_calls, sample_calls, _encoder_lifecycle_calls = _patch_fake_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        folder_module,
+        "SamplingProgress",
+        lambda total: type("Progress", (), {"update": lambda self: None})(),
+    )
+    vae, clip, model = _handles()
+    result = folder_module.MlxQwenImage21FolderEdit().edit_folder(
+        "mlx_qwen_image_21/corrupt-output",
+        vae,
+        clip,
+        model,
+        "保持主体",
+        "模糊",
+        0,
+        1,
+        1.0,
+        "flow_match_euler_discrete",
+        "off",
+    )
+
+    assert len(sample_calls) == 1
+    assert json.loads(result[2])[0]["status"] == "success"
+    with Image.open(output / "0000_source.png") as generated:
+        assert generated.format == "PNG"
+
+
 def test_folder_edit_keeps_source_size_and_scales_sampling_canvas(tmp_path, monkeypatch):
     comfy_input = tmp_path / "comfy-input"
     input_dir = comfy_input / "mlx_qwen_image_21" / "scaled"

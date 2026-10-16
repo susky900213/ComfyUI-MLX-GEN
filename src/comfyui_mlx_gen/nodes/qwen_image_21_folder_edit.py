@@ -6,6 +6,7 @@
 * 每次只把一张图片作为 Qwen-Image 2.1 的单个视觉参考；
 * 每张图片使用 ``batch_size=1``、``ref_count=1`` 独立采样；
 * 当前图片解码并写入输出目录后，才开始下一张图片。
+* 输出目录中已经存在且可读取的对应 PNG 会直接跳过，支持中断后继续处理。
 
 节点内部复用已有 pipeline API，但不修改旧节点或公共采样器的行为。
 """
@@ -64,6 +65,23 @@ def _load_one_image(path: Path) -> Image.Image:
             return source.convert("RGBA").copy()
     except (OSError, UnidentifiedImageError) as exc:
         raise ValueError(f"无法读取图片：{path}（{exc}）") from exc
+
+
+def _load_existing_output(path: Path) -> Image.Image | None:
+    """Return a readable existing output image, or ``None`` when it is absent/broken.
+
+    A partially written or corrupted PNG must not count as a completed item;
+    returning ``None`` makes the normal generation path replace it.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        with Image.open(path) as existing:
+            existing.verify()
+        return _load_one_image(path)
+    except (OSError, UnidentifiedImageError, ValueError):
+        return None
 
 
 def _comfy_input_directory() -> Path:
@@ -287,6 +305,48 @@ class MlxQwenImage21FolderEdit:
         print(f"[MlxQwenImage21FolderEdit] 输出目录：{output}")
         print(f"[MlxQwenImage21FolderEdit] 开始处理：共 {total_images} 张图片")
 
+        # 用自然排序后的原始 index 生成稳定的输出名；即使中途失败或跳过，
+        # 后续重跑也必须继续使用同一个名字，不能因为待处理列表变短而改名。
+        generated: list[Image.Image | None] = [None] * total_images
+        saved_paths: list[str | None] = [None] * total_images
+        records: list[dict[str, object] | None] = [None] * total_images
+        pending: list[tuple[int, Path, Path]] = []
+        processed = 0
+        for index, source_path in enumerate(ordered_paths):
+            destination = output / _safe_output_name(source_path.name, index)
+            existing = _load_existing_output(destination)
+            if existing is None:
+                pending.append((index, source_path, destination))
+                continue
+
+            generated[index] = existing
+            saved_paths[index] = str(destination)
+            records[index] = {
+                "index": index,
+                "source": str(source_path),
+                "output": str(destination),
+                "status": "skipped",
+                "reason": "输出文件已存在且可读取",
+            }
+            processed += 1
+            progress.update()
+            print(
+                f"[MlxQwenImage21FolderEdit] [{processed}/{total_images}] 已存在，跳过：{destination}"
+            )
+
+        if not pending:
+            # 全部结果都已存在时不加载模型；这也是“断点续跑”最省资源的路径。
+            report_records = [record for record in records if record is not None]
+            print(
+                f"[MlxQwenImage21FolderEdit] 已有 {total_images} 个可用输出，跳过全部图片"
+            )
+            return (
+                MlxPilImage(images=tuple(image for image in generated if image is not None)),
+                "\n".join(path for path in saved_paths if path is not None),
+                json.dumps(report_records, ensure_ascii=False, indent=2),
+                total_images,
+            )
+
         entry = entry_for(model.model_type)
         cache = Cache(
             caps={
@@ -298,9 +358,6 @@ class MlxQwenImage21FolderEdit:
         )
         positive_text = self._condition_text(prompt)
         negative_text = self._condition_text(negative_prompt)
-        generated: list[Image.Image] = []
-        saved_paths: list[str] = []
-        records: list[dict[str, object]] = []
         sampler_components = None
         encoder_components = None
         encoder_key = runtime.cache_key({"kind": "module", "clip": clip})
@@ -312,7 +369,7 @@ class MlxQwenImage21FolderEdit:
         try:
             sampler_components = pipeline.prepare_sampler_components(entry, model, cache)
             encoder_components = pipeline.prepare_encoder(entry, clip, cache, encoder_key)
-            for index, source_path in enumerate(ordered_paths):
+            for index, source_path, destination in pending:
                 ref_key = ""
                 positive_key = ""
                 negative_key = ""
@@ -425,37 +482,33 @@ class MlxQwenImage21FolderEdit:
                     if resolution_timing == RESOLUTION_TIMINGS[2]:
                         result_image = self._resize_image(result_image, (output_width, output_height))
 
-                    destination = output / _safe_output_name(source_path.name, index)
                     result_image.save(destination, format="PNG")
                     if not destination.is_file():
                         raise RuntimeError(f"图片保存后未找到输出文件：{destination}")
-                    generated.append(result_image)
-                    saved_paths.append(str(destination))
-                    records.append(
-                        {
-                            "index": index,
-                            "source": str(source_path),
-                            "output": str(destination),
-                            "status": "success",
-                            "seed": int(seed) + index,
-                            "width": output_width,
-                            "height": output_height,
-                            "resolution_scale": resolution_scale,
-                            "resolution_timing": resolution_timing,
-                        }
-                    )
-                    print(f"[MlxQwenImage21FolderEdit] [{index + 1}/{len(paths)}] 已保存：{destination}")
+                    generated[index] = result_image
+                    saved_paths[index] = str(destination)
+                    records[index] = {
+                        "index": index,
+                        "source": str(source_path),
+                        "output": str(destination),
+                        "status": "success",
+                        "seed": int(seed) + index,
+                        "width": output_width,
+                        "height": output_height,
+                        "resolution_scale": resolution_scale,
+                        "resolution_timing": resolution_timing,
+                    }
+                    print(f"[MlxQwenImage21FolderEdit] 已保存：{destination}")
                 except Exception as exc:  # noqa: BLE001
-                    records.append(
-                        {
-                            "index": index,
-                            "source": str(source_path),
-                            "status": "error",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
+                    records[index] = {
+                        "index": index,
+                        "source": str(source_path),
+                        "output": str(destination),
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                     print(
-                        f"[MlxQwenImage21FolderEdit] [{index + 1}/{len(paths)}] 处理失败，继续下一张："
+                        f"[MlxQwenImage21FolderEdit] 处理失败，继续下一张："
                         f"{source_path} | {exc}"
                     )
                 finally:
@@ -472,25 +525,29 @@ class MlxQwenImage21FolderEdit:
                         # 无论当前图片成功还是失败，都算作已处理，避免进度条停在
                         # 失败图片上；ComfyUI 中此调用会同步更新节点进度条。
                         progress.update()
-                        processed = index + 1
-                        failed = processed - len(generated)
+                        processed += 1
+                        available = sum(image is not None for image in generated)
+                        failed = processed - available
                         print(
                             f"[MlxQwenImage21FolderEdit] 处理进度：{processed}/{total_images} "
-                            f"（成功 {len(generated)}，失败 {failed}）"
+                            f"（成功/跳过 {available}，失败 {failed}）"
                         )
         finally:
             pipeline.clear_compiled_predict_caches()
             pipeline.release_sampler_components(entry, model, cache)
             pipeline.release_encoder(clip, cache)
 
-        success_count = len(generated)
+        available_images = [image for image in generated if image is not None]
+        available_paths = [path for path in saved_paths if path is not None]
+        report_records = [record for record in records if record is not None]
+        success_count = len(available_images)
         if not success_count:
-            report = json.dumps(records, ensure_ascii=False, indent=2)
+            report = json.dumps(report_records, ensure_ascii=False, indent=2)
             raise RuntimeError(f"文件夹中没有图片处理成功：\n{report}")
         return (
-            MlxPilImage(images=tuple(generated)),
-            "\n".join(saved_paths),
-            json.dumps(records, ensure_ascii=False, indent=2),
+            MlxPilImage(images=tuple(available_images)),
+            "\n".join(available_paths),
+            json.dumps(report_records, ensure_ascii=False, indent=2),
             success_count,
         )
 

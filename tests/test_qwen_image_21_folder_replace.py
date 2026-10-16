@@ -204,6 +204,105 @@ def test_folder_replace_orders_source_then_person_and_saves_to_images(tmp_path, 
     assert progress_updates == [(1, 3), (2, 3), (3, 3)]
 
 
+def test_folder_replace_skips_existing_outputs_and_reprocesses_corrupt_outputs(tmp_path, monkeypatch):
+    comfy_input = tmp_path / "comfy-input"
+    input_dir = comfy_input / "mlx_qwen_image_21" / "resume-replace"
+    input_dir.mkdir(parents=True)
+    monkeypatch.setattr(replace_module, "_comfy_input_directory", lambda: comfy_input)
+
+    Image.new("RGBA", (32, 32), (10, 0, 0, 255)).save(input_dir / "image1.png")
+    Image.new("RGBA", (32, 32), (20, 0, 0, 255)).save(input_dir / "image2.png")
+    Image.new("RGBA", (32, 32), (30, 0, 0, 255)).save(input_dir / "image10.png")
+    output_dir = input_dir / "images"
+    output_dir.mkdir()
+    Image.new("RGB", (12, 12), (77, 0, 0)).save(output_dir / "0001_image2.png")
+    (output_dir / "0002_image10.png").write_bytes(b"incomplete output")
+
+    reference_calls, _text_calls, sample_calls = _patch_fake_pipeline(monkeypatch)
+    progress_updates: list[tuple[int, int]] = []
+
+    class FakeProgress:
+        def __init__(self, total):
+            self.total = total
+            self.current = 0
+
+        def update(self, amount=1):
+            self.current += amount
+            progress_updates.append((self.current, self.total))
+
+    monkeypatch.setattr(replace_module, "SamplingProgress", FakeProgress)
+    vae, clip, model = _handles()
+    result = replace_module.MlxQwenImage21FolderReplace().replace_folder(
+        "mlx_qwen_image_21/resume-replace",
+        np.full((1, 16, 16, 3), 0.5, dtype=np.float32),
+        vae,
+        clip,
+        model,
+        "prompt",
+        "negative",
+        100,
+        1,
+        1.0,
+        "flow_match_euler_discrete",
+        "off",
+    )
+
+    assert [[image.getpixel((0, 0))[0] for image in call] for call in reference_calls] == [
+        [10, 128],
+        [30, 128],
+    ]
+    assert [call["seed"] for call in sample_calls] == [100, 102]
+    assert [Path(path).name for path in result[1].splitlines()] == [
+        "0000_image1.png",
+        "0001_image2.png",
+        "0002_image10.png",
+    ]
+    assert result[0].images[1].getpixel((0, 0))[0] == 77
+    assert [record["status"] for record in json.loads(result[2])] == [
+        "success",
+        "skipped",
+        "success",
+    ]
+    assert result[3] == 3
+    assert progress_updates == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_folder_replace_returns_existing_outputs_without_loading_pipeline(tmp_path, monkeypatch):
+    comfy_input = tmp_path / "comfy-input"
+    input_dir = comfy_input / "mlx_qwen_image_21" / "already-done"
+    input_dir.mkdir(parents=True)
+    monkeypatch.setattr(replace_module, "_comfy_input_directory", lambda: comfy_input)
+
+    for name, value in (("image1.png", 10), ("image2.png", 20)):
+        Image.new("RGBA", (20, 20), (value, 0, 0, 255)).save(input_dir / name)
+    output_dir = input_dir / "images"
+    output_dir.mkdir()
+    Image.new("RGB", (20, 20), (90, 0, 0)).save(output_dir / "0000_image1.png")
+    Image.new("RGB", (20, 20), (91, 0, 0)).save(output_dir / "0001_image2.png")
+
+    def fail_if_loaded(*_args, **_kwargs):
+        raise AssertionError("全部已有输出时不应加载采样管线")
+
+    monkeypatch.setattr(replace_module.pipeline, "prepare_sampler_components", fail_if_loaded)
+    monkeypatch.setattr(replace_module.pipeline, "prepare_encoder", fail_if_loaded)
+    result = replace_module.MlxQwenImage21FolderReplace().replace_folder(
+        "mlx_qwen_image_21/already-done",
+        None,
+        *_handles(),
+        "prompt",
+        "negative",
+        100,
+        1,
+        1.0,
+        "flow_match_euler_discrete",
+        "off",
+    )
+
+    assert [image.getpixel((0, 0))[0] for image in result[0].images] == [90, 91]
+    assert [record["status"] for record in json.loads(result[2])] == ["skipped", "skipped"]
+    assert result[3] == 2
+
+
 def test_folder_replace_continues_after_one_invalid_source(tmp_path, monkeypatch):
     comfy_input = tmp_path / "comfy-input"
     input_dir = comfy_input / "mlx_qwen_image_21" / "with-failure"
