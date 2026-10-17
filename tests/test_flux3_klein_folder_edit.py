@@ -60,7 +60,12 @@ def _make_input(tmp_path: Path, name: str = "batch") -> tuple[Path, Path]:
     return comfy_input, input_dir
 
 
-def _patch_fake_pipeline(monkeypatch, *, fail_on_sample: set[int] | None = None):
+def _patch_fake_pipeline(
+    monkeypatch,
+    *,
+    fail_on_sample: set[int] | None = None,
+    decoded_size: tuple[int, int] = (20, 20),
+):
     fail_on_sample = set(fail_on_sample or ())
     reference_calls: list[dict] = []
     text_calls: list[tuple[str, str]] = []
@@ -80,7 +85,10 @@ def _patch_fake_pipeline(monkeypatch, *, fail_on_sample: set[int] | None = None)
     monkeypatch.setattr(
         folder_module.pipeline,
         "reference_image_cache_key",
-        lambda _vae, digest, params: f"ref-{digest[:8]}-{params['family']}",
+        lambda _vae, digest, params: (
+            f"ref-{digest[:8]}-{params['family']}-{params['resolution_scale']}-"
+            f"{params['resolution_timing']}-{params['sampling_width']}x{params['sampling_height']}"
+        ),
     )
     monkeypatch.setattr(
         folder_module.pipeline,
@@ -163,7 +171,7 @@ def _patch_fake_pipeline(monkeypatch, *, fail_on_sample: set[int] | None = None)
     monkeypatch.setattr(
         folder_module.image_mod,
         "to_pil",
-        lambda _decoded, batch_index=-1: (Image.new("RGB", (20, 20), (40, 80, 120)),),
+        lambda _decoded, batch_index=-1: (Image.new("RGB", decoded_size, (40, 80, 120)),),
     )
     return reference_calls, text_calls, sample_calls, cleanup_calls, cache_instances
 
@@ -177,6 +185,8 @@ def _run(node, input_token, handles, **kwargs):
         kwargs.pop("seed", 100),
         kwargs.pop("steps", 4),
         kwargs.pop("resize_mode", "auto"),
+        kwargs.pop("resolution_scale", 1.0),
+        kwargs.pop("resolution_timing", folder_module.RESOLUTION_TIMINGS[0]),
     )
 
 
@@ -230,6 +240,116 @@ def test_folder_edit_orders_images_and_uses_shared_reference_key_for_conditions(
     assert cleanup_calls[-5:] == ["compiled", "sampler_release", "encoder_release", "vae_release", "flush"]
     assert len(cache_instances) == 1
     assert all(not cache.keys(bucket) for bucket in ("ref_encoding", "prompt_encoding", "component_weights") for cache in cache_instances)
+
+
+@pytest.mark.parametrize(
+    ("timing", "reference_size", "sampling_size", "decoded_size"),
+    [
+        (folder_module.RESOLUTION_TIMINGS[0], (130, 98), (64, 48), (64, 48)),
+        (folder_module.RESOLUTION_TIMINGS[1], (64, 48), (64, 48), (64, 48)),
+        (folder_module.RESOLUTION_TIMINGS[2], (130, 98), (128, 96), (128, 96)),
+    ],
+)
+def test_folder_edit_resolution_timing_controls_reference_canvas_and_output(
+    tmp_path,
+    monkeypatch,
+    timing,
+    reference_size,
+    sampling_size,
+    decoded_size,
+):
+    comfy_input, input_dir = _make_input(tmp_path, f"timing-{timing}")
+    monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
+    monkeypatch.setattr(folder_module, "_comfy_output_directory", lambda: tmp_path / "comfy-output")
+    Image.new("RGB", (130, 98), (10, 20, 30)).save(input_dir / "source.png")
+
+    reference_calls, _text_calls, sample_calls, _cleanup_calls, _cache_instances = _patch_fake_pipeline(
+        monkeypatch,
+        decoded_size=decoded_size,
+    )
+    result = _run(
+        folder_module.MlxFlux3KleinFolderEdit(),
+        f"mlx_flux3_klein/timing-{timing}",
+        _handles(),
+        resolution_scale=0.5,
+        resolution_timing=timing,
+    )
+
+    assert reference_calls[0]["size"] == reference_size
+    assert (sample_calls[0]["width"], sample_calls[0]["height"]) == sampling_size
+    assert reference_calls[0]["key"] == sample_calls[0]["ref_cache_key"]
+    assert reference_calls[0]["key"].endswith(f"-0.5-{timing}-{sampling_size[0]}x{sampling_size[1]}")
+
+    output_path = Path(result[1])
+    with Image.open(output_path) as generated:
+        assert generated.size == (64, 48)
+    assert result[0].images[0].size == (64, 48)
+    report = json.loads(result[2])
+    assert report[0]["width"] == 64
+    assert report[0]["height"] == 48
+    assert report[0]["resolution_scale"] == 0.5
+    assert report[0]["resolution_timing"] == timing
+
+
+def test_flux3_scaled_dimensions_floor_to_16_grid_and_keep_minimum_cell():
+    node = folder_module.MlxFlux3KleinFolderEdit()
+    image = Image.new("RGB", (130, 98))
+
+    assert node._scaled_dimensions(image, 1.0) == (128, 96)
+    assert node._scaled_dimensions(image, 0.5) == (64, 48)
+    assert node._scaled_dimensions(Image.new("RGB", (7, 9)), 0.01) == (16, 16)
+    with pytest.raises(ValueError, match="大于 0 的有限数字"):
+        node._scaled_dimensions(image, 0)
+    with pytest.raises(ValueError, match="大于 0 的有限数字"):
+        node._scaled_dimensions(image, float("nan"))
+
+
+def test_flux3_reference_cache_key_isolated_by_scale_timing_and_effective_dimensions():
+    node = folder_module.MlxFlux3KleinFolderEdit()
+    image = Image.new("RGB", (64, 48), (1, 2, 3))
+    vae = _handles()[0]
+
+    base = node._reference_key(vae, image, "auto", folder_module.RESOLUTION_TIMINGS[0], 1.0, (64, 48), (64, 48))
+    other_scale = node._reference_key(vae, image, "auto", folder_module.RESOLUTION_TIMINGS[0], 0.5, (32, 32), (32, 32))
+    other_timing = node._reference_key(vae, image, "auto", folder_module.RESOLUTION_TIMINGS[1], 1.0, (64, 48), (64, 48))
+    other_canvas = node._reference_key(vae, image, "auto", folder_module.RESOLUTION_TIMINGS[0], 1.0, (48, 48), (48, 48))
+
+    assert len({base, other_scale, other_timing, other_canvas}) == 4
+
+
+def test_folder_edit_rejects_invalid_resolution_controls(tmp_path, monkeypatch):
+    comfy_input, input_dir = _make_input(tmp_path, "invalid-resolution")
+    monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
+    Image.new("RGB", (64, 64), "white").save(input_dir / "source.png")
+    node = folder_module.MlxFlux3KleinFolderEdit()
+
+    with pytest.raises(ValueError, match="大于 0 的有限数字"):
+        _run(node, "mlx_flux3_klein/invalid-resolution", _handles(), resolution_scale=-1)
+    with pytest.raises(ValueError, match="未知分辨率缩放时机"):
+        _run(node, "mlx_flux3_klein/invalid-resolution", _handles(), resolution_timing="invalid")
+
+
+def test_flux3_folder_workflow_serializes_scaling_widgets_in_signature_order():
+    workflow_path = (
+        Path(__file__).resolve().parents[1]
+        / "workflows"
+        / "flux3-klein-folder-edit.json"
+    )
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    node = next(item for item in workflow["nodes"] if item["type"] == "MlxFlux3KleinFolderEdit")
+
+    # Linked vae/clip/model inputs are not serialized as widgets. The remaining
+    # values must follow edit_folder's public widget signature.
+    assert node["widgets_values"] == [
+        "",
+        folder_module.DEFAULT_PROMPT,
+        folder_module.DEFAULT_NEGATIVE_PROMPT,
+        42,
+        16,
+        "auto",
+        1.0,
+        folder_module.RESOLUTION_TIMINGS[0],
+    ]
 
 
 def test_folder_edit_resumes_valid_outputs_and_reprocesses_corrupt_outputs(tmp_path, monkeypatch):

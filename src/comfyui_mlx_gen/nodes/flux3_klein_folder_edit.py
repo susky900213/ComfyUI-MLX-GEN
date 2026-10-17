@@ -8,6 +8,7 @@ separate FLUX 3 edit request; no input folder is used as an output directory.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
@@ -36,6 +37,9 @@ UPLOAD_ROOT = "mlx_flux3_klein"
 OUTPUT_ROOT = "flux3-klein-folder-edit"
 SCHEDULER = "flux3_flow_map"
 RESIZE_MODES = ("auto", "aspect_area_crop", "keep_resolution")
+# Keep the same three scaling timings as the Qwen-Image 2.1 folder node.
+# FLUX 3 additionally aligns every sampling canvas side to its 16-pixel grid.
+RESOLUTION_TIMINGS = ("采样时降分辨率", "先降分辨率", "后降分辨率")
 
 DEFAULT_PROMPT = "保持原图主体、构图和视角，只按照提示词编辑图像。"
 DEFAULT_NEGATIVE_PROMPT = "低清晰度，模糊，畸形，水印，黑边，裁切主体"
@@ -213,6 +217,23 @@ class MlxFlux3KleinFolderEdit:
                 ),
                 "steps": ("INT", {"default": 16, "min": 1, "max": 100}),
                 "resize_mode": (list(RESIZE_MODES), {"default": "auto"}),
+                "resolution_scale": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.01,
+                        "max": 4.0,
+                        "step": 0.01,
+                        "tooltip": "按每张图片原始宽高乘以此系数；例如 0.5 表示目标尺寸减半，具体作用取决于缩放时机",
+                    },
+                ),
+                "resolution_timing": (
+                    list(RESOLUTION_TIMINGS),
+                    {
+                        "default": RESOLUTION_TIMINGS[0],
+                        "tooltip": "选择只缩小采样画布、先缩小参考图后采样，或在生成完成后缩小最终图片",
+                    },
+                ),
             }
         }
 
@@ -242,11 +263,51 @@ class MlxFlux3KleinFolderEdit:
         return text if text and text.strip() else " "
 
     @staticmethod
-    def _reference_key(vae_handle, image: Image.Image, resize_mode: str) -> str:
+    def _scaled_dimensions(image: Image.Image, resolution_scale: float) -> tuple[int, int]:
+        """Return a scaled FLUX 3 canvas aligned to the 16-pixel packing grid."""
+
+        scale = float(resolution_scale)
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(f"分辨率系数必须是大于 0 的有限数字，收到 {resolution_scale!r}")
+
+        def aligned(value: int) -> int:
+            # Very small factors still need one valid FLUX 3 grid cell.
+            return max(16, int(value * scale) // 16 * 16)
+
+        return aligned(image.width), aligned(image.height)
+
+    @staticmethod
+    def _resize_image(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+        if image.size == size:
+            return image
+        return image.resize(size, Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def _reference_key(
+        vae_handle,
+        image: Image.Image,
+        resize_mode: str,
+        resolution_timing: str,
+        resolution_scale: float,
+        sampling_size: tuple[int, int],
+        output_size: tuple[int, int],
+    ) -> str:
         return pipeline.reference_image_cache_key(
             vae_handle,
             image_mod.digest([image]),
-            {"count": 1, "resize_mode": resize_mode, "family": "flux3"},
+            {
+                "count": 1,
+                "resize_mode": resize_mode,
+                "resolution_timing": resolution_timing,
+                "resolution_scale": float(resolution_scale),
+                "reference_width": int(image.width),
+                "reference_height": int(image.height),
+                "sampling_width": int(sampling_size[0]),
+                "sampling_height": int(sampling_size[1]),
+                "output_width": int(output_size[0]),
+                "output_height": int(output_size[1]),
+                "family": "flux3",
+            },
         )
 
     def edit_folder(
@@ -260,13 +321,20 @@ class MlxFlux3KleinFolderEdit:
         seed,
         steps,
         resize_mode="auto",
+        resolution_scale=1.0,
+        resolution_timing=RESOLUTION_TIMINGS[0],
     ):
         self._validate_handles(vae, clip, model)
         if resize_mode not in RESIZE_MODES:
             raise ValueError(f"FLUX 3 参考图只支持 {' / '.join(RESIZE_MODES)}，收到 {resize_mode!r}")
+        if resolution_timing not in RESOLUTION_TIMINGS:
+            raise ValueError(f"未知分辨率缩放时机：{resolution_timing!r}")
         steps = int(steps)
         if steps < 1:
             raise ValueError(f"steps 必须大于 0，收到 {steps}")
+        resolution_scale = float(resolution_scale)
+        if not math.isfinite(resolution_scale) or resolution_scale <= 0:
+            raise ValueError(f"分辨率系数必须是大于 0 的有限数字，收到 {resolution_scale!r}")
 
         resolved_input = _resolve_input_directory(input_directory)
         paths = _secure_image_paths(resolved_input)
@@ -326,10 +394,35 @@ class MlxFlux3KleinFolderEdit:
                 vae_module = None
                 try:
                     source_image = _load_one_image(source_path)
-                    ref_key = self._reference_key(vae, source_image, resize_mode)
+                    output_width, output_height = self._scaled_dimensions(
+                        source_image, resolution_scale
+                    )
+                    # “采样时降”只调整目标画布；“先降”同时缩小传入的参考图；
+                    # “后降”先用原始画布生成，再缩小解码后的最终图片。
+                    if resolution_timing == RESOLUTION_TIMINGS[0]:
+                        generation_image = source_image
+                        width, height = output_width, output_height
+                    elif resolution_timing == RESOLUTION_TIMINGS[1]:
+                        generation_image = self._resize_image(
+                            source_image, (output_width, output_height)
+                        )
+                        width, height = output_width, output_height
+                    else:
+                        generation_image = source_image
+                        width, height = self._scaled_dimensions(source_image, 1.0)
+
+                    ref_key = self._reference_key(
+                        vae,
+                        generation_image,
+                        resize_mode,
+                        resolution_timing,
+                        resolution_scale,
+                        (width, height),
+                        (output_width, output_height),
+                    )
                     vae_module = pipeline.vae_component(vae, cache)
                     packed, ids, ref_width, ref_height = pipeline.encode_flux3_reference_images(
-                        vae_module, [source_image], cache, ref_key, 1, resize_mode
+                        vae_module, [generation_image], cache, ref_key, 1, resize_mode
                     )
                     cache.get_or_create(
                         "ref_encoding", ref_key, lambda: (packed, ids, ref_width, ref_height)
@@ -366,8 +459,8 @@ class MlxFlux3KleinFolderEdit:
                     params = {
                         "seed": int(seed) + index,
                         "steps": steps,
-                        "height": int(ref_height),
-                        "width": int(ref_width),
+                        "height": int(height),
+                        "width": int(width),
                         "batch_size": 1,
                         "positive_encoding_key": positive.encoding_key,
                         "negative_encoding_key": negative.encoding_key,
@@ -392,6 +485,8 @@ class MlxFlux3KleinFolderEdit:
                         latent.width,
                     )
                     result_image = image_mod.to_pil(decoded, batch_index=-1)[0].convert("RGB")
+                    if resolution_timing == RESOLUTION_TIMINGS[2]:
+                        result_image = self._resize_image(result_image, (output_width, output_height))
                     result_image.save(destination, format="PNG")
                     if _load_existing_output(destination) is None:
                         raise RuntimeError(f"图片保存后未找到有效 PNG：{destination}")
@@ -403,8 +498,10 @@ class MlxFlux3KleinFolderEdit:
                         "output": str(destination),
                         "status": "success",
                         "seed": int(seed) + index,
-                        "width": int(ref_width),
-                        "height": int(ref_height),
+                        "width": int(output_width),
+                        "height": int(output_height),
+                        "resolution_scale": resolution_scale,
+                        "resolution_timing": resolution_timing,
                     }
                 except Exception as exc:  # noqa: BLE001
                     records[index] = {
