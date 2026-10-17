@@ -105,27 +105,33 @@ image3`，不要在中间重新排序。`MlxVAEEncoder` 的 `images` 和 `ref_so
 ```text
 workflows/flux3-klein-edit-multi.json
 ```
-
 ## 3. 参考图预处理契约
 
-FLUX 3 不使用 Flux.2 的“每张参考图缩放到约 1MP”规则。当前
-`prepare_flux3_reference_image()` 的处理顺序是：
+FLUX 3 的官方代码对单图和多图使用不同的参考图尺寸上限：
 
-1. 转换为 RGB；
-2. 只有当单张图片面积超过 `4096 × 4096` 时，才按比例缩小到不超过该面积；
+- 单图参考：面积上限为 `4MP`；
+- 多图参考：每一张独立缩放到不超过 `1MP`。
+
+两条路径都会转 RGB，并把宽、高对齐到 16 像素的 VAE/packing 网格；多图路径随后
+做中心裁剪，并且不会把所有参考图强行改成第一张图的尺寸。实现顺序是：
+
+1. EXIF 方向校正并转换为 RGB；
+2. 单图按 4MP 上限处理，多图逐张按 1MP 上限处理；
 3. 将宽和高分别中心裁剪到 16 的倍数；
 4. 保留每张参考图自己的宽高和宽高比。
 
-因此，正常尺寸的 `1600×800` 参考图仍是 `1600×800`，不会被缩放到约 1MP；
-`1611×803` 会中心裁剪为 `1600×800`。参考图至少需要每边能裁出一个 16 像素块。
+因此，正常尺寸的 `1600×800` 参考图仍是 `1600×800`；多图中的 `2048×2048`
+参考图会缩放为 `1024×1024`，`4000×2000` 会缩放并对齐为 `1440×720`。
+单图 `1611×803` 会中心裁剪为 `1600×800`。参考图至少需要每边能裁出一个
+16 像素块。
 
 `resize_mode` 对 FLUX 3 的含义：
 
 | 值 | 行为 |
 | --- | --- |
-| `auto` | 按 Flux3 的面积上限与 16 像素网格处理 |
+| `auto` | 按单图 4MP / 多图每张 1MP 上限与 16 像素网格处理 |
 | `aspect_area_crop` | 同上，适合示例工作流的显式设置 |
-| `keep_resolution` | 不做 `4096²` 面积缩放，但仍转 RGB 并中心裁到 16 的倍数；可能明显增加内存 |
+| `keep_resolution` | 不做面积缩放，但仍转 RGB 并中心裁到 16 的倍数；可能明显增加内存 |
 
 ## 4. latent、ID 与 token 顺序
 
@@ -164,11 +170,11 @@ pack:             [B, (H/16)*(W/16), 128]
 FLUX 3 的 mode blocks 之后，single/joint blocks 的正式顺序是：
 
 ```text
-[text, image, image_cond]
+[image, image_cond, text]
 ```
 
-这不是 Flux.2 的 `[image, image_cond, text]` 顺序。实现保留三个 mode 的独立索引，
-但在进入 joint blocks 前严格按上面的顺序拼接，并在同一顺序下拼接 joint RoPE IDs
+实现保留三个 mode 的独立索引，并在进入 joint blocks 前严格按上面的顺序拼接，在
+同一顺序下拼接 joint RoPE IDs
 和 single-stream modulation。只取回 `image` 段作为目标图预测结果；`image_cond` 段
 不会被当作输出 latent。
 
@@ -195,8 +201,8 @@ PYTHONPATH=src /Users/apple/ComfyUI-Installs/ComfyUI/ComfyUI/.venv/bin/python \
 
 - `flux3` 是独立 family，不能回退到 Flux.2；
 - packed latent 与 transformer 默认层数/通道契约；
-- `[text, image, image_cond]` joint 顺序；
-- 正常尺寸参考图不执行 Flux.2 的约 1MP 缩放；
+- `[image, image_cond, text]` joint 顺序；
+- 单图 4MP / 多图每张 1MP 的官方参考图预处理；
 - 参考图输入顺序对应 `l=-1,-2,...`；
 - Flux3 编辑工作流不把参考图接入文本编码器。
 
@@ -218,9 +224,9 @@ git diff --check
 | 项目 | Flux.2 | FLUX 3 |
 | --- | --- | --- |
 | model family | `flux2` | `flux3` |
-| 参考图尺寸策略 | 约 1MP 等比处理 | 仅超过 `4096²` 才缩小，随后对齐 16 |
+| 参考图尺寸策略 | 约 1MP 等比处理 | 单图 4MP；多图每张 1MP，随后对齐 16 |
 | 参考图 layer 坐标 | Flux.2 的时间/网格约定 | 输入顺序对应 `-1,-2,...` |
-| joint 顺序 | `[image, image_cond, text]` | `[text, image, image_cond]` |
+| joint 顺序 | `[image, image_cond, text]` | `[image, image_cond, text]` |
 | 文本编码器接参考图 | Flux.2 工作流另有 family 约定 | **不接**，只进 `MlxKSamplerMLX.ref_images` |
 | 多图异尺寸入口 | `MlxRefImageSet` + Flux.2 规则 | `MlxRefImageSet` + FLUX 3 规则 |
 

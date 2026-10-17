@@ -246,9 +246,10 @@ workflows/flux3-klein-edit-multi.json # 有序多图参考编辑
 FLUX 3 的参考图必须通过 `MlxVAEEncoder` 编码后只接到
 `MlxKSamplerMLX.ref_images`，不能接到 `MlxTextEncoder.ref_images`。多图编辑使用
 `MlxRefImageSet` 的 `image1 → image2 → image3 → image4` 顺序连接到
-`MlxVAEEncoder.ref_source`；这个顺序就是模型接收参考图的顺序。普通尺寸的参考图不会
-被压缩到 Flux.2 的约 1MP；实现只会处理超过 `4096²` 像素的图片，并在最后中心裁剪到
-16 像素倍数。
+`MlxVAEEncoder.ref_source`；这个顺序就是模型接收参考图的顺序。FLUX 3 单图参考的
+面积上限是 `4MP`，多图参考则逐张缩放到不超过 `1MP`，之后中心裁剪到 16 像素倍数；
+不同参考图不会被强行改成第一张图的尺寸。需要完整的 token / layer ID 约定时，请以
+上面的 FLUX 3 编辑实现说明为准。
 
 ### 2.2 Ideogram 4 FP8
 

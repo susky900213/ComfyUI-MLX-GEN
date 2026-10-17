@@ -31,6 +31,7 @@ from .html_scramble_downloader import MlxDownloadScrambledHtmlImages
 from .storyboard_batch_edit import MlxQwenImage21StoryboardBatchEdit
 from .qwen_image_21_folder_edit import MlxQwenImage21FolderEdit
 from .qwen_image_21_folder_replace import MlxQwenImage21FolderReplace
+from .flux3_klein_folder_edit import MlxFlux3KleinFolderEdit
 from .whisper_transcribe import MlxWhisperTranscribe
 from .qwen_image_pe import MlxQwenImagePEI2I, MlxQwenImagePET2I
 from .yue2_melody import MlxYue2MelodyFromAudio
@@ -67,6 +68,7 @@ __all__ = [
     "MlxQwenImage21StoryboardBatchEdit",
     "MlxQwenImage21FolderEdit",
     "MlxQwenImage21FolderReplace",
+    "MlxFlux3KleinFolderEdit",
     "MlxWhisperTranscribe",
     "MlxQwenImagePET2I",
     "MlxQwenImagePEI2I",

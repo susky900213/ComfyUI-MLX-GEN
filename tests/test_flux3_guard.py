@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -33,7 +34,11 @@ from comfyui_mlx_gen.flux3.dit import (  # noqa: E402
     _join_single_stream_modulations,
 )
 from comfyui_mlx_gen.flux3.latent_creator import Flux3LatentCreator  # noqa: E402
-from comfyui_mlx_gen.pipeline import prepare_flux3_reference_image  # noqa: E402
+from comfyui_mlx_gen.pipeline import (  # noqa: E402
+    _flux3_pack_sample,
+    prepare_flux3_multi_reference_image,
+    prepare_flux3_reference_image,
+)
 import mlx.core as mx  # noqa: E402
 
 
@@ -133,16 +138,14 @@ def test_flux3_joint_sequence_uses_official_text_image_reference_order():
 
     _bounds, placement = Flux3Transformer._ranges_for_joint(packed)
     assert [mode for mode, _left, _right, _offset in placement] == [
-        "text",
         "image",
         "image_cond",
+        "text",
     ]
-    assert [offset for _mode, _left, _right, offset in placement] == [0, 3, 5]
+    assert [offset for _mode, _left, _right, offset in placement] == [0, 2, 7]
 
 
 def test_flux3_reference_preprocessing_keeps_normal_sized_images():
-    from PIL import Image
-
     image = Image.new("RGBA", (1600, 800), (255, 0, 0, 128))
     prepared = prepare_flux3_reference_image(image, "aspect_area_crop")
     assert prepared.mode == "RGB"
@@ -150,6 +153,18 @@ def test_flux3_reference_preprocessing_keeps_normal_sized_images():
 
     cropped = prepare_flux3_reference_image(Image.new("RGB", (1611, 803)), "auto")
     assert cropped.size == (1600, 800)
+
+
+def test_flux3_multi_reference_preprocessing_uses_one_megapixel_per_reference():
+    square = prepare_flux3_multi_reference_image(Image.new("RGB", (2048, 2048)), "auto")
+    assert square.size == (1024, 1024)
+
+    wide = prepare_flux3_multi_reference_image(Image.new("RGB", (4000, 2000)), "auto")
+    assert wide.size == (1440, 720)
+    assert wide.width * wide.height <= 1024 * 1024
+
+    kept = prepare_flux3_multi_reference_image(Image.new("RGB", (2048, 2048)), "keep_resolution")
+    assert kept.size == (2048, 2048)
 
 
 def test_flux3_reference_ids_use_input_order_on_negative_layer_axis():
@@ -161,6 +176,23 @@ def test_flux3_reference_ids_use_input_order_on_negative_layer_axis():
     assert tuple(ids.shape) == (1, 8, 4)
     assert np.all(np.asarray(ids[0, :6, 3]) == -1)
     assert np.all(np.asarray(ids[0, 6:, 3]) == -2)
+
+
+def test_flux3_sampler_pack_keeps_all_multi_reference_tokens():
+    text = (mx.zeros((1, 2, 20_480)), mx.zeros((1, 2, 4)))
+    image = (mx.zeros((1, 4, 128)), mx.zeros((1, 4, 4)))
+    references = (
+        mx.zeros((1, 3, 128)),
+        mx.zeros((1, 3, 4)),
+        1024,
+        1024,
+    )
+
+    packed = _flux3_pack_sample(text, references, image, 0)
+
+    assert tuple(packed.data["image_cond"].shape) == (3, 128)
+    assert packed.mode_indices["image_cond"] == [(0, 3)]
+    assert tuple(packed.ids["image_cond"].shape) == (3, 4)
 
 
 def test_flux3_edit_workflows_keep_reference_images_out_of_text_encoder():
@@ -199,6 +231,7 @@ if __name__ == "__main__":
         test_flux3_single_stream_modulation_is_joined_once,
         test_flux3_joint_sequence_uses_official_text_image_reference_order,
         test_flux3_reference_preprocessing_keeps_normal_sized_images,
+        test_flux3_multi_reference_preprocessing_uses_one_megapixel_per_reference,
         test_flux3_reference_ids_use_input_order_on_negative_layer_axis,
         test_flux3_edit_workflows_keep_reference_images_out_of_text_encoder,
     ]

@@ -800,7 +800,10 @@ REFERENCE_MIN_DIM = 16  # 参考图每条边必须是 16 的倍数（vae scale 8
 REFERENCE_T_COORD_BASE = 10  # 第 i 张参考图的 grid ids t 坐标 = 10 + 10 * i（目标图是 0）
 REFERENCE_T_COORD_STEP = 10
 RESIZE_MODES = ("aspect_area_crop", "keep_resolution")
-FLUX3_REFERENCE_MAX_AREA = 4096 * 4096
+# BFL reference code uses a 4MP canvas for a single reference and a separate
+# 1MP cap for every image in a multi-reference edit.
+FLUX3_REFERENCE_MAX_AREA = 4 * 1024 * 1024
+FLUX3_MULTI_REFERENCE_MAX_AREA = 1024 * 1024
 FLUX3_REFERENCE_MULTIPLE = 16
 
 
@@ -911,10 +914,12 @@ def encode_flux3_reference_images(
 ):
     """Encode FLUX 3 references as official 128-channel image-condition tokens.
 
-    FLUX 3 intentionally does not use Flux.2's approximately-1MP reference
-    resize.  Each reference keeps its own resolution; only images larger than
-    4096² pixels are downscaled, and every image is then center-cropped to the
-    16-pixel VAE/packing grid.  The input-list order is retained both in the
+    BFL has two reference preprocessing paths.  A single reference keeps up to
+    the 4MP reference canvas; multi-reference editing preprocesses *each*
+    reference to at most 1MP before the 16-pixel packed-VAE crop.  The latter is
+    important: concatenating several full-resolution 2K/4K references creates
+    a token stream unlike the official multi-reference path and can overwhelm
+    the DiT on Metal.  The input-list order is retained both in the
     concatenated token sequence and in the negative ``l`` RoPE coordinate.
     """
     helpers = runtime.import_object(
@@ -929,8 +934,13 @@ def encode_flux3_reference_images(
         packed: list[Any] = []
         ids: list[Any] = []
         use_w = use_h = 0
+        multi_reference = len(selected) > 1
         for index, pil in enumerate(selected):
-            prepared = prepare_flux3_reference_image(pil, resize_mode)
+            prepared = (
+                prepare_flux3_multi_reference_image(pil, resize_mode)
+                if multi_reference
+                else prepare_flux3_reference_image(pil, resize_mode)
+            )
             if index == 0:
                 use_w, use_h = prepared.width, prepared.height
             encoded = vae_util.encode(vae=vae, image=image_util.to_array(prepared), tiling_config=None)
@@ -953,7 +963,8 @@ def prepare_flux3_reference_image(pil, resize_mode: str):
     """Apply the official FLUX 3 reference-image preprocessing contract.
 
     The official processor preserves each reference's own aspect ratio and
-    resolution, downscaling only when its area exceeds 4096² pixels, then
+    resolution, downscaling only when its area exceeds the 4MP single-reference
+    limit, then
     center-crops to the 16-pixel packed-VAE grid.  ``keep_resolution`` remains
     available as an explicit memory-risking override for local workflows; the
     default ``auto``/``aspect_area_crop`` path follows the official limit.
@@ -963,9 +974,9 @@ def prepare_flux3_reference_image(pil, resize_mode: str):
             "FLUX 3 参考图只支持 auto / aspect_area_crop / keep_resolution，"
             f"收到 {resize_mode}"
         )
-    from PIL import Image as PILImage
+    from PIL import Image as PILImage, ImageOps
 
-    prepared = pil.convert("RGB")
+    prepared = ImageOps.exif_transpose(pil).convert("RGB")
     if resize_mode != "keep_resolution" and prepared.width * prepared.height > FLUX3_REFERENCE_MAX_AREA:
         scale = math.sqrt(FLUX3_REFERENCE_MAX_AREA / (prepared.width * prepared.height))
         new_width = max(FLUX3_REFERENCE_MULTIPLE, int(prepared.width * scale))
@@ -985,10 +996,51 @@ def prepare_flux3_reference_image(pil, resize_mode: str):
     return prepared.crop((left, top, left + width, top + height))
 
 
+def prepare_flux3_multi_reference_image(pil, resize_mode: str):
+    """Apply BFL's per-image preprocessing for a multi-reference edit.
+
+    The official ``prepare_multi_reference`` path scales each reference to at
+    most 1MP independently, floors both dimensions to the 16-pixel VAE/packing
+    grid, and center-crops.  It deliberately does not force all references to
+    the first image's dimensions; their individual ``l`` coordinates identify
+    them in the condition stream.
+
+    ``keep_resolution`` remains an explicit local override, matching the
+    existing workflow widget.  It can use substantially more Metal memory.
+    """
+    if resize_mode not in ("auto", "aspect_area_crop", "keep_resolution"):
+        raise ValueError(
+            "FLUX 3 多图参考图只支持 auto / aspect_area_crop / keep_resolution，"
+            f"收到 {resize_mode}"
+        )
+    from PIL import Image as PILImage, ImageOps
+
+    prepared = ImageOps.exif_transpose(pil).convert("RGB")
+    if resize_mode != "keep_resolution" and prepared.width * prepared.height > FLUX3_MULTI_REFERENCE_MAX_AREA:
+        scale = math.sqrt(
+            FLUX3_MULTI_REFERENCE_MAX_AREA / (prepared.width * prepared.height)
+        )
+        new_width = max(FLUX3_REFERENCE_MULTIPLE, int(prepared.width * scale))
+        new_height = max(FLUX3_REFERENCE_MULTIPLE, int(prepared.height * scale))
+        prepared = prepared.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+
+    width = prepared.width - prepared.width % FLUX3_REFERENCE_MULTIPLE
+    height = prepared.height - prepared.height % FLUX3_REFERENCE_MULTIPLE
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"FLUX 3 多图参考图太小（每边至少 {FLUX3_REFERENCE_MULTIPLE} 像素）: {prepared.size}"
+        )
+    if (width, height) == prepared.size:
+        return prepared
+    left = (prepared.width - width) // 2
+    top = (prepared.height - height) // 2
+    return prepared.crop((left, top, left + width, top + height))
+
+
 def cached_reference(cache, key: str):
     """取出参考图条件；缺失时提示重跑编码节点。
 
-    - flux2：`(packed, ids, width, height)`；
+    - flux2 / flux3：`(packed, ids, width, height)`；
     - qwen_edit：`(packed, ids, cond_h_patches, cond_w_patches)`（`cond_image_grid` 由
       调用方按参考图张数拼出）。
     """
@@ -1426,7 +1478,14 @@ def _sample_flux3(defn, comps, params, cache, guidance, on_progress=None):
     positive = cached_encoding(cache, params["positive_encoding_key"], "正")
     base = bool(params.get("flux3_base", False))
     negative = cached_encoding(cache, params["negative_encoding_key"], "负") if base and guidance > 1.0 else None
-    references = cached_reference(cache, params["ref_cache_key"])[0:2] if params.get("ref_cache_key") else None
+    if params.get("ref_cache_key"):
+        reference_encoding = cached_reference(cache, params["ref_cache_key"])
+        # Keep both arrays for every reference.  The cache tuple also contains
+        # the first prepared image's width/height; do not confuse that tuple
+        # slice with limiting the number of reference images.
+        references = (reference_encoding[0], reference_encoding[1])
+    else:
+        references = None
     schedule = _flux3_schedule(params["steps"])
     creator = runtime.import_object(defn.latent_creator)
     final = []

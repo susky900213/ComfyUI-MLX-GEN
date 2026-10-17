@@ -276,11 +276,13 @@ class Flux3Transformer(nn.Module):
 
     @staticmethod
     def _ranges_for_joint(packed: Flux3Packed) -> tuple[list[tuple[int, int]], list[tuple[str, int, int, int]]]:
-        # Diffusers/BFL's Flux3SingleTransformerBlock receives the text context
-        # first, followed by the target image and optional reference-image
-        # tokens.  Keep the mode-major storage layout above, but make the joint
-        # sequence follow the official [text, image, image_cond] order.
-        joint_modes = ("text", "image", "image_cond")
+        # BFL's Flux3SingleTransformerBlock receives the target image first,
+        # then the optional reference-image tokens, and finally text.  Keep the
+        # mode-major storage layout and the official MODES order here.  The
+        # reference implementation packs samples as [text, image_cond, image]
+        # only while building the mode-major arrays; that is not the order of
+        # the joint single-stream sequence.
+        joint_modes = MODES
         bounds: list[tuple[int, int]] = []
         placement: list[tuple[str, int, int, int]] = []
         offset = 0
