@@ -49,9 +49,11 @@ QWEN_IMAGE_21_FAMILY = "qwen_image_21"
 # FLUX 3 has an independent MLX implementation below.  Keep the marker in the
 # shared detector so a FLUX 3 checkpoint can never be routed to Flux.2.
 FLUX3_FAMILY = "flux3"
-# Qwen-Image 2.1 的 Qwen3-VL text_config.max_position_embeddings。
+# MOSS-Image 的 Qwen3.5 text_config.max_position_embeddings。
 # 该值包含提示词模板和编辑模式中的视觉 token；不要再用 512/4096 这类过小的工作流默认值。
 QWEN_IMAGE_21_MAX_LENGTH = 262_144
+MOSS_FAMILY = "moss"
+MOSS_MAX_LENGTH = 4096
 QWEN_IMAGE_FAMILY = "qwen_image"
 QWEN_EDIT_FAMILY = "qwen_edit"
 
@@ -72,6 +74,7 @@ _QWEN_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _FLUX3_RE = re.compile(r"(?<![a-z0-9])flux[\s._/-]*3(?![0-9])", re.IGNORECASE)
+_MOSS_RE = re.compile(r"(?<![a-z0-9])moss(?:[\s._/-]*image)?(?![a-z0-9])", re.IGNORECASE)
 
 
 def _family_from_text(value: str) -> str | None:
@@ -79,6 +82,8 @@ def _family_from_text(value: str) -> str | None:
     text = str(value)
     # FLUX 3 没有可复用的 Flux.2 MLX 契约；先返回 unsupported marker，避免
     # 后面的 legacy family 逻辑或 ModelConfig 前缀匹配接管它。
+    if _MOSS_RE.search(text):
+        return MOSS_FAMILY
     if _FLUX3_RE.search(text):
         return FLUX3_FAMILY
     # 2.1 必须先于 generic qwen-image 检查，否则会被旧 T2I family 吞掉。
@@ -149,6 +154,15 @@ def validate_model_family(model_type: str, name_or_path: str | Path) -> str | No
     可以套在 Flux.2 上的别名。
     """
     detected = detect_model_family(name_or_path)
+    if detected == MOSS_FAMILY and model_type != MOSS_FAMILY:
+        raise NotImplementedError(
+            "检测到 MOSS-Image checkpoint，但当前选择的不是 moss；"
+            "不会把 MOSS 路由到 Flux.2 或其它模型族"
+        )
+    if model_type == MOSS_FAMILY and detected not in (None, MOSS_FAMILY):
+        raise ValueError(
+            f"权重 {name_or_path!s} 被检测为 {detected}，不是 MOSS-Image；请使用 model_type=moss"
+        )
     if detected == FLUX3_FAMILY and model_type != FLUX3_FAMILY:
         raise NotImplementedError(
             "检测到 FLUX 3 Image Klein checkpoint，但当前选择的不是 flux3；"
@@ -159,10 +173,10 @@ def validate_model_family(model_type: str, name_or_path: str | Path) -> str | No
             f"权重 {name_or_path!s} 被检测为 {detected}，不是 FLUX 3；请使用对应的 model_type"
         )
     if detected is None:
-        if model_type == QWEN_IMAGE_21_FAMILY:
+        if model_type in (QWEN_IMAGE_21_FAMILY, MOSS_FAMILY):
             raise ValueError(
-                "model_type=qwen_image_21 只能使用名称或 config.json 明确标识为 "
-                "Qwen-Image 2.1 的 checkpoint；当前权重无法确认，已拒绝加载"
+                f"model_type={model_type} 只能使用名称或 config.json 明确标识其 checkpoint；"
+                "当前权重无法确认，已拒绝加载"
             )
         return None
     if detected != model_type:
@@ -738,6 +752,34 @@ IDEOGRAM4 = MlxModelEntry(
 )
 
 
+# --- MOSS-Image-SFT（独立 128-channel spatial DiT + Qwen3.5）-------------
+MOSS_IMAGE = MlxModelEntry(
+    family=MOSS_FAMILY,
+    # VAE mapping 复用 Flux2 的 AutoencoderKLFlux2 权重定义；transformer、
+    # text encoder 与 scheduler 全部走 comfyui_mlx_gen.moss 的独立实现。
+    weight_def="comfyui_mlx_gen.moss.weight_definition:MOSSWeightDefinition",
+    components=_components(
+        transformer="comfyui_mlx_gen.moss.transformer:MOSSImageTransformer",
+        vae="mflux.models.flux2.model.flux2_vae.vae:Flux2VAE",
+        text_encoder="comfyui_mlx_gen.moss.loader:build_text_encoder",
+        tokenizer_name="moss_qwen35",
+    ),
+    default_config="",
+    default_steps=50,
+    default_scheduler="moss_flow_match_euler",
+    default_guidance=3.0,
+    supports_compile=False,
+    prompt_encoder="comfyui_mlx_gen.moss.prompt:encode_prompts",
+    latent_creator="comfyui_mlx_gen.moss.latent:create_noise",
+    supported=True,
+    notes=(
+        "独立 MOSS-Image-SFT MLX 链路：42 层 / 3072 dim / 128-channel spatial latent，"
+        "Qwen3.5-9B 条件编码，官方 nearest-grid Flow-Matching Euler shift=5；"
+        "默认 50 步、CFG 3、negative branch 跳过 zero-based block 22。"
+    ),
+)
+
+
 # --- MiniMax-H3（文生视频 + 立体声）：绕开 mflux 的注册表与整体加载路径 ---
 MINIMAX_H3 = MlxModelEntry(
     family="minimax_h3",
@@ -832,6 +874,7 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
     "qwen_image": QWEN_IMAGE,
     "qwen_image_21": QWEN_IMAGE_21,
     "ideogram4": IDEOGRAM4,
+    "moss": MOSS_IMAGE,
     # 放在最后：MlxKSamplerMLX / 三个 loader 的 widget 默认值取 model_types()[0]（= z_image）
     "minimax_h3": MINIMAX_H3,
     "yue2": YUE2,

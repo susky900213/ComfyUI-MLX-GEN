@@ -64,6 +64,7 @@ SCHEDULERS = [
     "ideogram4_turbo",
     "minimax_h3",
     "yue2_midpoint",
+    "moss_flow_match_euler",
 ]
 KV_CACHE_MODES = ["auto", "off"]
 # H3 二阶段节点和命令行工具仍复用这些推荐档位；公共 MlxKSamplerMLX 的图片
@@ -438,6 +439,17 @@ class MlxKSamplerMLX:
                 raise ValueError("参考图不是按 flux2 / flux3 语义编码的")
             ref_key = ref_images.cache_key
             ref_count = int(ref_images.count)
+
+        if entry.family == "moss":
+            if int(width) % 16 or int(height) % 16:
+                raise ValueError("MOSS-Image 的 width / height 必须是 16 的倍数")
+            if ref_images is not None:
+                raise ValueError("MOSS-Image-SFT 是纯文生图链路，不支持 ref_images")
+            if scheduler != "moss_flow_match_euler":
+                print(
+                    f"[MlxKSamplerMLX] MOSS 固定使用 moss_flow_match_euler，已忽略 scheduler={scheduler!r}"
+                )
+                scheduler = "moss_flow_match_euler"
 
         params = {
             "seed": int(seed),

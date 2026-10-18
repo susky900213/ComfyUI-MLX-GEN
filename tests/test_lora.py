@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -327,7 +329,156 @@ check(
 )
 
 
-# --------------------------------------------------------- 6. Qwen-Image 2.1 小模型实际应用
+# --------------------------------------------------------- 6. FLUX 3 BFL/ComfyUI 路径别名
+class TinyFlux3Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.to_q = nn.Linear(4, 4, bias=False)
+        self.to_k = nn.Linear(4, 4, bias=False)
+        self.to_v = nn.Linear(4, 4, bias=False)
+        self.to_out = [nn.Linear(4, 4, bias=False)]
+
+
+class TinyFlux3FeedForward(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_in = nn.Linear(4, 4, bias=False)
+        self.linear_out = nn.Linear(4, 4, bias=False)
+
+
+class TinyFlux3Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = TinyFlux3Attention()
+        self.ff = TinyFlux3FeedForward()
+
+
+class TinyFlux3Modulation(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=False)
+
+
+class TinyFlux3Embedder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_layer = nn.Linear(4, 4, bias=False)
+        self.out_layer = nn.Linear(4, 4, bias=False)
+
+
+class TinyFlux3NormOut(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=False)
+
+
+class TinyFlux3(nn.Module):
+    """Small module tree with the production FLUX 3 target paths."""
+
+    def __init__(self):
+        super().__init__()
+        self.context_embedder = nn.Linear(4, 4, bias=False)
+        self.time_in = TinyFlux3Embedder()
+        self.x_embedders = {"image": nn.Linear(4, 4, bias=False), "image_cond": nn.Linear(4, 4, bias=False)}
+        self.early_stream_modulations = {name: TinyFlux3Modulation() for name in ("image", "image_cond", "txt")}
+        self.single_stream_modulations = {name: TinyFlux3Modulation() for name in ("image", "image_cond", "txt")}
+        self.mode_blocks = {name: [TinyFlux3Block()] for name in ("image", "image_cond")}
+        self.txt_mode_blocks = [TinyFlux3Block()]
+        self.single_transformer_blocks = [TinyFlux3Block()]
+        self.norm_out = TinyFlux3NormOut()
+        self.proj_out = nn.Linear(4, 4, bias=False)
+
+
+def _tiny_lora_matrices():
+    down = mx.array([[1.0, 0.0, 0.5, 0.0], [0.0, 1.0, 0.0, -0.5]])
+    up = mx.array([[0.2, 0.0], [0.0, 0.3], [0.1, 0.0], [0.0, -0.2]])
+    return down, up
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    old_root = paths.MODEL_ROOT
+    paths.MODEL_ROOT = Path(temporary)
+    (paths.MODEL_ROOT / "lora").mkdir()
+    bfl_path = paths.MODEL_ROOT / "lora" / "flux3-bfl.safetensors"
+    old_path = paths.MODEL_ROOT / "lora" / "flux3-diffusers.safetensors"
+    down, up = _tiny_lora_matrices()
+    mx.save_safetensors(
+        str(bfl_path),
+        {
+            "diffusion_model.content_mode_blocks.image.0.q_proj.lora_A.weight": down,
+            "diffusion_model.content_mode_blocks.image.0.q_proj.lora_B.weight": up,
+            "diffusion_model.single_blocks.0.mlp_in.lora_down.weight": down,
+            "diffusion_model.single_blocks.0.mlp_in.lora_up.weight": up,
+            "diffusion_model.single_blocks.0.mlp_in.alpha": mx.array(4.0),
+            "diffusion_model.emb_in.image.lora_A.weight": down,
+            "diffusion_model.emb_in.image.lora_B.weight": up,
+        },
+    )
+    mx.save_safetensors(
+        str(old_path),
+        {
+            "diffusion_model.mode_blocks.image.0.attn.to_k.lora_A.weight": down,
+            "diffusion_model.mode_blocks.image.0.attn.to_k.lora_B.weight": up,
+        },
+    )
+    bfl_model = TinyFlux3()
+    old_model = TinyFlux3()
+    mx.eval(bfl_model.parameters())
+    mx.eval(old_model.parameters())
+    bfl_sample = mx.array([[1.0, 2.0, 3.0, 4.0]])
+    bfl_q_base = mx.array(bfl_model.mode_blocks["image"][0].attn.to_q.weight)
+    bfl_single_base = mx.array(bfl_model.single_transformer_blocks[0].ff.linear_in.weight)
+    bfl_emb_base = mx.array(bfl_model.x_embedders["image"].weight)
+    old_k_base = mx.array(old_model.mode_blocks["image"][0].attn.to_k.weight)
+    output_capture = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output_capture):
+            bfl_resolved, bfl_strengths = transformer_lora.apply_transformer_loras(
+                "flux3", bfl_model, (LoraRef("flux3-bfl.safetensors", 0.5),)
+            )
+            old_resolved, old_strengths = transformer_lora.apply_transformer_loras(
+                "flux3", old_model, (LoraRef("flux3-diffusers.safetensors", 0.25),)
+            )
+        bfl_q_result = bfl_model.mode_blocks["image"][0].attn.to_q(bfl_sample)
+        bfl_single_result = bfl_model.single_transformer_blocks[0].ff.linear_in(bfl_sample)
+        bfl_emb_result = bfl_model.x_embedders["image"](bfl_sample)
+        old_k_result = old_model.mode_blocks["image"][0].attn.to_k(bfl_sample)
+    finally:
+        paths.MODEL_ROOT = old_root
+    from mflux.models.common.lora.layer.linear_lora_layer import LoRALinear
+
+    bfl_expected_q = bfl_sample @ bfl_q_base.T + 0.5 * ((bfl_sample @ down.T) @ up.T)
+    bfl_expected_single = bfl_sample @ bfl_single_base.T + 0.5 * (4.0 / 2.0) * (
+        (bfl_sample @ down.T) @ up.T
+    )
+    bfl_expected_emb = bfl_sample @ bfl_emb_base.T + 0.5 * ((bfl_sample @ down.T) @ up.T)
+    old_expected_k = bfl_sample @ old_k_base.T + 0.25 * ((bfl_sample @ down.T) @ up.T)
+
+check(
+    "FLUX 3 BFL/ComfyUI aliases apply content/single/embed layers with alpha and strength",
+    bfl_resolved == [str(bfl_path.absolute())]
+    and bfl_strengths == [0.5]
+    and isinstance(bfl_model.mode_blocks["image"][0].attn.to_q, LoRALinear)
+    and isinstance(bfl_model.single_transformer_blocks[0].ff.linear_in, LoRALinear)
+    and isinstance(bfl_model.x_embedders["image"], LoRALinear)
+    and "Applied to 3 layers (7/7 keys matched)" in output_capture.getvalue()
+    and np.allclose(np.asarray(bfl_q_result), np.asarray(bfl_expected_q), atol=2e-3, rtol=2e-3)
+    and np.allclose(np.asarray(bfl_single_result), np.asarray(bfl_expected_single), atol=2e-3, rtol=2e-3)
+    and np.allclose(np.asarray(bfl_emb_result), np.asarray(bfl_expected_emb), atol=2e-3, rtol=2e-3),
+    output_capture.getvalue(),
+)
+check(
+    "FLUX 3 既有 Diffusers/MLX module paths 仍可应用",
+    old_resolved == [str(old_path.absolute())]
+    and old_strengths == [0.25]
+    and isinstance(old_model.mode_blocks["image"][0].attn.to_k, LoRALinear)
+    and "Applied to 1 layers (2/2 keys matched)" in output_capture.getvalue()
+    and np.allclose(np.asarray(old_k_result), np.asarray(old_expected_k), atol=2e-3, rtol=2e-3),
+    output_capture.getvalue(),
+)
+
+
+# --------------------------------------------------------- 7. Qwen-Image 2.1 小模型实际应用
 with tempfile.TemporaryDirectory() as temporary:
     old_root = paths.MODEL_ROOT
     paths.MODEL_ROOT = Path(temporary)

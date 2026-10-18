@@ -50,6 +50,8 @@ def normalize_max_length(model_type: str, value: int) -> int:
     保留，避免把有意设置的较小上限静默改掉。
     """
     length = int(value)
+    if model_type == "moss":
+        return min(length, 4096)
     if model_type == "qwen_image_21" and length == 512:
         return QWEN_IMAGE_21_MAX_LENGTH
     return length
@@ -64,7 +66,11 @@ def component_options(component: str) -> list[str]:
         items += [
             name
             for name in paths.list_component_items("transformer")
-            if "yue2" in name.lower() or "breeze" in name.lower()
+            if (
+                "yue2" in name.lower()
+                or "breeze" in name.lower()
+                or "moss" in name.lower()
+            )
         ]
     return list(dict.fromkeys(items)) or [NO_PATH]
 

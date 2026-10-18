@@ -61,6 +61,10 @@ from .qwen_image_21.transformer import QwenImage21KVCache
 from .flux3 import config as flux3_config
 from .flux3 import text_encoder as flux3_text_encoder
 from .flux3 import dit as flux3_dit
+from .moss import latent as moss_latent
+from .moss import loader as moss_loader
+from .moss import prompt as moss_prompt
+from .moss.scheduler import MOSSImageScheduler
 from .types import (
     MlxH3VisualCondition,
     MlxLatentHandle,
@@ -95,6 +99,17 @@ def component_path(entry, role: str, selection: str) -> tuple[str, str]:
     comp = entry.components[role]
     if entry.family == "flux3" and role == "tokenizer":
         return paths.resolve(comp.source, selection, "text_encoder")
+    if entry.family == "moss" and role == "tokenizer":
+        kind, resolved = paths.resolve(comp.source, selection, "tokenizer")
+        if kind != "missing":
+            return kind, resolved
+        # The downloaded HF snapshot currently has a broken `processor`
+        # symlink in the shared model directory.  The official tokenizer files
+        # retained in docs are an explicit local fallback, never a network fetch.
+        fallback = Path(__file__).resolve().parents[2] / "docs/reference_code/moss/moss-image-sft/tokenizer"
+        if (fallback / "tokenizer.json").is_file():
+            return "dir", str(fallback)
+        return kind, resolved
     if entry.family == "qwen_image_21":
         return _qwen21_component_path(role, selection, comp.source)
     kind, resolved = paths.resolve(comp.source, selection, role)
@@ -260,6 +275,18 @@ def prepare_components(
             kind, path = component_path(entry, role, selection)
             if kind == "missing":
                 raise FileNotFoundError(f"未找到 {role} 权重: {path}")
+            if entry.family == "moss":
+                if role == "transformer":
+                    comps[role] = moss_loader.load_transformer(
+                        path, precision=precision, quantize=quantize
+                    ).module
+                elif role == "text_encoder":
+                    comps[role] = moss_loader.load_text_encoder(path, precision=precision).module
+                elif role == "tokenizer":
+                    comps[role] = moss_loader.load_tokenizer(path, max_length=max_length or 4096)
+                else:
+                    raise ValueError(f"MOSS 不支持 prepare_components role={role}")
+                continue
             if entry.family == "qwen_image_21":
                 if role == "tokenizer":
                     comps[role] = qwen21_loader.load_tokenizer(path)
@@ -315,6 +342,8 @@ def prepare_encoder(entry, clip, cache, cache_key: str) -> dict[str, Any]:
         max_length=clip.max_length,
         precision=clip.precision,
     )
+    if entry.family == "moss":
+        return comps
     # qwen_edit 的条件编码还要 VL 那两层；命中缓存时 bundle 里已经有了（幂等）
     if entry.family == "qwen_edit" and "vl_encoder" not in comps:
         _attach_vl(comps)
@@ -411,7 +440,7 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
     _ensure_image_family(entry, "MLX 采样器")
     model_config = (
         None
-        if entry.family in ("qwen_image_21", "flux3")
+        if entry.family in ("qwen_image_21", "flux3", "moss")
         else weights.config_for_path(model_handle.model_path, entry.default_config)
     )
 
@@ -419,6 +448,12 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
         kind, path = component_path(entry, role, model_handle.model_path)
         if kind == "missing":
             raise FileNotFoundError(f"未找到 {role} 权重: {path}")
+        if entry.family == "moss":
+            return moss_loader.load_transformer(
+                path,
+                precision=model_handle.precision,
+                quantize=model_handle.quantize or None,
+            ).module
         # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例），
         # 但 overrides 里还混着运行时开关（qwen_edit_plus 之类）→ 要按签名过滤
         if entry.family == "qwen_image_21":
@@ -468,6 +503,8 @@ def create_latents(defn, seed, height, width, batch_size) -> list[Any]:
       与「是否接参考图」无关 —— edit 那边另外还要参考图 latent，见
       `_sample_qwen_edit`）。
     """
+    if defn.family == "moss":
+        return [moss_latent.create_noise(seed + i, height, width) for i in range(batch_size)]
     if defn.family == "qwen_image_21":
         return [
             qwen21_sampling.create_noise(seed + i, height, width)
@@ -578,6 +615,13 @@ def encode_text(
     """
 
     def build():
+        if defn.family == "moss":
+            return moss_prompt.encode_prompts(
+                text,
+                comps["tokenizer"],
+                comps["text_encoder"],
+                max_length=max_length or 4096,
+            )
         if defn.family == "qwen_image_21":
             return encode_qwen21_prompt(
                 comps["text_encoder"],
@@ -2076,6 +2120,55 @@ def _sample_ideogram4(defn, comps, params, cache, on_progress=None):
     return stacked
 
 
+def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
+    """MOSS native spatial-latent sampling with official negative-layer CFG."""
+    positive = cached_encoding(cache, params["positive_encoding_key"], "正")
+    negative = (
+        cached_encoding(cache, params["negative_encoding_key"], "负")
+        if guidance != 1.0
+        else None
+    )
+    transformer = comps["transformer"]
+    final = []
+    for batch_index in range(int(params["batch_size"])):
+        current = moss_latent.create_noise(
+            int(params["seed"]) + batch_index,
+            int(params["height"]),
+            int(params["width"]),
+            dtype=mx.float32,
+        )
+        scheduler = MOSSImageScheduler(shift=5.0, training_shift=1.0)
+        scheduler.set_timesteps(int(params["steps"]))
+        for step_index, timestep in enumerate(scheduler.timesteps):
+            cond = transformer(
+                current,
+                mx.array([timestep], dtype=mx.float32),
+                positive.embeddings,
+                positive.attention_mask,
+            ).astype(mx.float32)
+            if negative is None:
+                prediction = cond
+            else:
+                uncond = transformer(
+                    current,
+                    mx.array([timestep], dtype=mx.float32),
+                    negative.embeddings,
+                    negative.attention_mask,
+                    # Official MOSS-SFT CFG skips zero-based block 22 only
+                    # for the negative branch.
+                    skip_layers=(22,),
+                ).astype(mx.float32)
+                prediction = uncond + float(guidance) * (cond - uncond)
+            current = scheduler.step(prediction, timestep, current)
+            mx.eval(current)
+            if on_progress is not None:
+                on_progress()
+        final.append(current)
+    result = mx.concatenate(final, axis=0)
+    mx.eval(result)
+    return result
+
+
 def run_sampler(defn, model_handle, comps, params, cache):
     """跑完整采样，返回带缓存数组的 latent 句柄。
 
@@ -2093,7 +2186,7 @@ def run_sampler(defn, model_handle, comps, params, cache):
         raise NotImplementedError(f"{defn.family} 尚未实现：{defn.notes}")
     model_config = (
         None
-        if defn.family in ("qwen_image_21", "flux3")
+        if defn.family in ("qwen_image_21", "flux3", "moss")
         else weights.config_for_path(model_handle.model_path, defn.default_config)
     )
     # 只有**明确声明**不支持 CFG（False，如 z-image-turbo）才清零；
@@ -2132,6 +2225,8 @@ def run_sampler(defn, model_handle, comps, params, cache):
                 f"{defn.family} 暂不支持参考图编辑（目前只有 flux2 / qwen_edit / "
                 "qwen_image_21 的 edit 路径）"
             )
+        if defn.family == "moss":
+            return _sample_moss(defn, comps, params, cache, guidance, progress.update)
         if defn.family == "flux2":
             return _sample_flux2(
                 defn, comps, params, cache, model_config, guidance, progress.update
@@ -2155,7 +2250,9 @@ def run_sampler(defn, model_handle, comps, params, cache):
     key = sampler_cache_key(
         model_handle,
         params,
-        "flux3" if defn.family == "flux3" else ("qwen-image-2.1" if model_config is None else model_config.model_name),
+        "flux3"
+        if defn.family == "flux3"
+        else ("moss" if defn.family == "moss" else ("qwen-image-2.1" if model_config is None else model_config.model_name)),
     )
     latents, hit = cache.get_or_create("component_weights", key, sample)
     if hit:
@@ -2197,6 +2294,8 @@ def decode_latents(defn, comps, latents, height, width):
             latents = latents[None, ...]
         unpacked = latent_creator.unpack_latents(latents, height, width)
         return vae.decode(unpacked)
+    if defn.family == "moss":
+        return vae.decode_packed_latents(latents)
     if defn.family == "qwen_image_21":
         unpacked = qwen21_sampling.unpack_latents(latents, height, width)
         decoded = vae.decode(unpacked)
