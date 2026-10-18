@@ -1,0 +1,174 @@
+{
+  "id": "raon-korean-to-chinese-voice-tone",
+  "revision": 0,
+  "last_node_id": 8,
+  "last_link_id": 9,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "RaonModelLoader",
+      "pos": [40, 40],
+      "size": [460, 260],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "model", "type": "RAON_MODEL", "links": [1, 4], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "RaonModelLoader"},
+      "title": "Raon Speech 模型加载（首次执行时加载 21B）",
+      "widgets_values": ["A.X-K2-Raon-Speech-21B-A3B", "auto", "bfloat16", "sdpa"]
+    },
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "pos": [40, 380],
+      "size": [460, 280],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "COMBO", "widget": {"name": "audio"}, "link": null}
+      ],
+      "outputs": [
+        {"name": "AUDIO", "type": "AUDIO", "links": [2, 6], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "LoadAudio"},
+      "title": "输入韩语语音（翻译输入 + 原声参考音色）",
+      "widgets_values": [""]
+    },
+    {
+      "id": 3,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 720],
+      "size": [520, 300],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "value", "type": "STRING", "widget": {"name": "value"}}
+      ],
+      "outputs": [
+        {"name": "STRING", "type": "STRING", "links": [3], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PrimitiveStringMultiline"},
+      "title": "韩语 → 简体中文翻译指令（保留语气）",
+      "widgets_values": [
+        "请听懂这段韩语语音，并将其翻译成自然、准确的简体中文。只输出中文翻译，不要输出韩文、解释、前缀或引号。保留原说话人的情绪、语气、礼貌程度、强弱、口语风格和自然停顿；用合适的中文标点表达停顿，不要添加原音频没有的信息。输出适合直接用于中文配音的台词。"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "RaonSpeechChat",
+      "pos": [650, 280],
+      "size": [480, 340],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "RAON_MODEL", "link": 1, "slot_index": 0},
+        {"name": "audio", "type": "AUDIO", "link": 2, "slot_index": 1},
+        {"name": "prompt", "type": "STRING", "link": 3, "slot_index": 2}
+      ],
+      "outputs": [
+        {"name": "text", "type": "STRING", "links": [5, 7], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "RaonSpeechChat"},
+      "title": "韩语语音 → 中文台词（只输出翻译文本）",
+      "widgets_values": []
+    },
+    {
+      "id": 5,
+      "type": "RaonTTS",
+      "pos": [1220, 300],
+      "size": [480, 360],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "RAON_MODEL", "link": 4, "slot_index": 0},
+        {"name": "text", "type": "STRING", "link": 5, "slot_index": 1},
+        {"name": "speaker_audio", "type": "AUDIO", "link": 6, "slot_index": 2}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": [8, 9], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "RaonTTS"},
+      "title": "中文配音（使用原韩语音频作为音色/表达参考）",
+      "widgets_values": []
+    },
+    {
+      "id": 6,
+      "type": "SaveText",
+      "pos": [1220, 40],
+      "size": [420, 240],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "text", "type": "STRING", "link": 7, "slot_index": 0},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null, "slot_index": 1},
+        {"name": "format", "type": "COMBO", "widget": {"name": "format"}, "link": null, "slot_index": 2}
+      ],
+      "outputs": [
+        {"name": "text", "type": "STRING", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "SaveText"},
+      "title": "保存中文翻译文本（便于检查）",
+      "widgets_values": ["raon-ko-zh-translation", "txt"]
+    },
+    {
+      "id": 7,
+      "type": "PreviewAudio",
+      "pos": [1770, 300],
+      "size": [420, 220],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 8, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "PreviewAudio"},
+      "title": "试听中文配音",
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "SaveAudio",
+      "pos": [1770, 580],
+      "size": [420, 260],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 9, "slot_index": 0},
+        {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null, "slot_index": 1}
+      ],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "SaveAudio"},
+      "title": "保存中文配音",
+      "widgets_values": ["audio/raon-ko-zh-voice-tone"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 4, 0, "RAON_MODEL"],
+    [2, 2, 0, 4, 1, "AUDIO"],
+    [3, 3, 0, 4, 2, "STRING"],
+    [4, 1, 0, 5, 0, "RAON_MODEL"],
+    [5, 4, 0, 5, 1, "STRING"],
+    [6, 2, 0, 5, 2, "AUDIO"],
+    [7, 4, 0, 6, 0, "STRING"],
+    [8, 5, 0, 7, 0, "AUDIO"],
+    [9, 5, 0, 8, 0, "AUDIO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.8, "offset": [0, 0]}},
+  "version": 0.4
+}

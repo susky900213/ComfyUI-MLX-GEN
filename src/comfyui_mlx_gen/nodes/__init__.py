@@ -36,6 +36,7 @@ from .whisper_transcribe import MlxWhisperTranscribe
 from .qwen_image_pe import MlxQwenImagePEI2I, MlxQwenImagePET2I
 from .yue2_melody import MlxYue2MelodyFromAudio
 from .yue2_abc import MlxYue2LoadABC
+from .raon import RaonModelLoader, RaonTTS, RaonSTT, RaonSpeechChat, RaonSpeechChatAudio
 
 __all__ = [
     "MlxBreezeSampler",
@@ -74,4 +75,9 @@ __all__ = [
     "MlxQwenImagePEI2I",
     "MlxYue2MelodyFromAudio",
     "MlxYue2LoadABC",
+    "RaonModelLoader",
+    "RaonTTS",
+    "RaonSTT",
+    "RaonSpeechChat",
+    "RaonSpeechChatAudio",
 ]

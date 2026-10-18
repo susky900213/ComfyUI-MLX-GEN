@@ -35,6 +35,7 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     qwen_image_pe,
     yue2_melody,
     yue2_abc,
+    raon as raon_nodes,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -74,6 +75,11 @@ NODE_CLASS_MAPPINGS = {
     "MlxQwenImagePEI2I": qwen_image_pe.MlxQwenImagePEI2I,
     "MlxYue2MelodyFromAudio": yue2_melody.MlxYue2MelodyFromAudio,
     "MlxYue2LoadABC": yue2_abc.MlxYue2LoadABC,
+    "RaonModelLoader": raon_nodes.RaonModelLoader,
+    "RaonTTS": raon_nodes.RaonTTS,
+    "RaonSTT": raon_nodes.RaonSTT,
+    "RaonSpeechChat": raon_nodes.RaonSpeechChat,
+    "RaonSpeechChatAudio": raon_nodes.RaonSpeechChatAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -113,6 +119,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxQwenImagePEI2I": "Qwen-Image 2.1 I2I 提示词增强",
     "MlxYue2MelodyFromAudio": "YuE2 原曲旋律 → ABC 参考",
     "MlxYue2LoadABC": "YuE2 读取 ABC 文件",
+    "RaonModelLoader": "Raon Speech 模型加载",
+    "RaonTTS": "Raon Speech 文本转语音",
+    "RaonSTT": "Raon Speech 语音转文字",
+    "RaonSpeechChat": "Raon Speech 语音对话",
+    "RaonSpeechChatAudio": "Raon Speech 语音对话（语音回答）",
 }
 
 WEB_DIRECTORY = "./web"

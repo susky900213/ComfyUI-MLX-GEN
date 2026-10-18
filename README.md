@@ -8,6 +8,43 @@ Qwen-Image 2.1 用户可直接阅读：[Qwen-Image 2.1 下载、安装与使用�
 FLUX 3 Image Klein 的模型放置、单图/多图编辑连线和实现约定见：
 [FLUX 3 编辑实现说明](FLUX3_EDIT_IMPLEMENTATION.md)。
 
+## Raon Speech（可选 PyTorch runtime）
+
+仓库还提供独立的 Raon Speech 节点，用于本地 TTS、STT 和 Speech-Chat。它**不使用
+MLX runtime 或 MLX cache**，也不会把 PyTorch、Transformers 或官方 Raon package
+作为插件启动时的强制依赖。只有实际执行 Raon 节点时，才会惰性创建一个缓存的
+`RaonPipeline` 实例。
+
+在 ComfyUI 实际使用的 Python 环境中单独安装可选依赖：
+
+```bash
+cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
+python -m pip install -r requirements-raon.txt
+# 再按官方 Raon-Speech 仓库说明安装官方源码/包
+```
+
+把完整的 BF16 checkpoint 放入 MLX 共享模型根目录的 `transformer/` 下。默认扫描名称为
+`A.X-K2-Raon-Speech-21B-A3B`，目录根部必须包含 `config.json`；Raon Loader 只接受本地
+目录，不会因路径错误而联网下载：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/
+└── transformer/
+    └── A.X-K2-Raon-Speech-21B-A3B/
+        ├── config.json
+        ├── tokenizer* / processor* ...
+        └── *.safetensors 或 *.bin
+```
+
+节点连线为：`Raon Speech 模型加载` → `Raon Speech 文本转语音`、
+`Raon Speech 语音转文字` 或 `Raon Speech 语音对话`。输入音频使用 ComfyUI 原生
+`AUDIO`；TTS 输出也使用 `{"waveform": ..., "sample_rate": ...}`。可选参考音频会被
+短暂写入 PCM WAV，传给官方 `RaonPipeline` 后自动删除。
+
+Raon Speech 21B/A3B checkpoint 约 42.4 GB，Apple Silicon 的统一内存和当前 PyTorch/MPS
+兼容性尚未在本项目中做完整端到端验证。默认 `device=auto` 优先使用 MPS；遇到 MPS
+算子或内存问题可尝试 `dtype=float16`，或改用 `device=cpu`（速度会明显降低）。
+
 ## Breeze-TTS-2 本地语音生成
 
 Breeze-TTS-2 通过专用采样器在 **ComfyUI 进程内**完成文本编码、语音 token 生成与

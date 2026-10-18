@@ -46,6 +46,21 @@ cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
 > 不要同时安装 `mlx-gen` 与本项目固定的 `mflux==0.19.1`。两个发行包都会提供名为
 > `mflux` 的 Python 模块，但 MLX 版本约束不同，容易造成导入错误或运行时不兼容。
 
+### 1.1.1 可选：Raon Speech PyTorch 节点
+
+Raon Speech 是与 MLX 完全分开的可选 runtime。正常使用 MLX 节点时不需要安装它；如果
+需要 Raon TTS、STT 或 Speech-Chat，请在**同一个 ComfyUI Python 环境**中安装独立依赖：
+
+```bash
+cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
+/你的/ComfyUI/.venv/bin/python -m pip install -r requirements-raon.txt
+# 按官方 Raon-Speech 仓库文档安装官方源码/包
+```
+
+当前集成不把官方 Raon 源码复制进本仓库，也不会在插件启动时导入 `torch`、`torchaudio`、
+`transformers` 或 `raon`。缺少依赖时，只有执行 Raon 节点才会报告安装命令；已有 MLX
+工作流仍可正常注册。
+
 需要清理旧环境时，可以在 ComfyUI 的 Python 环境中执行：
 
 ```bash
@@ -86,6 +101,23 @@ ComfyUI Desktop 的 `extra_model_paths` 已将 `mlx` 注册到上述共享目录
 └── lora/                      # .safetensors LoRA
 ```
 
+Raon checkpoint 使用同一个 `mlx/transformer/` 根目录，但不与 MLX Transformer handle
+共享缓存。推荐目录如下：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/
+└── transformer/
+    └── A.X-K2-Raon-Speech-21B-A3B/
+        ├── config.json
+        ├── tokenizer* / processor* ...
+        └── *.safetensors 或 *.bin
+```
+
+也可以把 `transformer/A.X-K2-Raon-Speech-21B-A3B` 建成指向其他磁盘上完整 checkpoint
+目录的绝对软链接。Raon Loader 只解析本地目录和 `config.json`，不会使用 Hugging Face
+repo id，也不会自动下载模型；官方 custom code 必须已经安装，或放在官方支持的本地
+checkpoint/custom-code 布局中。
+
 普通图片模型通常要把同一套 checkpoint 的组件分别放入四个同名目录：
 
 ```text
@@ -112,6 +144,29 @@ mlx/
 
 模型下拉框是在扫描模型目录后生成的。新放入模型后如果下拉框没有更新，请完整重启
 ComfyUI，而不只是刷新浏览器。
+
+### 1.5 Raon Speech 节点
+
+Raon 的 `Raon Speech 模型加载` 是轻量配置 Loader；它不会在排队 Loader 时加载 21B
+权重。第一次执行 TTS、STT 或 Speech-Chat 时，runtime 才会构造一个官方
+`RaonPipeline`，同一组模型路径、设备、精度和 attention backend 后续会复用该实例。
+
+- **文本转语音**：`Raon Speech 文本转语音` 接 `STRING`，输出 ComfyUI `AUDIO`；可选
+  `speaker_audio` 用于官方参考音频音色条件。
+- **语音转文字**：`Raon Speech 语音转文字` 接 `AUDIO`，输出 `STRING`；`prompt` 留空
+  时使用官方 STT 默认提示词。
+- **语音对话**：`Raon Speech 语音对话` 接 `AUDIO`，使用官方 `RaonPipeline.chat()`
+  返回文本回答。需要音频回答的集成可以调用 runtime 的 `chat(...,
+  force_audio_output=True)`，其结果会转换为 ComfyUI `AUDIO`。
+
+所有输入音频都会取第一批并将声道平均为单声道，写成临时 PCM16 WAV，传入官方音频接口
+后立即删除。TTS/STT/Chat 不会复用 MLX `MlxModelHandle` 或 MLX cache。
+
+> **资源限制：** 默认 Raon BF16 模型约 42.4 GB，远超普通 Mac 的统一内存余量。本文档
+> 没有宣称 Apple Silicon 上已完成该模型的端到端验证；请先确认磁盘、统一内存和 PyTorch
+> MPS 支持，再尝试加载。OOM 或 MPS 算子错误时，优先将 Loader 的 `dtype` 改为
+> `float16`，或选择 `device=cpu`。首次加载会占用大量时间和内存，清理模型需重启进程
+> 或由集成方调用独立 Raon cache cleanup，不会影响 MLX cache。
 
 ### 1.4 漫画分镜自动拆分：`MLX 漫画分镜自动拆分`
 

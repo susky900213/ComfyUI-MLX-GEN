@@ -1,0 +1,9 @@
+# Raon Speech 是独立的可选 PyTorch/Transformers runtime，不会随 MLX 依赖自动安装。
+torch>=2.6
+torchaudio>=2.6
+transformers>=4.50
+PyYAML>=6.0
+soundfile>=0.12
+
+# 官方 Raon-Speech 源码需要另行安装（版本随官方仓库更新）：
+# cd /path/to/Raon-Speech && python -m pip install -e .
