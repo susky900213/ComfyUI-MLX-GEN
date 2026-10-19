@@ -51,6 +51,7 @@ from .. import pipeline, runtime
 from ..cache import CACHE
 from ..h3 import pipeline as h3_pipeline
 from ..h3.latent_creator.h3_layout import valid_frame_counts
+from ..moss import lora as moss_lora
 from ..qwen_image_21 import sampling as qwen21_sampling
 from ..types import condition, entry_for, model, model_types, ref_images, validate_model_family
 
@@ -221,6 +222,12 @@ class MlxKSamplerMLX:
             # 只做基础范围校验；非 32 倍数会在 Qwen 2.1 采样内部对齐，不能在
             # 这里拒绝，否则自定义画布仍然无法使用。
             qwen21_sampling.validate_dimensions(height, width)
+
+        if entry.family == "moss":
+            # The official adapter still requires the MOSS scheduler and unit
+            # guidance, but the requested number of denoising steps is left
+            # configurable instead of being hard-coded to four.
+            moss_lora.validate_sampling_request(model, steps, guidance, scheduler)
 
         # MiniMax-H3：一条打包序列里同时去噪视频与音频（guidance 蒸馏模型，每步只有
         # 一次前向），所以 scheduler / guidance / 负向条件三个 widget 都不看；

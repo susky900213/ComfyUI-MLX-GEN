@@ -15,7 +15,7 @@ from .h3_two_stage import (
     MlxH3LatentUpscaler,
     MlxH3SecondPassSampler,
 )
-from .lora import MlxClipLoraApply, MlxModelLoraApply
+from .lora import MlxClipLoraApply, MlxModelLoraApply, MlxMoss4StepLoraApply
 from .text_encoder import MlxTextEncoder
 from .qwen_edit import MlxQwenEditEncoder
 from .ref_image_set import MlxRefImageSet
@@ -54,6 +54,7 @@ __all__ = [
     "MlxRefImageSet",
     "MlxTransformerLoader",
     "MlxModelLoraApply",
+    "MlxMoss4StepLoraApply",
     "MlxClipLoraApply",
     "MlxKSamplerMLX",
     "MlxVAELoader",

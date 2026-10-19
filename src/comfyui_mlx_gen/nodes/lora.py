@@ -7,6 +7,7 @@ from dataclasses import replace
 from .. import paths
 from ..transformer_lora import supported_families
 from ..types import CLIP, LoraRef, MlxClipHandle, MlxModelHandle
+from ..moss import lora as moss_lora
 
 NO_LORA = "<无 LoRA>"
 
@@ -47,12 +48,54 @@ class MlxModelLoraApply:
             raise ValueError("必须先连接 MlxTransformerLoader 的输出")
         if lora == NO_LORA:
             return (model,)
+        if model.model_type == "moss":
+            # 普通 PEFT MOSS LoRA 走通用节点；只有旧的 dynamic-rank 4-step
+            # 文件保留专用节点，因为它没有标准 lora_A/lora_B 结构且强度固定为 1。
+            if float(strength) != 0.0:
+                moss_lora.validate_generic_node_selection(model, lora, strength)
+            return (_add(model, lora, strength),)
         if model.model_type not in supported_families():
             raise ValueError(
                 f"{model.model_type} 当前不支持 Transformer LoRA；"
                 f"支持的模型大类：{', '.join(supported_families())}"
             )
         return (_add(model, lora, strength),)
+
+
+class MlxMoss4StepLoraApply:
+    """Register the official single-file MOSS 4-step adapter at strength 1.0."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        choices = [
+            item
+            for item in paths.scan_loras()
+            if moss_lora.MOSS_LORA_FILENAME_RE.search(item.rsplit("/", 1)[-1])
+        ] or [NO_LORA]
+        return {
+            "required": {
+                "model": ("model", {}),
+                "lora": (choices, {"default": choices[0]}),
+            }
+        }
+
+    RETURN_TYPES = ("model",)
+    FUNCTION = "apply"
+    CATEGORY = "MLX/Gen/MOSS"
+
+    def apply(self, model: MlxModelHandle, lora: str):
+        if model is None:
+            raise ValueError("必须先连接 MlxTransformerLoader 的输出")
+        if lora == NO_LORA:
+            return (model,)
+        if model.model_type != "moss":
+            raise ValueError("「MLX MOSS 4 步 LoRA」只能连接 model_type=moss 的 Transformer")
+        if int(model.quantize) != 0:
+            raise ValueError("MOSS 4-step LoRA 只支持未量化 dense Transformer；请把 quantize 设为 0")
+        if model.precision != "bfloat16":
+            raise ValueError("MOSS 4-step LoRA 只支持 bfloat16 Transformer")
+        moss_lora.validate_node_selection(model, lora)
+        return (_add(model, lora, 1.0),)
 
 
 class MlxClipLoraApply:

@@ -1,0 +1,547 @@
+"""Native loaders for the MOSS-Image-SFT Transformer LoRAs.
+
+MOSS has two released adapter layouts.  The original 4-step adapter contains
+one ``alpha`` scalar and a dynamically resized ``lora_down`` / ``lora_up`` pair
+for each of the six projections in all 42 MOSS image blocks.  The regular SFT
+adapter is a fixed-rank PEFT file with ``lora_A`` / ``lora_B`` keys.  Neither
+layout matches mflux's generic image mappings, so keep both implementations
+local to MOSS.
+
+Adapters are deliberately kept unmerged: every targeted dense Linear becomes
+``base(x) + (x @ down.T @ up.T) * alpha / rank``.  This preserves the base
+checkpoint and makes the cache key / model handle the sole source of adapter
+identity.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import mlx.core as mx
+from mlx import nn
+
+from ..transformer_lora import active_loras, resolve_lora_path
+from ..types import LoraRef
+
+MOSS_LORA_FILENAME_RE = re.compile(
+    r"(?:^|[_-])4[_-]?steps?(?:[_-]|\.|$)",
+    re.IGNORECASE,
+)
+MOSS_LORA_KEY_RE = re.compile(
+    r"^diffusion_model\.layers\.(\d+)\.proj\."
+    r"(q|k|v|o|ffn_up_gate|ffn_down)\."
+    r"(alpha|lora_down\.weight|lora_up\.weight)$"
+)
+MOSS_STANDARD_LORA_KEY_RE = re.compile(
+    r"^transformer\.layers\.(\d+)\.proj\."
+    r"(q|k|v|o|ffn_up_gate|ffn_down)\."
+    r"lora_(A|B)\.weight$"
+)
+MOSS_LORA_PROJECTIONS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
+MOSS_LORA_LAYERS = 42
+MOSS_LORA_MAX_RANK = 128
+
+
+@dataclass(frozen=True)
+class MOSSLoRATarget:
+    layer: int
+    projection: str
+    rank: int
+    # Header validation can only verify that alpha is scalar.  Its value is
+    # read from the payload when the adapter is attached.
+    alpha: float | None
+    down_shape: tuple[int, int]
+    up_shape: tuple[int, int]
+
+
+def _expected_shapes(projection: str) -> tuple[int, int]:
+    if projection == "ffn_down":
+        return 8192, 3072
+    if projection == "ffn_up_gate":
+        return 3072, 16384
+    return 3072, 3072
+
+
+def _header(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read only the safetensors header; no payload is mapped or loaded."""
+    file = Path(path)
+    try:
+        size = file.stat().st_size
+        with file.open("rb") as handle:
+            raw_size = handle.read(8)
+            if len(raw_size) != 8:
+                raise ValueError("header size field is incomplete")
+            header_size = struct.unpack("<Q", raw_size)[0]
+            if header_size <= 0 or header_size > size - 8:
+                raise ValueError(f"invalid header size {header_size}")
+            raw_header = handle.read(header_size)
+    except OSError as exc:
+        raise ValueError(f"无法读取 MOSS 4-step LoRA 文件头 {file}: {exc}") from exc
+    try:
+        value = json.loads(raw_header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"MOSS 4-step LoRA header 不是合法 JSON: {file}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"MOSS 4-step LoRA header 必须是 object: {file}")
+    metadata = value.pop("__metadata__", {})
+    if not isinstance(metadata, dict):
+        raise ValueError(f"MOSS 4-step LoRA metadata 必须是 object: {file}")
+    return value, metadata
+
+
+def _target_key(layer: int, projection: str, suffix: str) -> str:
+    return f"diffusion_model.layers.{layer}.proj.{projection}.{suffix}"
+
+
+def _standard_target_key(layer: int, projection: str, matrix: str) -> str:
+    return f"transformer.layers.{layer}.proj.{projection}.lora_{matrix}.weight"
+
+
+def validate_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRATarget]:
+    """Validate the complete official 42-layer dynamic-rank layout.
+
+    This function intentionally does not load the 327 MB payload.  It is used
+    by the node so an incompatible file is rejected before a transformer is
+    materialized.
+    """
+    file = Path(path)
+    if file.suffix.lower() != ".safetensors":
+        raise ValueError(f"MOSS 4-step LoRA 必须是 .safetensors 文件: {file}")
+    if not MOSS_LORA_FILENAME_RE.search(file.name):
+        raise ValueError(
+            f"{file.name} 没有 4-step 文件标识；MOSS 4-step 节点不会把未知步数的 LoRA 当作 4 步使用"
+        )
+    entries, metadata = _header(file)
+    if metadata.get("ss_network_dim") != "Dynamic" or metadata.get("ss_network_alpha") != "Dynamic":
+        raise ValueError(
+            f"{file.name} 不是官方 MOSS dynamic-rank LoRA："
+            f"ss_network_dim={metadata.get('ss_network_dim')!r}, "
+            f"ss_network_alpha={metadata.get('ss_network_alpha')!r}"
+        )
+
+    expected_keys = {
+        _target_key(layer, projection, suffix)
+        for layer in range(MOSS_LORA_LAYERS)
+        for projection in MOSS_LORA_PROJECTIONS
+        for suffix in ("alpha", "lora_down.weight", "lora_up.weight")
+    }
+    actual_keys = set(entries)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        raise ValueError(
+            f"{file.name} 的 MOSS LoRA 层覆盖不完整："
+            f"missing={missing[:4]}, extra={extra[:4]}"
+        )
+
+    targets: dict[tuple[int, str], MOSSLoRATarget] = {}
+    for key, value in entries.items():
+        match = MOSS_LORA_KEY_RE.fullmatch(key)
+        if match is None:
+            raise ValueError(f"{file.name} 包含非法 MOSS LoRA key: {key}")
+        if value.get("dtype") != "BF16":
+            raise ValueError(
+                f"{file.name} 的 {key} dtype={value.get('dtype')!r}，只支持 BF16 单文件 LoRA"
+            )
+        layer = int(match.group(1))
+        projection = match.group(2)
+        suffix = match.group(3)
+        shape = tuple(int(item) for item in value.get("shape", ()))
+        if suffix == "alpha":
+            if shape:
+                raise ValueError(f"{file.name} 的 {key} 必须是标量 alpha，收到 shape={shape}")
+            continue
+        if len(shape) != 2:
+            raise ValueError(f"{file.name} 的 {key} 必须是二维矩阵，收到 shape={shape}")
+
+        old = targets.get((layer, projection))
+        down_shape = shape if suffix == "lora_down.weight" else (old.down_shape if old else ())
+        up_shape = shape if suffix == "lora_up.weight" else (old.up_shape if old else ())
+        if old is None:
+            targets[(layer, projection)] = MOSSLoRATarget(
+                layer, projection, 0, None, down_shape, up_shape
+            )
+        else:
+            targets[(layer, projection)] = MOSSLoRATarget(
+                old.layer, old.projection, old.rank, old.alpha, down_shape, up_shape
+            )
+
+    for key, target in list(targets.items()):
+        layer, projection = key
+        down = entries[_target_key(layer, projection, "lora_down.weight")]
+        up = entries[_target_key(layer, projection, "lora_up.weight")]
+        down_shape = tuple(int(item) for item in down["shape"])
+        up_shape = tuple(int(item) for item in up["shape"])
+        input_dims, output_dims = _expected_shapes(projection)
+        rank = down_shape[0]
+        if not 1 <= rank <= MOSS_LORA_MAX_RANK:
+            raise ValueError(f"{file.name} 的 {key} rank={rank} 超出 1..{MOSS_LORA_MAX_RANK}")
+        if down_shape != (rank, input_dims) or up_shape != (output_dims, rank):
+            raise ValueError(
+                f"{file.name} 的 {key} shape 不匹配：down={down_shape}, up={up_shape}，"
+                f"期望 down=({rank},{input_dims}), up=({output_dims},{rank})"
+            )
+        alpha_info = entries[_target_key(layer, projection, "alpha")]
+        if alpha_info.get("shape") != []:
+            raise ValueError(f"{file.name} 的 {key} alpha 必须是标量")
+        targets[key] = MOSSLoRATarget(layer, projection, rank, None, down_shape, up_shape)
+    return targets
+
+
+def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRATarget]:
+    """Validate the regular fixed-rank PEFT MOSS LoRA layout.
+
+    The returned targets use ``down_shape`` for PEFT ``lora_A`` and
+    ``up_shape`` for PEFT ``lora_B`` so they can share the same native wrapper
+    as the 4-step adapter.  Only the safetensors header is read here.
+    """
+    file = Path(path)
+    if file.suffix.lower() != ".safetensors":
+        raise ValueError(f"MOSS 普通 LoRA 必须是 .safetensors 文件: {file}")
+    entries, metadata = _header(file)
+    adapter_metadata: dict[str, Any] = {}
+    raw_adapter_metadata = metadata.get("lora_adapter_metadata")
+    if isinstance(raw_adapter_metadata, str):
+        try:
+            parsed = json.loads(raw_adapter_metadata)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{file.name} 的 lora_adapter_metadata 不是合法 JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{file.name} 的 lora_adapter_metadata 必须是 object")
+        adapter_metadata = parsed
+    elif raw_adapter_metadata is not None:
+        if not isinstance(raw_adapter_metadata, dict):
+            raise ValueError(f"{file.name} 的 lora_adapter_metadata 必须是 object")
+        adapter_metadata = raw_adapter_metadata
+
+    try:
+        rank = int(adapter_metadata.get("r", 0))
+        alpha = float(adapter_metadata.get("lora_alpha", rank))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{file.name} 的 PEFT rank/alpha 元数据无效") from exc
+    if not 1 <= rank <= MOSS_LORA_MAX_RANK or not math.isfinite(alpha):
+        raise ValueError(f"{file.name} 的 PEFT rank/alpha 无效：rank={rank}, alpha={alpha}")
+
+    expected_keys = {
+        _standard_target_key(layer, projection, matrix)
+        for layer in range(MOSS_LORA_LAYERS)
+        for projection in MOSS_LORA_PROJECTIONS
+        for matrix in ("A", "B")
+    }
+    actual_keys = set(entries)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        raise ValueError(
+            f"{file.name} 的 MOSS 普通 LoRA 层覆盖不完整："
+            f"missing={missing[:4]}, extra={extra[:4]}"
+        )
+
+    targets: dict[tuple[int, str], MOSSLoRATarget] = {}
+    for key, value in entries.items():
+        match = MOSS_STANDARD_LORA_KEY_RE.fullmatch(key)
+        if match is None:
+            raise ValueError(f"{file.name} 包含非法 MOSS 普通 LoRA key: {key}")
+        if value.get("dtype") != "BF16":
+            raise ValueError(
+                f"{file.name} 的 {key} dtype={value.get('dtype')!r}，"
+                "只支持 BF16 单文件 LoRA"
+            )
+        shape = tuple(int(item) for item in value.get("shape", ()))
+        if len(shape) != 2:
+            raise ValueError(f"{file.name} 的 {key} 必须是二维矩阵，收到 shape={shape}")
+        layer = int(match.group(1))
+        projection = match.group(2)
+        matrix = match.group(3)
+        old = targets.get((layer, projection))
+        down_shape = shape if matrix == "A" else (old.down_shape if old else ())
+        up_shape = shape if matrix == "B" else (old.up_shape if old else ())
+        targets[(layer, projection)] = MOSSLoRATarget(
+            layer,
+            projection,
+            rank,
+            alpha,
+            down_shape,
+            up_shape,
+        )
+
+    for (layer, projection), target in targets.items():
+        input_dims, output_dims = _expected_shapes(projection)
+        if target.down_shape != (rank, input_dims) or target.up_shape != (output_dims, rank):
+            raise ValueError(
+                f"{file.name} 的 layers.{layer}.proj.{projection} shape 不匹配："
+                f"lora_A={target.down_shape}, lora_B={target.up_shape}，"
+                f"期望 lora_A=({rank},{input_dims}), lora_B=({output_dims},{rank})"
+            )
+    return targets
+
+
+class MOSSLoRALinear(nn.Module):
+    """A non-baked low-rank branch around one dense MLX Linear."""
+
+    def __init__(self, base: nn.Linear, down: mx.array, up: mx.array, scale: float):
+        super().__init__()
+        self.base = base
+        self.lora_down = down
+        self.lora_up = up
+        self.scale = float(scale)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        result = self.base(x)
+        branch_input = x.astype(self.lora_down.dtype)
+        branch = mx.matmul(branch_input, self.lora_down.T)
+        branch = mx.matmul(branch, self.lora_up.T)
+        return result + branch.astype(result.dtype) * mx.array(self.scale, dtype=result.dtype)
+
+
+def _validate_base_request_refs(model_handle: Any, refs: tuple[LoraRef, ...]) -> tuple[LoraRef, ...]:
+    active = active_loras(refs)
+    if not active:
+        return ()
+    if getattr(model_handle, "model_type", None) != "moss":
+        raise ValueError("MOSS LoRA 只能连接 model_type=moss 的 Transformer")
+    if int(getattr(model_handle, "quantize", 0)) != 0:
+        raise ValueError("MOSS LoRA 只支持未量化 dense Transformer；请把 quantize 设为 0")
+    if getattr(model_handle, "precision", None) != "bfloat16":
+        raise ValueError("MOSS LoRA 只支持 bfloat16 Transformer")
+    if len(active) != 1:
+        raise ValueError("MOSS LoRA 只支持单个适配器，不能叠加多个文件")
+    return active
+
+
+def _validate_request_refs(model_handle: Any, refs: tuple[LoraRef, ...]) -> tuple[LoraRef, ...]:
+    active = _validate_base_request_refs(model_handle, refs)
+    if not active:
+        return ()
+    if float(active[0].strength) != 1.0:
+        raise ValueError("MOSS 4-step LoRA 的强度固定为 1.0")
+    return active
+
+
+def _validate_standard_request_refs(
+    model_handle: Any, refs: tuple[LoraRef, ...]
+) -> tuple[LoraRef, ...]:
+    return _validate_base_request_refs(model_handle, refs)
+
+
+def _validate_node_addition(model_handle: Any, selection: str, strength: float) -> None:
+    """Reject a second MOSS adapter before the node returns its model handle.
+
+    MOSS has two incompatible adapter layouts, and its native transformer
+    injection is intentionally single-adapter only.  A node may be evaluated
+    more than once with the same selection, so the exact same path/strength is
+    treated as an idempotent re-application rather than a stack.
+    """
+    existing = active_loras(tuple(getattr(model_handle, "loras", ())))
+    if not existing:
+        return
+
+    candidate_path = resolve_lora_path(selection)
+    if (
+        len(existing) == 1
+        and resolve_lora_path(existing[0].path) == candidate_path
+        and float(existing[0].strength) == float(strength)
+    ):
+        return
+
+    raise ValueError(
+        "MOSS LoRA 只支持单个适配器，不能叠加多个文件；"
+        "请在 4-step LoRA 节点和普通 PEFT LoRA 节点之间二选一"
+    )
+
+
+def _is_standard_layout(path: str | Path) -> bool:
+    entries, _metadata = _header(path)
+    return any(MOSS_STANDARD_LORA_KEY_RE.fullmatch(key) for key in entries)
+
+
+def validate_sampling_request(model_handle: Any, steps: int, guidance: float, scheduler: str) -> bool:
+    """Validate sampler settings that are independent of the requested step count."""
+    refs = tuple(getattr(model_handle, "loras", ()))
+    active = _validate_base_request_refs(model_handle, refs)
+    if not active:
+        return False
+    path = resolve_lora_path(active[0].path)
+    if not _is_standard_layout(path):
+        _validate_request_refs(model_handle, refs)
+    if float(guidance) != 1.0:
+        raise ValueError("MOSS LoRA 必须使用 CFG/guidance=1.0")
+    if scheduler != "moss_flow_match_euler":
+        raise ValueError("MOSS LoRA 必须使用 moss_flow_match_euler（Euler shift=5）")
+    return True
+
+
+def _validate_transformer(transformer: Any) -> Any:
+    layers = getattr(transformer, "layers", None)
+    if layers is None or len(layers) != MOSS_LORA_LAYERS:
+        raise ValueError(f"MOSS Transformer 必须有 {MOSS_LORA_LAYERS} 个 dense layers")
+    return layers
+
+
+def _base_for_target(layers: Any, layer_index: int, projection: str, *, label: str) -> nn.Linear:
+    base = layers[layer_index].proj.get(projection)
+    if not isinstance(base, nn.Linear) or isinstance(base, MOSSLoRALinear):
+        raise ValueError(
+            f"MOSS LoRA 目标 layers.{layer_index}.proj.{projection} "
+            f"不是未量化 dense Linear（{label}）"
+        )
+    input_dims, output_dims = _expected_shapes(projection)
+    if tuple(base.weight.shape) != (output_dims, input_dims):
+        raise ValueError(
+            f"MOSS 基础层 layers.{layer_index}.proj.{projection} shape={tuple(base.weight.shape)}，"
+            f"期望 {(output_dims, input_dims)}"
+        )
+    return base
+
+
+def apply_4step_lora(transformer: Any, model_handle: Any, *, role: str = "transformer") -> None:
+    """Apply the one validated MOSS adapter to the native transformer."""
+    if role != "transformer":
+        raise ValueError(f"MOSS 4-step LoRA 只支持 transformer role，收到 {role!r}")
+    refs = _validate_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
+    if not refs:
+        return
+    path = resolve_lora_path(refs[0].path)
+    targets = validate_header(path)
+    try:
+        weights = dict(mx.load(path, format="safetensors"))
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"无法读取 MOSS 4-step LoRA payload {path}: {exc}") from exc
+
+    try:
+        layers = _validate_transformer(transformer)
+        for (layer_index, projection), target in targets.items():
+            base = _base_for_target(layers, layer_index, projection, label="4-step")
+            down = weights[_target_key(layer_index, projection, "lora_down.weight")]
+            up = weights[_target_key(layer_index, projection, "lora_up.weight")]
+            alpha = weights[_target_key(layer_index, projection, "alpha")]
+            mx.eval(down, up, alpha)
+            alpha_value = float(alpha.item())
+            if not mx.isfinite(alpha).item():
+                raise ValueError(
+                    f"MOSS 4-step LoRA 的 layers.{layer_index}.proj.{projection} alpha "
+                    f"必须是有限 scalar，收到 {alpha_value:g}"
+                )
+            layers[layer_index].proj[projection] = MOSSLoRALinear(
+                base,
+                down,
+                up,
+                alpha_value / float(target.rank),
+            )
+        mx.eval(transformer.parameters())
+    finally:
+        # The wrapper owns all matrix arrays after replacement.  Do not retain a
+        # second dictionary containing the complete 327 MB payload.
+        del weights
+    print(f"[MLX LoRA] moss/transformer: 已以未合并方式应用 {Path(path).name}（252 个目标层）")
+
+
+def apply_standard_lora(transformer: Any, model_handle: Any, *, role: str = "transformer") -> None:
+    """Apply the regular fixed-rank PEFT MOSS adapter at its requested strength."""
+    if role != "transformer":
+        raise ValueError(f"MOSS LoRA 只支持 transformer role，收到 {role!r}")
+    refs = _validate_standard_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
+    if not refs:
+        return
+    path = resolve_lora_path(refs[0].path)
+    targets = validate_standard_header(path)
+    try:
+        weights = dict(mx.load(path, format="safetensors"))
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"无法读取 MOSS 普通 LoRA payload {path}: {exc}") from exc
+
+    try:
+        layers = _validate_transformer(transformer)
+        strength = float(refs[0].strength)
+        for (layer_index, projection), target in targets.items():
+            base = _base_for_target(layers, layer_index, projection, label="PEFT")
+            down = weights[_standard_target_key(layer_index, projection, "A")]
+            up = weights[_standard_target_key(layer_index, projection, "B")]
+            mx.eval(down, up)
+            layers[layer_index].proj[projection] = MOSSLoRALinear(
+                base,
+                down,
+                up,
+                strength * float(target.alpha) / float(target.rank),
+            )
+        mx.eval(transformer.parameters())
+    finally:
+        del weights
+    print(
+        f"[MLX LoRA] moss/transformer: 已以未合并方式应用 {Path(path).name} "
+        f"（{len(targets)} 个目标层，strength={refs[0].strength:g}）"
+    )
+
+
+def apply_lora(transformer: Any, model_handle: Any, *, role: str = "transformer") -> None:
+    """Dispatch a MOSS adapter by its safetensors key layout."""
+    refs = _validate_base_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
+    if not refs:
+        return
+    path = resolve_lora_path(refs[0].path)
+    if _is_standard_layout(path):
+        apply_standard_lora(transformer, model_handle, role=role)
+    else:
+        apply_4step_lora(transformer, model_handle, role=role)
+
+
+def validate_node_selection(model_handle: Any, selection: str) -> str:
+    """Resolve and header-check a node selection without loading its payload."""
+    _validate_node_addition(model_handle, selection, 1.0)
+    refs = _validate_request_refs(
+        model_handle,
+        (LoraRef(selection, 1.0),),
+    )
+    if not refs:
+        raise ValueError("MOSS 4-step LoRA 选择不能为空")
+    path = resolve_lora_path(selection)
+    validate_header(path)
+    return path
+
+
+def validate_standard_node_selection(model_handle: Any, selection: str, strength: float) -> str:
+    """Resolve and header-check a regular MOSS PEFT selection."""
+    refs = _validate_standard_request_refs(
+        model_handle,
+        (LoraRef(selection, strength),),
+    )
+    if not refs:
+        raise ValueError("MOSS 普通 LoRA 选择不能为空")
+    path = resolve_lora_path(selection)
+    validate_standard_header(path)
+    return path
+
+
+def validate_generic_node_selection(model_handle: Any, selection: str, strength: float) -> str:
+    """Validate a MOSS selection used by the shared model-LoRA node.
+
+    Standard PEFT adapters are accepted here.  The legacy 4-step adapter is
+    deliberately rejected with an actionable message instead of being silently
+    treated as a regular LoRA with a user-selected strength.
+    """
+    _validate_node_addition(model_handle, selection, strength)
+    refs = _validate_standard_request_refs(model_handle, (LoraRef(selection, strength),))
+    if not refs:
+        raise ValueError("MOSS 普通 LoRA 选择不能为空")
+    path = resolve_lora_path(selection)
+    entries, _metadata = _header(path)
+    if any(MOSS_STANDARD_LORA_KEY_RE.fullmatch(key) for key in entries):
+        validate_standard_header(path)
+        return path
+    if MOSS_LORA_FILENAME_RE.search(Path(path).name) or any(
+        MOSS_LORA_KEY_RE.fullmatch(key) for key in entries
+    ):
+        raise ValueError(
+            "MOSS 4-step LoRA 不能接通用「MLX 模型 LoRA」节点；"
+            "请使用「MLX MOSS 4 步 LoRA」节点"
+        )
+    raise ValueError(
+        f"{Path(path).name} 不是支持的 MOSS 普通 PEFT LoRA；"
+        "需要 transformer.layers.*.proj.*.lora_A/B.weight"
+    )

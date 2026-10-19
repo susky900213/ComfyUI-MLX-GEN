@@ -63,6 +63,7 @@ from .flux3 import text_encoder as flux3_text_encoder
 from .flux3 import dit as flux3_dit
 from .moss import latent as moss_latent
 from .moss import loader as moss_loader
+from .moss import lora as moss_lora
 from .moss import prompt as moss_prompt
 from .moss.scheduler import MOSSImageScheduler, to_mlx_timestep
 from .types import (
@@ -451,11 +452,13 @@ def prepare_sampler_components(entry, model_handle, cache) -> dict[str, Any]:
         if kind == "missing":
             raise FileNotFoundError(f"未找到 {role} 权重: {path}")
         if entry.family == "moss":
-            return moss_loader.load_transformer(
+            instance = moss_loader.load_transformer(
                 path,
                 precision=model_handle.precision,
                 quantize=model_handle.quantize or None,
             ).module
+            moss_lora.apply_lora(instance, model_handle, role=role)
+            return instance
         # 构造参数必须按 ModelConfig 的 overrides 给（否则会建出维度对不上的实例），
         # 但 overrides 里还混着运行时开关（qwen_edit_plus 之类）→ 要按签名过滤
         if entry.family == "qwen_image_21":
