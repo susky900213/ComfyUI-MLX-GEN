@@ -5,25 +5,29 @@ from __future__ import annotations
 from dataclasses import replace
 
 from .. import paths
-from ..transformer_lora import supported_families
+from ..transformer_lora import resolve_lora_path, supported_families
 from ..types import CLIP, LoraRef, MlxClipHandle, MlxModelHandle
 from ..moss import lora as moss_lora
 
 NO_LORA = "<无 LoRA>"
 
 
-def _add(model, path: str, strength: float):
+def _add(model, path: str, strength: float, *, canonicalize: bool = False):
     """把 LoraRef 追加到 model（同 path 且强度不同即报错）。"""
     loras = list(model.loras)
+    # strength=0 严格等同基础 handle；不要为了规范化一个不会被加载的
+    # 路径而要求对应文件存在（旧节点和其它模型 LoRA 都依赖这个语义）。
+    if float(strength) == 0.0:
+        return model
+    resolved_path = resolve_lora_path(path) if canonicalize else path
     for item in loras:
-        if item.path == path:
-            if item.strength != strength:
+        item_path = resolve_lora_path(item.path) if canonicalize else item.path
+        if item_path == resolved_path:
+            if float(item.strength) != float(strength):
                 raise ValueError(
                     f"同一 LoRA 出现两次且强度不同: {path}（{item.strength} 与 {strength}）"
                 )
             return model  # 相同值 → 直接复用
-    if float(strength) == 0.0:
-        return model  # 首次登记 0 强度严格等同基础 handle（缓存键也不变）
     loras.append(LoraRef(path, strength))
     return replace(model, loras=tuple(loras))
 
@@ -53,7 +57,7 @@ class MlxModelLoraApply:
             # 文件保留专用节点，因为它没有标准 lora_A/lora_B 结构且强度固定为 1。
             if float(strength) != 0.0:
                 moss_lora.validate_generic_node_selection(model, lora, strength)
-            return (_add(model, lora, strength),)
+            return (_add(model, lora, strength, canonicalize=True),)
         if model.model_type not in supported_families():
             raise ValueError(
                 f"{model.model_type} 当前不支持 Transformer LoRA；"
@@ -63,7 +67,7 @@ class MlxModelLoraApply:
 
 
 class MlxMoss4StepLoraApply:
-    """Register the official single-file MOSS 4-step adapter at strength 1.0."""
+    """Register the official MOSS 4-step adapter at strength 1.0."""
 
     @classmethod
     def INPUT_TYPES(cls):

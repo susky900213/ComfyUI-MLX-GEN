@@ -283,21 +283,71 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
 
 
 class MOSSLoRALinear(nn.Module):
-    """A non-baked low-rank branch around one dense MLX Linear."""
+    """A dense Linear wrapped by one or more non-baked low-rank branches.
 
-    def __init__(self, base: nn.Linear, down: mx.array, up: mx.array, scale: float):
+    ``branches`` deliberately stays as a list of small dictionaries instead of
+    nesting ``MOSSLoRALinear`` instances.  That gives every target exactly one
+    wrapper, so standard PEFT and dynamic-rank 4-step adapters can be attached
+    in either order without making one wrapper the special ``base`` of another.
+    ``nn.Module`` tracks arrays inside lists/dicts as parameters, which also
+    keeps the wrapper compatible with MLX evaluation and cache lifetimes.
+    """
+
+    def __init__(
+        self,
+        base: nn.Linear,
+        down: mx.array,
+        up: mx.array,
+        scale: float,
+        *,
+        branches: list[dict[str, Any]] | None = None,
+        adapter_key: str | None = None,
+    ):
         super().__init__()
         self.base = base
-        self.lora_down = down
-        self.lora_up = up
-        self.scale = float(scale)
+        self.branches = list(branches or [])
+        object.__setattr__(self, "_adapter_keys", set())
+        self.add_branch(down, up, scale, adapter_key=adapter_key)
+
+    def add_branch(
+        self,
+        down: mx.array,
+        up: mx.array,
+        scale: float,
+        *,
+        adapter_key: str | None = None,
+    ) -> bool:
+        """Append one low-rank branch without changing the dense base.
+
+        ``adapter_key`` is the resolved file path.  It is not part of the
+        parameter tree, but lets a repeated materialization pass avoid adding
+        the same file twice to an already wrapped target.
+        """
+        if adapter_key is not None and adapter_key in self._adapter_keys:
+            return False
+        self.branches.append(
+            {
+                "down": down,
+                "up": up,
+                "scale": float(scale),
+            }
+        )
+        if adapter_key is not None:
+            self._adapter_keys.add(adapter_key)
+        return True
 
     def __call__(self, x: mx.array) -> mx.array:
         result = self.base(x)
-        branch_input = x.astype(self.lora_down.dtype)
-        branch = mx.matmul(branch_input, self.lora_down.T)
-        branch = mx.matmul(branch, self.lora_up.T)
-        return result + branch.astype(result.dtype) * mx.array(self.scale, dtype=result.dtype)
+        for branch_spec in self.branches:
+            down = branch_spec["down"]
+            up = branch_spec["up"]
+            branch_input = x.astype(down.dtype)
+            branch = mx.matmul(branch_input, down.T)
+            branch = mx.matmul(branch, up.T)
+            result = result + branch.astype(result.dtype) * mx.array(
+                branch_spec["scale"], dtype=result.dtype
+            )
+        return result
 
 
 def _validate_base_request_refs(model_handle: Any, refs: tuple[LoraRef, ...]) -> tuple[LoraRef, ...]:
@@ -310,8 +360,6 @@ def _validate_base_request_refs(model_handle: Any, refs: tuple[LoraRef, ...]) ->
         raise ValueError("MOSS LoRA 只支持未量化 dense Transformer；请把 quantize 设为 0")
     if getattr(model_handle, "precision", None) != "bfloat16":
         raise ValueError("MOSS LoRA 只支持 bfloat16 Transformer")
-    if len(active) != 1:
-        raise ValueError("MOSS LoRA 只支持单个适配器，不能叠加多个文件")
     return active
 
 
@@ -319,8 +367,9 @@ def _validate_request_refs(model_handle: Any, refs: tuple[LoraRef, ...]) -> tupl
     active = _validate_base_request_refs(model_handle, refs)
     if not active:
         return ()
-    if float(active[0].strength) != 1.0:
-        raise ValueError("MOSS 4-step LoRA 的强度固定为 1.0")
+    for ref in active:
+        if float(ref.strength) != 1.0:
+            raise ValueError("MOSS 4-step LoRA 的强度固定为 1.0")
     return active
 
 
@@ -331,29 +380,26 @@ def _validate_standard_request_refs(
 
 
 def _validate_node_addition(model_handle: Any, selection: str, strength: float) -> None:
-    """Reject a second MOSS adapter before the node returns its model handle.
+    """Validate a MOSS adapter addition before returning the new model handle.
 
-    MOSS has two incompatible adapter layouts, and its native transformer
-    injection is intentionally single-adapter only.  A node may be evaluated
-    more than once with the same selection, so the exact same path/strength is
-    treated as an idempotent re-application rather than a stack.
+    A node may be evaluated more than once with the same selection, so the
+    exact same path/strength remains an idempotent re-application.  Different
+    paths are now valid: the native injector combines their branches in one
+    ``MOSSLoRALinear`` wrapper.
     """
     existing = active_loras(tuple(getattr(model_handle, "loras", ())))
     if not existing:
         return
 
     candidate_path = resolve_lora_path(selection)
-    if (
-        len(existing) == 1
-        and resolve_lora_path(existing[0].path) == candidate_path
-        and float(existing[0].strength) == float(strength)
-    ):
-        return
-
-    raise ValueError(
-        "MOSS LoRA 只支持单个适配器，不能叠加多个文件；"
-        "请在 4-step LoRA 节点和普通 PEFT LoRA 节点之间二选一"
-    )
+    for item in existing:
+        if resolve_lora_path(item.path) == candidate_path:
+            if float(item.strength) != float(strength):
+                raise ValueError(
+                    f"同一 MOSS LoRA 出现两次且强度不同: {selection}"
+                    f"（{item.strength} 与 {strength}）"
+                )
+            return
 
 
 def _is_standard_layout(path: str | Path) -> bool:
@@ -367,9 +413,10 @@ def validate_sampling_request(model_handle: Any, steps: int, guidance: float, sc
     active = _validate_base_request_refs(model_handle, refs)
     if not active:
         return False
-    path = resolve_lora_path(active[0].path)
-    if not _is_standard_layout(path):
-        _validate_request_refs(model_handle, refs)
+    for ref in active:
+        path = resolve_lora_path(ref.path)
+        if not _is_standard_layout(path):
+            _validate_request_refs(model_handle, (ref,))
     if float(guidance) != 1.0:
         raise ValueError("MOSS LoRA 必须使用 CFG/guidance=1.0")
     if scheduler != "moss_flow_match_euler":
@@ -384,111 +431,163 @@ def _validate_transformer(transformer: Any) -> Any:
     return layers
 
 
-def _base_for_target(layers: Any, layer_index: int, projection: str, *, label: str) -> nn.Linear:
+def _base_for_target(
+    layers: Any, layer_index: int, projection: str, *, label: str
+) -> nn.Linear | MOSSLoRALinear:
     base = layers[layer_index].proj.get(projection)
-    if not isinstance(base, nn.Linear) or isinstance(base, MOSSLoRALinear):
+    dense = base.base if isinstance(base, MOSSLoRALinear) else base
+    if not isinstance(dense, nn.Linear):
         raise ValueError(
             f"MOSS LoRA 目标 layers.{layer_index}.proj.{projection} "
             f"不是未量化 dense Linear（{label}）"
         )
     input_dims, output_dims = _expected_shapes(projection)
-    if tuple(base.weight.shape) != (output_dims, input_dims):
+    if tuple(dense.weight.shape) != (output_dims, input_dims):
         raise ValueError(
-            f"MOSS 基础层 layers.{layer_index}.proj.{projection} shape={tuple(base.weight.shape)}，"
+            f"MOSS 基础层 layers.{layer_index}.proj.{projection} shape={tuple(dense.weight.shape)}，"
             f"期望 {(output_dims, input_dims)}"
         )
     return base
 
 
+def _attach_branch(
+    layers: Any,
+    layer_index: int,
+    projection: str,
+    down: mx.array,
+    up: mx.array,
+    scale: float,
+    *,
+    adapter_key: str,
+    label: str,
+) -> None:
+    """Attach a branch to a target, creating the composite wrapper once."""
+    current = _base_for_target(layers, layer_index, projection, label=label)
+    if isinstance(current, MOSSLoRALinear):
+        current.add_branch(down, up, scale, adapter_key=adapter_key)
+    else:
+        layers[layer_index].proj[projection] = MOSSLoRALinear(
+            current,
+            down,
+            up,
+            scale,
+            adapter_key=adapter_key,
+        )
+
+
 def apply_4step_lora(transformer: Any, model_handle: Any, *, role: str = "transformer") -> None:
-    """Apply the one validated MOSS adapter to the native transformer."""
+    """Apply every validated dynamic-rank MOSS adapter to the transformer."""
     if role != "transformer":
         raise ValueError(f"MOSS 4-step LoRA 只支持 transformer role，收到 {role!r}")
-    refs = _validate_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
-    if not refs:
+    refs = _validate_base_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
+    four_step_refs = []
+    for ref in refs:
+        path = resolve_lora_path(ref.path)
+        if not _is_standard_layout(path):
+            _validate_request_refs(model_handle, (ref,))
+            four_step_refs.append((ref, path))
+    if not four_step_refs:
         return
-    path = resolve_lora_path(refs[0].path)
-    targets = validate_header(path)
-    try:
-        weights = dict(mx.load(path, format="safetensors"))
-    except (OSError, ValueError, RuntimeError) as exc:
-        raise ValueError(f"无法读取 MOSS 4-step LoRA payload {path}: {exc}") from exc
+    layers = _validate_transformer(transformer)
+    for ref, path in four_step_refs:
+        targets = validate_header(path)
+        try:
+            weights = dict(mx.load(path, format="safetensors"))
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ValueError(f"无法读取 MOSS 4-step LoRA payload {path}: {exc}") from exc
 
-    try:
-        layers = _validate_transformer(transformer)
-        for (layer_index, projection), target in targets.items():
-            base = _base_for_target(layers, layer_index, projection, label="4-step")
-            down = weights[_target_key(layer_index, projection, "lora_down.weight")]
-            up = weights[_target_key(layer_index, projection, "lora_up.weight")]
-            alpha = weights[_target_key(layer_index, projection, "alpha")]
-            mx.eval(down, up, alpha)
-            alpha_value = float(alpha.item())
-            if not mx.isfinite(alpha).item():
-                raise ValueError(
-                    f"MOSS 4-step LoRA 的 layers.{layer_index}.proj.{projection} alpha "
-                    f"必须是有限 scalar，收到 {alpha_value:g}"
+        try:
+            for (layer_index, projection), target in targets.items():
+                down = weights[_target_key(layer_index, projection, "lora_down.weight")]
+                up = weights[_target_key(layer_index, projection, "lora_up.weight")]
+                alpha = weights[_target_key(layer_index, projection, "alpha")]
+                mx.eval(down, up, alpha)
+                alpha_value = float(alpha.item())
+                if not mx.isfinite(alpha).item():
+                    raise ValueError(
+                        f"MOSS 4-step LoRA 的 layers.{layer_index}.proj.{projection} alpha "
+                        f"必须是有限 scalar，收到 {alpha_value:g}"
+                    )
+                _attach_branch(
+                    layers,
+                    layer_index,
+                    projection,
+                    down,
+                    up,
+                    alpha_value / float(target.rank),
+                    adapter_key=path,
+                    label="4-step",
                 )
-            layers[layer_index].proj[projection] = MOSSLoRALinear(
-                base,
-                down,
-                up,
-                alpha_value / float(target.rank),
-            )
-        mx.eval(transformer.parameters())
-    finally:
-        # The wrapper owns all matrix arrays after replacement.  Do not retain a
-        # second dictionary containing the complete 327 MB payload.
-        del weights
-    print(f"[MLX LoRA] moss/transformer: 已以未合并方式应用 {Path(path).name}（252 个目标层）")
+            mx.eval(transformer.parameters())
+        finally:
+            # The wrapper owns all matrix arrays after replacement.  Do not retain a
+            # second dictionary containing the complete payload.
+            del weights
+        print(
+            f"[MLX LoRA] moss/transformer: 已以未合并方式应用 {Path(path).name} "
+            f"（{len(targets)} 个目标层）"
+        )
 
 
 def apply_standard_lora(transformer: Any, model_handle: Any, *, role: str = "transformer") -> None:
-    """Apply the regular fixed-rank PEFT MOSS adapter at its requested strength."""
+    """Apply every regular fixed-rank PEFT MOSS adapter at its strength."""
     if role != "transformer":
         raise ValueError(f"MOSS LoRA 只支持 transformer role，收到 {role!r}")
     refs = _validate_standard_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
-    if not refs:
+    standard_refs = []
+    for ref in refs:
+        path = resolve_lora_path(ref.path)
+        if _is_standard_layout(path):
+            standard_refs.append((ref, path))
+    if not standard_refs:
         return
-    path = resolve_lora_path(refs[0].path)
-    targets = validate_standard_header(path)
-    try:
-        weights = dict(mx.load(path, format="safetensors"))
-    except (OSError, ValueError, RuntimeError) as exc:
-        raise ValueError(f"无法读取 MOSS 普通 LoRA payload {path}: {exc}") from exc
+    layers = _validate_transformer(transformer)
+    for ref, path in standard_refs:
+        targets = validate_standard_header(path)
+        try:
+            weights = dict(mx.load(path, format="safetensors"))
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ValueError(f"无法读取 MOSS 普通 LoRA payload {path}: {exc}") from exc
 
-    try:
-        layers = _validate_transformer(transformer)
-        strength = float(refs[0].strength)
-        for (layer_index, projection), target in targets.items():
-            base = _base_for_target(layers, layer_index, projection, label="PEFT")
-            down = weights[_standard_target_key(layer_index, projection, "A")]
-            up = weights[_standard_target_key(layer_index, projection, "B")]
-            mx.eval(down, up)
-            layers[layer_index].proj[projection] = MOSSLoRALinear(
-                base,
-                down,
-                up,
-                strength * float(target.alpha) / float(target.rank),
-            )
-        mx.eval(transformer.parameters())
-    finally:
-        del weights
-    print(
-        f"[MLX LoRA] moss/transformer: 已以未合并方式应用 {Path(path).name} "
-        f"（{len(targets)} 个目标层，strength={refs[0].strength:g}）"
-    )
+        try:
+            strength = float(ref.strength)
+            for (layer_index, projection), target in targets.items():
+                down = weights[_standard_target_key(layer_index, projection, "A")]
+                up = weights[_standard_target_key(layer_index, projection, "B")]
+                mx.eval(down, up)
+                _attach_branch(
+                    layers,
+                    layer_index,
+                    projection,
+                    down,
+                    up,
+                    strength * float(target.alpha) / float(target.rank),
+                    adapter_key=path,
+                    label="PEFT",
+                )
+            mx.eval(transformer.parameters())
+        finally:
+            del weights
+        print(
+            f"[MLX LoRA] moss/transformer: 已以未合并方式应用 {Path(path).name} "
+            f"（{len(targets)} 个目标层，strength={ref.strength:g}）"
+        )
 
 
 def apply_lora(transformer: Any, model_handle: Any, *, role: str = "transformer") -> None:
-    """Dispatch a MOSS adapter by its safetensors key layout."""
+    """Dispatch and combine all MOSS adapters by their safetensors layouts."""
     refs = _validate_base_request_refs(model_handle, tuple(getattr(model_handle, "loras", ())))
     if not refs:
         return
-    path = resolve_lora_path(refs[0].path)
-    if _is_standard_layout(path):
-        apply_standard_lora(transformer, model_handle, role=role)
-    else:
-        apply_4step_lora(transformer, model_handle, role=role)
+    if role != "transformer":
+        raise ValueError(f"MOSS LoRA 只支持 transformer role，收到 {role!r}")
+    for ref in refs:
+        path = resolve_lora_path(ref.path)
+        if not _is_standard_layout(path):
+            _validate_request_refs(model_handle, (ref,))
+            validate_header(path)
+    apply_standard_lora(transformer, model_handle, role=role)
+    apply_4step_lora(transformer, model_handle, role=role)
 
 
 def validate_node_selection(model_handle: Any, selection: str) -> str:

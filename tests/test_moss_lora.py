@@ -6,6 +6,7 @@ import sys
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 from mlx import nn
@@ -126,6 +127,93 @@ def test_lora_linear_keeps_base_and_adds_scaled_low_rank_branch():
     assert output.tolist() == [[4.0, 7.5]]
 
 
+def test_lora_linear_combines_multiple_low_rank_branches():
+    base = nn.Linear(3, 2, bias=False)
+    base.weight = mx.zeros((2, 3), dtype=mx.float32)
+    first_down = mx.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=mx.float32)
+    first_up = mx.array([[2.0, 0.0], [0.0, 3.0]], dtype=mx.float32)
+    second_down = mx.array([[0.0, 0.0, 1.0]], dtype=mx.float32)
+    second_up = mx.array([[1.0], [1.0]], dtype=mx.float32)
+    module = lora.MOSSLoRALinear(base, first_down, first_up, 0.5)
+    assert module.add_branch(second_down, second_up, 0.25)
+    output = module(mx.array([[4.0, 5.0, 9.0]], dtype=mx.float32))
+    mx.eval(output)
+    assert output.tolist() == [[6.25, 9.75]]
+
+
+def test_lora_linear_deduplicates_repeated_adapter_key():
+    base = nn.Linear(3, 2, bias=False)
+    base.weight = mx.zeros((2, 3), dtype=mx.float32)
+    down = mx.array([[1.0, 0.0, 0.0]], dtype=mx.float32)
+    up = mx.array([[1.0], [1.0]], dtype=mx.float32)
+    module = lora.MOSSLoRALinear(base, down, up, 0.5, adapter_key="adapter.safetensors")
+    assert not module.add_branch(down, up, 0.5, adapter_key="adapter.safetensors")
+    assert len(module.branches) == 1
+
+
+def test_apply_lora_composes_standard_and_four_step_targets(monkeypatch):
+    base = nn.Linear(3, 2, bias=False)
+    base.weight = mx.zeros((2, 3), dtype=mx.float32)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(proj={"q": base})],
+        parameters=lambda: {},
+    )
+    standard_target = lora.MOSSLoRATarget(0, "q", 1, 1.0, (1, 3), (2, 1))
+    four_step_target = lora.MOSSLoRATarget(0, "q", 1, None, (1, 3), (2, 1))
+    standard_down = mx.array([[1.0, 0.0, 0.0]], dtype=mx.float32)
+    standard_up = mx.array([[1.0], [0.0]], dtype=mx.float32)
+    four_step_down = mx.array([[0.0, 1.0, 0.0]], dtype=mx.float32)
+    four_step_up = mx.array([[0.0], [1.0]], dtype=mx.float32)
+
+    monkeypatch.setattr(lora, "MOSS_LORA_LAYERS", 1)
+    monkeypatch.setattr(lora, "_expected_shapes", lambda projection: (3, 2))
+    monkeypatch.setattr(lora, "resolve_lora_path", lambda path: path)
+    monkeypatch.setattr(lora, "_is_standard_layout", lambda path: "standard" in path)
+    monkeypatch.setattr(
+        lora,
+        "validate_standard_header",
+        lambda path: {(0, "q"): standard_target},
+    )
+    monkeypatch.setattr(
+        lora,
+        "validate_header",
+        lambda path: {(0, "q"): four_step_target},
+    )
+
+    def fake_load(path, format=None):
+        if "standard" in path:
+            return {
+                lora._standard_target_key(0, "q", "A"): standard_down,
+                lora._standard_target_key(0, "q", "B"): standard_up,
+            }
+        return {
+            lora._target_key(0, "q", "lora_down.weight"): four_step_down,
+            lora._target_key(0, "q", "lora_up.weight"): four_step_up,
+            lora._target_key(0, "q", "alpha"): mx.array(1.0, dtype=mx.float32),
+        }
+
+    monkeypatch.setattr(lora.mx, "load", fake_load)
+    model = _handle(
+        loras=(
+            LoraRef("four.safetensors", 1.0),
+            LoraRef("standard.safetensors", 0.5),
+        )
+    )
+
+    lora.apply_lora(transformer, model)
+    wrapped = transformer.layers[0].proj["q"]
+    assert isinstance(wrapped, lora.MOSSLoRALinear)
+    assert len(wrapped.branches) == 2
+    output = wrapped(mx.array([[2.0, 3.0, 4.0]], dtype=mx.float32))
+    mx.eval(output)
+    assert output.tolist() == [[1.0, 3.0]]
+
+    # Re-materializing against the same module is idempotent at the injection
+    # layer as well as at the model-handle node layer.
+    lora.apply_lora(transformer, model)
+    assert len(wrapped.branches) == 2
+
+
 def test_sampling_contract_keeps_scheduler_and_guidance_constraints_only():
     plain = _handle()
     assert not lora.validate_sampling_request(plain, 50, 3.0, "moss_flow_match_euler")
@@ -186,22 +274,32 @@ def test_standard_moss_lora_still_rejects_quantized_transformer():
         raise AssertionError("quantized MOSS PEFT LoRA was accepted")
 
 
-def test_moss_lora_nodes_reject_mixing_four_step_and_standard_adapters():
+def test_moss_lora_nodes_allow_mixing_four_step_and_standard_adapters():
     four_step = _handle(loras=(LoraRef(str(LORA_PATH), 1.0),))
-    try:
-        MlxModelLoraApply().apply(four_step, str(STANDARD_LORA_PATH), 1.0)
-    except ValueError as exc:
-        assert "4-step LoRA 节点和普通 PEFT LoRA 节点之间二选一" in str(exc)
-    else:
-        raise AssertionError("MOSS 4-step and standard PEFT LoRAs were mixed")
+    mixed_from_four_step, = MlxModelLoraApply().apply(
+        four_step, str(STANDARD_LORA_PATH), 0.5
+    )
+    assert mixed_from_four_step.loras == (
+        LoraRef(str(LORA_PATH), 1.0),
+        LoraRef(str(STANDARD_LORA_PATH), 0.5),
+    )
 
     standard = _handle(loras=(LoraRef(str(STANDARD_LORA_PATH), 0.5),))
-    try:
-        MlxMoss4StepLoraApply().apply(standard, str(LORA_PATH))
-    except ValueError as exc:
-        assert "4-step LoRA 节点和普通 PEFT LoRA 节点之间二选一" in str(exc)
-    else:
-        raise AssertionError("MOSS standard PEFT and 4-step LoRAs were mixed")
+    mixed_from_standard, = MlxMoss4StepLoraApply().apply(standard, str(LORA_PATH))
+    assert mixed_from_standard.loras == (
+        LoraRef(str(STANDARD_LORA_PATH), 0.5),
+        LoraRef(str(LORA_PATH), 1.0),
+    )
+
+
+def test_moss_sampling_accepts_mixed_standard_and_four_step_adapters():
+    mixed = _handle(
+        loras=(
+            LoraRef(str(LORA_PATH), 1.0),
+            LoraRef(str(STANDARD_LORA_PATH), 0.5),
+        )
+    )
+    assert lora.validate_sampling_request(mixed, 4, 1.0, "moss_flow_match_euler")
 
 
 def test_moss_lora_node_allows_idempotent_same_selection():
