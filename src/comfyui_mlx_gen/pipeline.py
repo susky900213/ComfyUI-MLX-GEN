@@ -64,7 +64,7 @@ from .flux3 import dit as flux3_dit
 from .moss import latent as moss_latent
 from .moss import loader as moss_loader
 from .moss import prompt as moss_prompt
-from .moss.scheduler import MOSSImageScheduler
+from .moss.scheduler import MOSSImageScheduler, to_mlx_timestep
 from .types import (
     MlxH3VisualCondition,
     MlxLatentHandle,
@@ -416,9 +416,11 @@ def vae_component(handle, cache) -> Any:
                 quantize=None,
                 precision=handle.precision,
             ).module
-        instance, _bits = components.create_and_load(
-            entry, "vae", kind, resolved, int(handle.quantize) or None
-        )
+        # The official MOSS VAE is a float32 autoencoder and its decoder has a
+        # model-specific topology.  Ignore generic VAE quantization widgets so
+        # an old workflow cannot reintroduce the snow-image failure.
+        quantize = None if entry.family == "moss" else int(handle.quantize) or None
+        instance, _bits = components.create_and_load(entry, "vae", kind, resolved, quantize)
         return instance
 
     instance, _hit = cache.get_or_create("module", handle.cache_key, build)
@@ -2140,9 +2142,11 @@ def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
         scheduler = MOSSImageScheduler(shift=5.0, training_shift=1.0)
         scheduler.set_timesteps(int(params["steps"]))
         for step_index, timestep in enumerate(scheduler.timesteps):
+            timestep_value = float(timestep)
+            timestep_tensor = to_mlx_timestep(timestep_value)
             cond = transformer(
                 current,
-                mx.array([timestep], dtype=mx.float32),
+                timestep_tensor,
                 positive.embeddings,
                 positive.attention_mask,
             ).astype(mx.float32)
@@ -2151,7 +2155,7 @@ def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
             else:
                 uncond = transformer(
                     current,
-                    mx.array([timestep], dtype=mx.float32),
+                    timestep_tensor,
                     negative.embeddings,
                     negative.attention_mask,
                     # Official MOSS-SFT CFG skips zero-based block 22 only
@@ -2159,7 +2163,7 @@ def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
                     skip_layers=(22,),
                 ).astype(mx.float32)
                 prediction = uncond + float(guidance) * (cond - uncond)
-            current = scheduler.step(prediction, timestep, current)
+            current = scheduler.step(prediction, timestep_value, current)
             mx.eval(current)
             if on_progress is not None:
                 on_progress()

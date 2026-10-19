@@ -8,6 +8,17 @@ import mlx.core as mx
 import numpy as np
 
 
+def to_mlx_timestep(timestep: float | np.floating) -> mx.array:
+    """Convert a NumPy schedule scalar to the MLX timestep tensor shape.
+
+    MLX does not accept ``numpy.float32`` values nested in a Python list during
+    array initialization, even when an MLX dtype is supplied.  The scheduler
+    stores its timesteps as a NumPy float32 array, so normalize the scalar to a
+    Python float before constructing the one-element tensor.
+    """
+    return mx.array([float(timestep)], dtype=mx.float32)
+
+
 @dataclass
 class MOSSImageScheduler:
     num_train_timesteps: int = 1000

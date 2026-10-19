@@ -75,8 +75,8 @@
       ],
       "outputs": [{"name": "latents", "type": "latents", "links": [6], "slot_index": 0}],
       "properties": {"Node name for S&R": "MlxKSamplerMLX"},
-      "title": "MOSS 文生图（先用 4 步验证）",
-      "widgets_values": [42, 4, 256, 256, 1, 3.0, "moss_flow_match_euler", 124, 12.0, 3.0, "auto"]
+      "title": "MOSS 文生图（官方 50 步）",
+      "widgets_values": [42, 50, 256, 256, 1, 3.0, "moss_flow_match_euler", 124, 12.0, 3.0, "auto"]
     },
     {
       "id": 6,
@@ -90,7 +90,7 @@
       "outputs": [{"name": "vae", "type": "mlx_vae", "links": [7], "slot_index": 0}],
       "properties": {"Node name for S&R": "MlxVAELoader"},
       "title": "MOSS VAE",
-      "widgets_values": ["moss", "OpenMOSS-Team--MOSS-Image-SFT", "bfloat16", 8, "vae"]
+      "widgets_values": ["moss", "OpenMOSS-Team--MOSS-Image-SFT", "float32", 0, "vae"]
     },
     {
       "id": 7,
@@ -185,7 +185,7 @@
   "config": {},
   "extra": {
     "ds": {"scale": 1, "offset": [0, 0]},
-    "workflow_notes": "MOSS-Image-SFT 独立 MLX 文生图工作流。四个组件均使用 models/mlx 下的 OpenMOSS-Team--MOSS-Image-SFT；首次运行会懒加载 Qwen3.5-9B 条件编码器与约 27GB transformer。当前默认 256x256 / 4 步仅用于低资源 smoke test；稳定生成建议将 MlxKSamplerMLX 的 steps 改为 50，并按内存调整 width/height。MOSS 只支持文生图，不要连接 ref_images。"
+      "workflow_notes": "MOSS-Image-SFT 独立 MLX 文生图工作流。四个组件均使用 models/mlx 下的 OpenMOSS-Team--MOSS-Image-SFT；首次运行会懒加载 Qwen3.5-9B 条件编码器与约 27GB transformer。采样使用官方 50 步；MOSS VAE 必须使用专用 decoder、float32、非量化配置，否则会出现雪花点。可按内存调整 width/height。MOSS 只支持文生图，不要连接 ref_images。"
   },
   "version": "0.4"
 }

@@ -755,12 +755,12 @@ IDEOGRAM4 = MlxModelEntry(
 # --- MOSS-Image-SFT（独立 128-channel spatial DiT + Qwen3.5）-------------
 MOSS_IMAGE = MlxModelEntry(
     family=MOSS_FAMILY,
-    # VAE mapping 复用 Flux2 的 AutoencoderKLFlux2 权重定义；transformer、
-    # text encoder 与 scheduler 全部走 comfyui_mlx_gen.moss 的独立实现。
+    # VAE 权重映射复用 Flux.2，但架构使用 MOSS 专用 decoder 通道；
+    # transformer、text encoder 与 scheduler 全部走 comfyui_mlx_gen.moss 的独立实现。
     weight_def="comfyui_mlx_gen.moss.weight_definition:MOSSWeightDefinition",
     components=_components(
         transformer="comfyui_mlx_gen.moss.transformer:MOSSImageTransformer",
-        vae="mflux.models.flux2.model.flux2_vae.vae:Flux2VAE",
+        vae="comfyui_mlx_gen.moss.vae:MOSSVAE",
         text_encoder="comfyui_mlx_gen.moss.loader:build_text_encoder",
         tokenizer_name="moss_qwen35",
     ),

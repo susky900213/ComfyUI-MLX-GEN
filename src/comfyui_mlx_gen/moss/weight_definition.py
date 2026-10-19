@@ -5,6 +5,8 @@ uses the official Flux.2 autoencoder implementation only as a component
 format, so its mapping is shared without making MOSS a Flux.2 family.
 """
 
+import mlx.core as mx
+
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.weights.loading.weight_definition import ComponentDefinition
 
@@ -22,7 +24,9 @@ class MOSSWeightDefinition:
             ComponentDefinition(
                 name="vae",
                 hf_subdir="vae",
-                precision=ModelConfig.precision,
+                # The official MOSS pipeline decodes with a float32 VAE.  This
+                # also keeps the VAE independent from the DiT's bf16 setting.
+                precision=mx.float32,
                 mapping_getter=_vae_mapping,
             ),
             # These two entries document the native component names.  The

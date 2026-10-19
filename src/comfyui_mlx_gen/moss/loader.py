@@ -21,6 +21,27 @@ GROUP_SIZE = 64
 _DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
 
 
+class MOSSQwenRMSNorm(nn.Module):
+    """Qwen3.5's zero-centered RMSNorm, not MLX's multiplicative RMSNorm.
+
+    Transformers initializes this layer's parameter at zero and applies
+    ``normalized * (1 + weight)``.  The released checkpoint therefore contains
+    values around zero.  Using ``mlx.nn.RMSNorm`` directly would multiply by
+    those small values and collapse every Qwen3.5 hidden state before it reaches
+    the MOSS DiT.
+    """
+
+    def __init__(self, dims: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.zeros((dims,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x32 = x.astype(mx.float32)
+        normalized = x32 * mx.rsqrt(mx.mean(x32 * x32, axis=-1, keepdims=True) + self.eps)
+        return (normalized * (1.0 + self.weight.astype(mx.float32))).astype(x.dtype)
+
+
 @dataclass(frozen=True)
 class LoadedMOSSComponent:
     role: str
@@ -171,8 +192,8 @@ def _transformer_key(key: str, _tensor: mx.array) -> tuple[str, mx.array] | None
     return key, _tensor
 
 
-def build_transformer(path: str | Path) -> MOSSImageTransformer:
-    return MOSSImageTransformer(MOSSConfig.from_path(path))
+def build_transformer(path: str | Path, activation_dtype: mx.Dtype = mx.bfloat16) -> MOSSImageTransformer:
+    return MOSSImageTransformer(MOSSConfig.from_path(path), activation_dtype=activation_dtype)
 
 
 def load_transformer(
@@ -185,7 +206,7 @@ def load_transformer(
         raise ValueError(f"未知 MOSS precision: {precision}")
     root = _component_dir(path)
     validate_index(root, "diffusion_pytorch_model")
-    module = build_transformer(root)
+    module = build_transformer(root, activation_dtype=_DTYPES[precision])
     expected = _module_expected(module)
     entries = _load_shards(root, "diffusion_pytorch_model", _transformer_key, expected, _DTYPES[precision])
     if quantize:
@@ -230,12 +251,39 @@ def build_text_encoder(path: str | Path) -> Any:
     text_config, _ = _qwen35_kwargs(config)
     from mlx_vlm.models.qwen3_5.language import Qwen3_5Model
 
-    return Qwen3_5Model(text_config)
+    module = Qwen3_5Model(text_config)
+    # Qwen3.5 uses zero-centered RMSNorm weights in all ordinary decoder norms
+    # and attention q/k norms.  Replace MLX's standard multiplicative modules
+    # before the checkpoint is loaded so expected keys remain unchanged.
+    def zero_centered(value):
+        replacement = MOSSQwenRMSNorm(value.weight.shape[0], value.eps)
+        replacement.weight = value.weight
+        return replacement
+
+    module.norm = zero_centered(module.norm)
+    for layer in module.layers:
+        layer.input_layernorm = zero_centered(layer.input_layernorm)
+        layer.post_attention_layernorm = zero_centered(layer.post_attention_layernorm)
+        if not layer.is_linear:
+            layer.self_attn.q_norm = zero_centered(layer.self_attn.q_norm)
+            layer.self_attn.k_norm = zero_centered(layer.self_attn.k_norm)
+    return module
 
 
 def _text_key(key: str, tensor: mx.array) -> tuple[str, mx.array] | None:
     if key.startswith("language_model."):
         local = key[len("language_model.") :]
+        if (
+            local.endswith(".linear_attn.conv1d.weight")
+            and tensor.ndim == 3
+            and tensor.shape[1] == 1
+            and tensor.shape[2] != 1
+        ):
+            # PyTorch Conv1d stores depthwise kernels as [out, in/groups, kernel],
+            # while MLX Conv1d expects [out, kernel, in/groups].  Qwen3.5's
+            # linear-attention convolution is depthwise, so the official MOSS
+            # checkpoint shape [8192, 1, 4] must become [8192, 4, 1].
+            tensor = tensor.transpose(0, 2, 1)
         # The DiT consumes the decoder output before the final norm. The MLX
         # Qwen3.5 implementation owns the norm parameter, but it is still
         # loaded so the module remains a complete checkpoint representation.

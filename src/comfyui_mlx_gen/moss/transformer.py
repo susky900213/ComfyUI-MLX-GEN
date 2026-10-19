@@ -20,6 +20,25 @@ def _situ(hidden: mx.array, gate: mx.array) -> mx.array:
     return value.astype(hidden.dtype)
 
 
+def _activation_dtype(module: nn.Module, fallback: mx.Dtype) -> mx.Dtype:
+    """Return the floating activation dtype for ordinary and quantized Linear layers.
+
+    ``QuantizedLinear.weight`` is packed (uint32), so it must never be used as
+    the activation dtype.  The bias remains in the requested model precision
+    and is a reliable dtype marker for layers that have one; bias-free layers
+    use the transformer's explicit fallback.
+    """
+    if isinstance(module, nn.QuantizedLinear):
+        return fallback
+    bias = getattr(module, "bias", None)
+    if isinstance(bias, mx.array) and bias.dtype in (mx.float16, mx.bfloat16, mx.float32):
+        return bias.dtype
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, mx.array) and weight.dtype in (mx.float16, mx.bfloat16, mx.float32):
+        return weight.dtype
+    return fallback
+
+
 def _rope_rotate(x: mx.array, rope: mx.array) -> mx.array:
     """Apply the official MOSS split-half rotary convention.
 
@@ -76,7 +95,13 @@ class MOSSImageTextBlock(nn.Module):
         self.ffn_up = nn.Linear(config.dim, config.ffn_dim)
         self.ffn_down = nn.Linear(config.ffn_dim, config.dim)
 
-    def __call__(self, x: mx.array, rope: mx.array, token_mask: mx.array | None = None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        rope: mx.array,
+        token_mask: mx.array | None = None,
+        activation_dtype: mx.Dtype = mx.bfloat16,
+    ) -> mx.array:
         q, k, value = mx.split(self.qkv(self.norm1(x)), 3, axis=-1)
         batch, sequence, _ = q.shape
         head_dim = q.shape[-1] // self.heads
@@ -87,7 +112,10 @@ class MOSSImageTextBlock(nn.Module):
             attention_mask = token_mask[:, None, :, None] & token_mask[:, None, None, :]
         x = x + self.proj(_attention(q, k, value, rope, self.heads, attention_mask))
         normalized = self.norm2(x)
-        return x + self.ffn_down(_situ(self.ffn_up(normalized), self.ffn_gate(normalized)))
+        return x + self.ffn_down(
+            _situ(self.ffn_up(normalized.astype(_activation_dtype(self.ffn_up, activation_dtype))),
+                  self.ffn_gate(normalized.astype(_activation_dtype(self.ffn_gate, activation_dtype))))
+        )
 
 
 class MOSSImageTextProjection(nn.Module):
@@ -96,10 +124,16 @@ class MOSSImageTextProjection(nn.Module):
         self.proj = nn.Linear(config.text_dim, config.dim)
         self.blocks = [MOSSImageTextBlock(config) for _ in range(2)]
 
-    def __call__(self, x: mx.array, rope: mx.array, token_mask: mx.array | None = None) -> mx.array:
-        x = self.proj(x.astype(self.proj.weight.dtype))
+    def __call__(
+        self,
+        x: mx.array,
+        rope: mx.array,
+        token_mask: mx.array | None = None,
+        activation_dtype: mx.Dtype = mx.bfloat16,
+    ) -> mx.array:
+        x = self.proj(x.astype(_activation_dtype(self.proj, activation_dtype)))
         for block in self.blocks:
-            x = block(x, rope, token_mask)
+            x = block(x, rope, token_mask, activation_dtype)
         return x
 
 
@@ -127,13 +161,14 @@ class MOSSImageBlock(nn.Module):
         rope: mx.array,
         modulation: mx.array,
         token_mask: mx.array | None = None,
+        activation_dtype: mx.Dtype = mx.bfloat16,
     ) -> mx.array:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mx.split(modulation, 6, axis=1)
         # mx.split(axis=1) already returns [B,1,D], which is the broadcast
         # shape corresponding to PyTorch's ``unbind(1)`` followed by
         # ``[:, None]`` in the reference implementation.
         normalized = self.norm1(x) * (1.0 + scale_a) + shift_a
-        dtype = self.proj["q"].weight.dtype
+        dtype = _activation_dtype(self.proj["q"], activation_dtype)
         normalized = normalized.astype(dtype)
         q = self.proj["q"](normalized)
         k = self.proj["k"](normalized)
@@ -149,7 +184,8 @@ class MOSSImageBlock(nn.Module):
             _attention(q, k, value, rope, self.heads, attention_mask)
         ) * gate_a
         normalized = self.norm2(x) * (1.0 + scale_f) + shift_f
-        hidden, gate = mx.split(self.proj["ffn_up_gate"](normalized.astype(dtype)), 2, axis=-1)
+        normalized = normalized.astype(_activation_dtype(self.proj["ffn_up_gate"], activation_dtype))
+        hidden, gate = mx.split(self.proj["ffn_up_gate"](normalized), 2, axis=-1)
         return x + self.proj["ffn_down"](_situ(hidden, gate)) * gate_f
 
 
@@ -176,12 +212,20 @@ class MOSSImageRoPE:
         return mx.concatenate([mx.sin(phase), mx.cos(phase)], axis=1).reshape(1, -1, self.num_bands * 8)
 
 
-def _timestep_embedding(timestep: mx.array, freq_dim: int, dtype: mx.Dtype) -> mx.array:
+def _timestep_embedding(timestep: mx.array, freq_dim: int) -> mx.array:
+    """Build the timestep sinusoid in fp32, matching the official pipeline.
+
+    The PyTorch reference computes the frequency/phase path in float64 and
+    converts the final sinusoid to float32 before the time MLP.  Metal does not
+    support float64, but retaining fp32 here is still essential: casting this
+    embedding directly to bf16 changes the modulation vector at every denoising
+    step and produces a visibly corrupted image.
+    """
     values = timestep.astype(mx.float32).reshape(-1, 1)
     half = freq_dim // 2
     frequencies = mx.exp(-math.log(10_000.0) * mx.arange(half, dtype=mx.float32) / half)
     phase = values * frequencies[None]
-    return mx.concatenate([mx.cos(phase), mx.sin(phase)], axis=-1).astype(dtype)
+    return mx.concatenate([mx.cos(phase), mx.sin(phase)], axis=-1)
 
 
 def _validate_skip_layers(skip_layers: Iterable[int] | None, depth: int) -> frozenset[int]:
@@ -194,12 +238,18 @@ def _validate_skip_layers(skip_layers: Iterable[int] | None, depth: int) -> froz
 class MOSSImageTransformer(nn.Module):
     """Official MOSS dense DiT with spatial latents and optional block skipping."""
 
-    def __init__(self, config: MOSSConfig | None = None, **kwargs):
+    def __init__(
+        self,
+        config: MOSSConfig | None = None,
+        activation_dtype: mx.Dtype | None = None,
+        **kwargs,
+    ):
         super().__init__()
         if config is None:
             config = MOSSConfig.from_dict(kwargs) if kwargs else MOSSConfig()
         validate_config(config)
         self.config = config
+        self.activation_dtype = activation_dtype or mx.float32
         self.latent_channels = config.latent_channels
         self.freq_dim = config.freq_dim
         self.video_embedder = nn.Linear(config.latent_channels, config.dim)
@@ -236,29 +286,56 @@ class MOSSImageTransformer(nn.Module):
             times = mx.broadcast_to(times, (batch,))
         if times.shape[0] != batch:
             raise ValueError("MOSS timestep 数量必须为 1 或 batch size")
-        dtype = self.video_embedder.weight.dtype
-        time = self.time_embedding[2](nn.silu(self.time_embedding[0](_timestep_embedding(times, self.freq_dim, dtype))))
-        modulation = self.shared_block_modulation(time.astype(self.shared_block_modulation.weight.dtype)).reshape(batch, 6, -1)
-        head = self.video_head_modulation(time.astype(self.video_head_modulation.weight.dtype)).reshape(batch, 2, -1)
+        dtype = self.activation_dtype
+        time_input = _timestep_embedding(times, self.freq_dim)
+        time = self.time_embedding[2](
+            nn.silu(
+                self.time_embedding[0](
+                    time_input.astype(_activation_dtype(self.time_embedding[0], dtype))
+                )
+            )
+        ).astype(mx.float32)
+        modulation = self.shared_block_modulation(
+            time.astype(_activation_dtype(self.shared_block_modulation, dtype))
+        ).reshape(batch, 6, -1)
+        head = self.video_head_modulation(
+            time.astype(_activation_dtype(self.video_head_modulation, dtype))
+        ).reshape(batch, 2, -1)
         outputs = []
         for index in range(batch):
             valid = mask[index].astype(mx.bool_)
-            context = encoder_hidden_states[index : index + 1]
-            if int(mx.sum(valid).item()) == 0:
+            valid_length = int(mx.sum(valid).item())
+            if valid_length == 0:
                 raise ValueError("每个 MOSS 样本至少需要一个有效文本 token")
+            # pad_conditioning only pads on the right.  Slice the valid prefix
+            # before text refinement and RoPE construction, matching the
+            # official PyTorch ``context = context[:, mask[index].bool()]``
+            # path instead of merely masking attention after padding changed
+            # the text sequence length and image/text positions.
+            if not bool(mx.all(valid[:valid_length]).item()) or bool(mx.any(valid[valid_length:]).item()):
+                raise ValueError("MOSS attention_mask 必须是右侧 padding 的前缀有效 mask")
+            context = encoder_hidden_states[index : index + 1, :valid_length]
             video = hidden_states[index : index + 1].transpose(0, 2, 3, 1).reshape(1, height * width, -1)
             video = self.video_embedder(video.astype(dtype))
             rope = self.rope(height, width, int(context.shape[1])).astype(video.dtype)
-            text = self.text_embedder(context, rope[:, height * width :], valid[None])
+            text = self.text_embedder(context, rope[:, height * width :], None, self.activation_dtype)
             value = mx.concatenate([video, text], axis=1)
-            token_mask = mx.concatenate(
-                [mx.ones((1, height * width), dtype=mx.bool_), valid[None]], axis=1
-            )
+            token_mask = None
             for layer_index, layer in enumerate(self.layers):
                 if layer_index not in skip:
-                    value = layer(value, rope, modulation[index : index + 1], token_mask)
-            value = self.final_norm_video(value[:, : height * width].astype(self.final_norm_video.weight.dtype))
+                    value = layer(
+                        value,
+                        rope,
+                        modulation[index : index + 1],
+                        token_mask,
+                        self.activation_dtype,
+                    )
+            value = self.final_norm_video(
+                value[:, : height * width].astype(self.final_norm_video.weight.dtype)
+            )
             value = value * (1.0 + head[index : index + 1, 1:2]) + head[index : index + 1, 0:1]
-            value = self.final_linear_video(value.astype(self.final_linear_video.weight.dtype))
+            value = self.final_linear_video(
+                value.astype(_activation_dtype(self.final_linear_video, self.activation_dtype))
+            )
             outputs.append(value.transpose(0, 2, 1).reshape(1, -1, height, width))
         return mx.concatenate(outputs, axis=0)

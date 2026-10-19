@@ -62,6 +62,21 @@ def pad_conditioning(rows: Sequence[mx.array]) -> MOSSConditioning:
     return MOSSConditioning(embeds, mask)
 
 
+def _text_position_ids(input_ids: mx.array) -> mx.array:
+    """Return pure-text Qwen3.5 M-RoPE positions.
+
+    Qwen3.5's MLX implementation expects three position axes even for text-only
+    input.  Keeping all axes identical matches the Qwen3-VL pure-text layout.
+    Passing the positions explicitly also avoids a bug in some mlx-vlm versions
+    where the no-KV-cache path tries to read ``cache.offset`` from ``None``.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(f"MOSS text input_ids 必须是二维 [batch, sequence]，收到 {tuple(input_ids.shape)}")
+    batch, sequence = input_ids.shape
+    positions = mx.arange(sequence, dtype=mx.int32)[None, None, :]
+    return mx.broadcast_to(positions, (3, batch, sequence))
+
+
 def encode_prompts(
     prompts: Sequence[str] | str,
     tokenizer: Any,
@@ -76,7 +91,11 @@ def encode_prompts(
         formatted = format_prompt(prompt)
         encoded = tokenizer(formatted, return_tensors="np", truncation=True, max_length=int(max_length))
         input_ids = mx.array(encoded["input_ids"], dtype=mx.int32)
-        output = text_encoder(input_ids, mask=mx.ones(input_ids.shape, dtype=mx.bool_))
+        output = text_encoder(
+            input_ids,
+            mask=mx.ones(input_ids.shape, dtype=mx.bool_),
+            position_ids=_text_position_ids(input_ids),
+        )
         hidden = getattr(output, "hidden_states", None)
         if hidden is None:
             hidden = getattr(output, "last_hidden_state", output)
