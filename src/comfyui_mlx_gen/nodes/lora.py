@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 from .. import paths
+from ..fibo2 import backend as fibo2_backend
 from ..transformer_lora import resolve_lora_path, supported_families
-from ..types import CLIP, LoraRef, MlxClipHandle, MlxModelHandle
+from ..types import CLIP, LoraRef, MlxClipHandle, MlxModelHandle, vae
 from ..moss import lora as moss_lora
 
 NO_LORA = "<无 LoRA>"
@@ -52,6 +53,8 @@ class MlxModelLoraApply:
             raise ValueError("必须先连接 MlxTransformerLoader 的输出")
         if lora == NO_LORA:
             return (model,)
+        if isinstance(model, fibo2_backend.Fibo2ModelHandle):
+            return (_add(model, lora, strength),)
         if model.model_type == "moss":
             # 普通 PEFT MOSS LoRA 走通用节点；只有旧的 dynamic-rank 4-step
             # 文件保留专用节点，因为它没有标准 lora_A/lora_B 结构且强度固定为 1。
@@ -125,8 +128,39 @@ class MlxClipLoraApply:
             raise ValueError("必须先连接 MlxClipLoader 的输出")
         if lora == NO_LORA:
             return (clip,)
+        if isinstance(clip, fibo2_backend.Fibo2ClipHandle):
+            return (_add(clip, lora, strength),)
         raise NotImplementedError(
             "MLX CLIP LoRA 尚不支持：mflux 0.19.1 的现有 mapping 只覆盖扩散/视频 "
             "Transformer。请把 LoRA 接到「MLX 模型 LoRA」节点；包含文本编码器权重的 "
             "LoRA 需要单独的 CLIP/Qwen/T5 映射，插件不会再静默登记后忽略。"
         )
+
+
+class MlxVaeLoraApply:
+    """Apply a Fibo-2 Diffusers LoRA through the unified VAE socket.
+
+    Native MLX VAE LoRA mappings are intentionally not invented here.  Fibo-2
+    native MLX currently rejects VAE LoRA rather than silently applying it.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": (vae, {}),
+                "lora": ([NO_LORA] + paths.scan_loras(), {"default": NO_LORA}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            }
+        }
+
+    RETURN_TYPES = (vae,)
+    FUNCTION = "apply"
+    CATEGORY = "MLX/Gen"
+
+    def apply(self, vae, lora: str, strength: float):
+        if vae is None:
+            raise ValueError("必须先连接 VAE Loader 的输出")
+        if lora == NO_LORA:
+            return (vae,)
+        raise NotImplementedError("Fibo-2 MLX VAE LoRA mapping 尚未实现；不会回退到 Torch/Diffusers")

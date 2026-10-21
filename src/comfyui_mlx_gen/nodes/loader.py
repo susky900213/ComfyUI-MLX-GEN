@@ -18,7 +18,8 @@ LoRA 请单独连接 MlxModelLoraApply，不要在本节点上配置。
 from __future__ import annotations
 
 from .. import paths, runtime
-from ..types import MlxModelHandle, entry_for, model_types, validate_model_family
+from ..fibo2 import backend as fibo2_backend
+from ..types import FIBO2_FAMILY, MlxModelHandle, entry_for, model_types, validate_model_family
 
 # 0 = 保留磁盘精度（Ideogram 4 官方 checkpoint 已是 FP8，不应再做一次在线量化）。
 QUANTIZE_OPTIONS = [0, 4, 8, 16]
@@ -30,12 +31,18 @@ def path_options(component: str) -> list[str]:
     return paths.list_component_items(component) or [NO_WEIGHTS]
 
 
+def _fibo2_options(items: list[str]) -> list[str]:
+    """Return local Fibo snapshots only; native MLX never downloads Torch repos."""
+
+    return list(dict.fromkeys(items))
+
+
 class MlxTransformerLoader:
     @classmethod
     def INPUT_TYPES(cls):
         types = model_types()
         default_type = types[0]
-        transformer_paths = path_options("transformer")
+        transformer_paths = _fibo2_options(path_options("transformer"))
         return {
             "required": {
                 "model_type": (types, {"default": default_type}),
@@ -56,6 +63,20 @@ class MlxTransformerLoader:
     CATEGORY = "MLX/Gen"
 
     def load(self, model_type, model_path, quantize, precision, compile, compile_cache_limit):
+        if model_type == FIBO2_FAMILY:
+            path = fibo2_backend.resolve_model_selection(model_path)
+            normalized_dtype = fibo2_backend.normalize_dtype(precision)
+            normalized_device = "auto"
+            # The unified loader is native MLX.  The legacy backend-specific
+            # Torch device option is intentionally not exposed here.
+            handle = fibo2_backend.Fibo2ModelHandle(
+                model_path=path,
+                dtype=normalized_dtype,
+                device=normalized_device,
+                quantize=int(quantize),
+                cache_key=fibo2_backend.model_cache_key(path, normalized_dtype, normalized_device, int(quantize)),
+            )
+            return (handle,)
         # 未知大类 → 直接报错（不静默回退，避免加载到错的类）；
         # 已知但尚未验证的大类（MODEL_DEFS 里 supported=False）提示还没实现
         entry = entry_for(model_type)

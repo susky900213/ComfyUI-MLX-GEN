@@ -16,6 +16,9 @@ _TYPE_CAPS: dict[str, int] = {
     # Ideogram 4 的每条条件为多层 Qwen 特征；只保留当前工作流的一条，换 prompt / 尺寸即淘汰
     "ideogram4_prompt": 1,
     "component_weights": 2,
+    # Fibo-2 的 sampler 已经在 native MLX 路径完成 VAE 解码；保留最近的
+    # decoded payload，兼容旧工作流把 sampler 的 latents 接到通用解码器。
+    "fibo2_images": 2,
     "image": 6,
     # 参考图条件（flux2：packed + grid ids；qwen_edit：packed + ids；
     # qwen_image_21：预处理 PIL + 64 通道 latent + 各图网格），

@@ -13,8 +13,10 @@ ModelConfig 由 weights.config_for_path 按目录名匹配）。
 from __future__ import annotations
 
 from .. import paths, runtime
+from ..fibo2 import backend as fibo2_backend
 from ..types import (
     CLIP,
+    FIBO2_FAMILY,
     QWEN_IMAGE_21_MAX_LENGTH,
     MlxClipHandle,
     entry_for,
@@ -75,13 +77,21 @@ def component_options(component: str) -> list[str]:
     return list(dict.fromkeys(items)) or [NO_PATH]
 
 
+def _fibo2_options(items: list[str]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            [*items, *paths.list_component_items("transformer")]
+        )
+    )
+
+
 class MlxClipLoader:
     @classmethod
     def INPUT_TYPES(cls):
         types = model_types()
         default_type = types[0]
         comp = "text_encoder"
-        paths_for_comp = component_options(comp)
+        paths_for_comp = _fibo2_options(component_options(comp))
         return {
             "required": {
                 "model_type": (types, {"default": default_type}),
@@ -106,6 +116,21 @@ class MlxClipLoader:
     CATEGORY = "MLX/Gen"
 
     def load(self, model_type, component, path, precision, max_length, quantize):
+        if model_type == FIBO2_FAMILY:
+            if component not in COMPONENTS:
+                raise ValueError(f"未知组件: {component}")
+            selected = fibo2_backend.resolve_model_selection(path)
+            normalized_precision = normalize_precision(precision)
+            handle = fibo2_backend.Fibo2ClipHandle(
+                model_path=selected,
+                dtype=normalized_precision,
+                device="auto",
+                quantize=int(quantize),
+                cache_key=fibo2_backend.model_cache_key(
+                    selected, normalized_precision, "auto", int(quantize)
+                ),
+            )
+            return (handle,)
         # 未知大类 → 直接报错；已知但未验证的大类提示还没实现
         entry = entry_for(model_type)
         validate_model_family(model_type, path)

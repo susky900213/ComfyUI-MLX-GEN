@@ -37,6 +37,7 @@ ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 
 ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留原尺寸；MlxRefImageSet → MlxVAEEncoder）
 # H3 视觉条件（首 / 尾帧锚点 + 多图参考；图片本体留在缓存，handle 只带键、顺序与画布）
 h3_keyframes = "mlx_h3_keyframes"
+FIBO2_FAMILY = "fibo2"
 
 
 # --- checkpoint family detection -------------------------------------------
@@ -206,7 +207,7 @@ class MlxClipHandle:
     用哪套 ModelConfig 不登记在这里：由 weights.config_for_path 按 path
     （目录名 / 文件名 / repo id）去 AVAILABLE_MODELS 里匹配。
 
-    `quantize` 是给视频家族（minimax_h3）用的：它的条件编码器不量化会常驻约
+    `quantize` 是给视频家族（minimax_h3）用的：它的条件编码器不量化要常驻约
     50 GB，所以必须 q8 / q4。图片链路的 loader 默认不量化（None = 现状）。
     """
 
@@ -885,7 +886,10 @@ MODEL_DEFS: dict[str, MlxModelEntry] = {
 # --- 供节点使用的查询入口（只依赖大类，不依赖具体模型名 / 配置名） ---
 def model_types() -> list[str]:
     """所有模型大类（= MODEL_DEFS 的键，如 "z_image"、"flux2"、"qwen_edit"）。"""
-    return list(MODEL_DEFS)
+    # Fibo 2 has a separate native MLX component bundle because its official
+    # architecture is not one of the mflux families.  It still participates in
+    # the unified loader widgets while its nodes dispatch before entry_for().
+    return [*MODEL_DEFS, FIBO2_FAMILY]
 
 
 def entry_for(model_type: str) -> MlxModelEntry:

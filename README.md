@@ -8,6 +8,33 @@ Qwen-Image 2.1 用户可直接阅读：[Qwen-Image 2.1 下载、安装与使用�
 FLUX 3 Image Klein 的模型放置、单图/多图编辑连线和实现约定见：
 [FLUX 3 编辑实现说明](FLUX3_EDIT_IMPLEMENTATION.md)。
 
+## Fibo 2.0（原生 MLX）
+
+Fibo 2.0 现在通过统一的 `MlxTransformerLoader`、`MlxClipLoader`、`MlxVAELoader` 和
+`MlxKSamplerMLX` **直接走 MLX**：Qwen3-VL 条件编码、Fibo-2 DiT、Flow-Match Euler、
+FLUX.2 VAE 和 latent 解码都在 MLX/Metal 上执行，不会调用 Torch 或 Diffusers。
+
+官方 Fibo-2 仓库仍然发布的是 Diffusers 目录格式，因此需要先把完整官方 snapshot 放入
+MLX 模型目录（插件在加载时将 safetensors 映射到 MLX 模块）：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/Fibo-2.0-dev/
+├── model_index.json
+├── processor/
+├── scheduler/
+├── text_encoder/
+├── transformer/
+└── vae/
+```
+
+三个 Loader 的 `model_type` 都选 `fibo2`，`model_path` 都选同一个本地根目录名称。
+Transformer 默认建议选择 `quantize=8` 以降低 Apple Silicon 统一内存压力；Fibo-2
+Transformer 使用约 3.6B hidden width、44 层、128 维 head，完整推理仍需要很大的统一内存。
+`Fibo-2.0-edit-turbo` 固定 4 步、guidance 1.0；`Fibo-2.0-dev` 默认 30 步、guidance 5.0。
+
+`requirements-fibo2.txt` 现在只保留给旧的显式 Torch/Diffusers 兼容 API 使用；统一 MLX
+工作流不需要安装它。旧版 `BriaFiboEditPipeline` 仍不是 Fibo-2，插件不会把它当作替代品。
+
 ## Raon Speech（可选 PyTorch runtime）
 
 仓库还提供独立的 Raon Speech 节点，用于本地 TTS、STT 和 Speech-Chat。它**不使用

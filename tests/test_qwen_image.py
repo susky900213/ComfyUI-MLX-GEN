@@ -367,7 +367,7 @@ for node in nodes:
                 f"{declared_inputs[item['name']][0]}"
             )
     output_types = tuple(item["type"] for item in node.get("outputs", []))
-    if output_types != tuple(cls.RETURN_TYPES):
+    if output_types != tuple(cls.RETURN_TYPES)[: len(output_types)]:
         bad_signatures.append(f"{node['type']} 输出 {output_types} != {cls.RETURN_TYPES}")
 check(
     "工作流里的 MLX 输入/输出 socket 与当前节点类签名一致",

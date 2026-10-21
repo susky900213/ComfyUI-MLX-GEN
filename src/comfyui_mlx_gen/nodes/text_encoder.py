@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from .. import pipeline, runtime
 from ..cache import CACHE
+from ..fibo2 import backend as fibo2_backend
 from ..types import (
     CLIP,
+    FIBO2_FAMILY,
     condition,
     entry_for,
     MlxClipHandle,
@@ -61,6 +63,22 @@ class MlxTextEncoder:
     def encode(self, text, clip, h3_keyframes=None, ref_images=None, prompt=None):
         if clip is None:
             raise ValueError("必须先连接 MlxClipLoader 的输出")
+        if isinstance(clip, fibo2_backend.Fibo2ClipHandle):
+            if prompt is not None:
+                text = prompt
+            # Fibo-2's six Qwen3-VL bundles are materialized by the native MLX
+            # sampler together with the DiT.  Keep this socket as a lightweight
+            # prompt handle so the unified ComfyUI graph remains compatible;
+            # no Torch/Diffusers embedding is created here.
+            return (
+                MlxConditioning(
+                    clip=clip,
+                    text=str(text or ""),
+                    encoding_key=runtime.cache_key(
+                        {"family": FIBO2_FAMILY, "clip": clip, "text": str(text or "")}
+                    ),
+                ),
+            )
         if not isinstance(clip, MlxClipHandle):
             raise ValueError(
                 "clip 必须是 MlxClipLoader 产出的 handle；"

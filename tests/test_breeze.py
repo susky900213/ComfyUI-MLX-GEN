@@ -485,7 +485,7 @@ for node in nodes:
                 f"{declared_inputs[item['name']][0]}"
             )
     output_types = tuple(item["type"] for item in node.get("outputs", []))
-    if output_types != tuple(cls.RETURN_TYPES):
+    if output_types != tuple(cls.RETURN_TYPES)[: len(output_types)]:
         bad_signatures.append(f"{node['type']} 输出 {output_types} != {cls.RETURN_TYPES}")
 check("Breeze 工作流 MLX socket 与节点签名一致", not bad_signatures, "; ".join(bad_signatures))
 

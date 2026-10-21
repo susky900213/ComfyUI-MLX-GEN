@@ -38,6 +38,7 @@ from __future__ import annotations
 from .. import image as image_mod
 from .. import pipeline
 from ..cache import CACHE
+from ..fibo2 import backend as fibo2_backend
 from ..types import (
     MlxRefImageSource,
     MlxReferenceImages,
@@ -179,6 +180,11 @@ class MlxVAEEncoder:
         height=0,
         ref_source=None,
     ):
+        if isinstance(vae, fibo2_backend.Fibo2VaeHandle):
+            raise ValueError(
+                "Fibo-2 的参考图由统一 MLX 采样器按官方 image processor 语义编码；"
+                "当前不能把 Fibo-2 handle 接到通用参考图编码节点"
+            )
         if vae is None or not isinstance(vae, MlxVaeHandle):
             raise ValueError(
                 "必须连接「MLX VAE 加载器」的输出；"

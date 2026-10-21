@@ -13,7 +13,8 @@ handle.cache_key 物化并缓存 —— 因此「同一个 VAE handle 同时接�
 from __future__ import annotations
 
 from .. import paths, runtime
-from ..types import MlxVaeHandle, entry_for, model_types, validate_model_family, vae
+from ..fibo2 import backend as fibo2_backend
+from ..types import FIBO2_FAMILY, MlxVaeHandle, entry_for, model_types, validate_model_family, vae
 
 NO_WEIGHTS = "<无可用权重>"
 PRECISIONS = ["bfloat16", "float16", "float32"]
@@ -23,19 +24,34 @@ QUANTIZE_OPTIONS = [0, 4, 8, 16]
 ROLES = ["vae", "audio_vae"]
 
 
+def _fibo2_options(items: list[str]) -> list[str]:
+    """Include local Fibo roots in the shared VAE selector."""
+
+    return list(
+        dict.fromkeys(
+            [
+                *items,
+                *paths.list_component_items("transformer"),
+            ]
+        )
+    )
+
+
 class MlxVAELoader:
     @classmethod
     def INPUT_TYPES(cls):
         types = model_types()
         # 两个候选目录取并集：H3 的音频 VAE 既可以放 audio_vae/，也可以放 vae/
-        vae_paths = list(
-            dict.fromkeys(
-                paths.list_component_items("vae") + paths.list_component_items("audio_vae")
-                + [
-                    name
-                    for name in paths.list_component_items("transformer")
-                    if "breeze" in name.lower()
-                ]
+        vae_paths = _fibo2_options(
+            list(
+                dict.fromkeys(
+                    paths.list_component_items("vae") + paths.list_component_items("audio_vae")
+                    + [
+                        name
+                        for name in paths.list_component_items("transformer")
+                        if "breeze" in name.lower()
+                    ]
+                )
             )
         ) or [NO_WEIGHTS]
         return {
@@ -54,6 +70,21 @@ class MlxVAELoader:
     CATEGORY = "MLX/Gen"
 
     def load(self, model_type, model_path, precision, quantize, role="vae"):
+        if model_type == FIBO2_FAMILY:
+            if role != "vae":
+                raise ValueError("Fibo 2 只有 pipeline 内置的 vae，不支持 audio_vae role")
+            selected = fibo2_backend.resolve_model_selection(model_path)
+            normalized_precision = fibo2_backend.normalize_dtype(precision)
+            handle = fibo2_backend.Fibo2VaeHandle(
+                model_path=selected,
+                dtype=normalized_precision,
+                device="auto",
+                quantize=int(quantize),
+                cache_key=fibo2_backend.model_cache_key(
+                    selected, normalized_precision, "auto", int(quantize)
+                ),
+            )
+            return (handle,)
         # 未知大类 → 直接报错；已知但未验证的大类提示还没实现（与 MlxTransformerLoader 一致）
         entry = entry_for(model_type)
         validate_model_family(model_type, model_path)

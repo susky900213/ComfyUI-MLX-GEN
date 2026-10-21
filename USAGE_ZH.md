@@ -35,6 +35,33 @@ cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
 如果 ComfyUI 不是虚拟环境安装，把命令开头换成启动 ComfyUI 时实际使用的 Python。
 安装完成后重启 ComfyUI。
 
+### 1.1.2 Fibo 2.0 原生 MLX
+
+Fibo 2.0 使用统一 Loader，但现在由仓库内的 native MLX backend 执行：Qwen3-VL 的六组
+hidden-state 条件、Fibo-2 Transformer、FLUX.2 VAE、动态 gist token、Flow-Match Euler
+和 CFG 都在 MLX/Metal 上运行。不会因为选择 `fibo2` 而导入 Torch/Diffusers。
+
+官方权重需要先下载到本地，保持 Diffusers snapshot 的目录结构。把整个根目录放到：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/Fibo-2.0-dev/
+├── model_index.json
+├── processor/
+├── scheduler/
+├── text_encoder/
+├── transformer/
+└── vae/
+```
+
+工作流中 `MlxTransformerLoader`、`MlxClipLoader`、`MlxVAELoader` 的 `model_type` 都选
+`fibo2`，并选择同一个本地根目录。Fibo-2 是约 8B 总参数的 BF16 checkpoint；Transformer
+建议先使用 q8，并从 512×512、batch=1 开始验证 Metal 内存。`Fibo-2.0-edit-turbo`
+固定 4 步 / guidance 1.0，`Fibo-2.0-dev` 默认 30 步 / guidance 5.0。
+
+当前 native MLX 版本支持文生图与最多 5 张上下文参考图；mask inpainting、Fibo VAE LoRA
+和直接选择 HF repo id 仍会明确报错，避免静默回退到 Torch。`requirements-fibo2.txt`
+只用于旧的显式 Torch/Diffusers 兼容 API，不是 MLX 工作流的依赖。
+
 依赖版本以 `requirements.txt` 为准，当前主要包括：
 
 - `mlx>=0.32.0,<0.33.0`

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from inspect import signature
+import json
 from pathlib import Path
 import re
 from typing import Any
+
+import mlx.core as mx
 
 from . import paths, runtime
 from .types import MlxModelEntry, QWEN_IMAGE_21_FAMILY, detect_model_family
@@ -125,12 +128,153 @@ def load_component(
             rel = paths.relative_to_root(str(path))
         else:  # repo：需要预先下载到本地，这里不再联网
             raise RuntimeError(f"组件 {component} 指向 HF 仓库 {path}；请先下载到本地目录")
-        weights, quantization, version = wl._load_component(root, replace(comp, hf_subdir=rel), raw_cache)
+        # mflux's ``multi_json`` loader historically assumes the index is named
+        # ``model.safetensors.index.json``.  Diffusers transformer components use
+        # ``diffusion_pytorch_model.safetensors.index.json`` instead.  Handle that
+        # layout locally while preserving mflux's normal path for its canonical
+        # index name and for every other component.
+        component_path = Path(path)
+        alternate_index = _alternate_safetensors_index(component_path, comp.loading_mode)
+        if alternate_index is not None:
+            weights, quantization, version = _load_indexed_component(
+                wl, comp, component_path, alternate_index, raw_cache
+            )
+        else:
+            weights, quantization, version = wl._load_component(root, replace(comp, hf_subdir=rel), raw_cache)
     elif kind == "file":
         weights, quantization, version = _load_single_file(wl, comp, Path(path))
     else:
         raise ValueError(f"未知 kind: {kind}")
     return LoadedComponent(weights=weights, quantization=quantization, version=version, cache_key=key)
+
+
+def _alternate_safetensors_index(path: Path, loading_mode: str) -> Path | None:
+    """Return a non-mflux index name that the local loader can read.
+
+    Diffusers exports transformer weights under ``diffusion_pytorch_model`` while
+    mflux's ``multi_json`` implementation only looks for ``model``.  Do not use a
+    broad glob here: selecting an arbitrary index could silently load the wrong
+    variant when a directory contains more than one checkpoint.
+    """
+
+    if loading_mode != "multi_json":
+        return None
+    canonical = path / "model.safetensors.index.json"
+    if canonical.is_file():
+        return None
+    alternate = path / "diffusion_pytorch_model.safetensors.index.json"
+    return alternate if alternate.is_file() else None
+
+
+def _indexed_safetensor_files(index_path: Path) -> tuple[Path, ...]:
+    """Validate a safetensors index and return its declared shard paths.
+
+    The checkpoint is local-only, but the index is still treated as untrusted
+    input.  In particular, a malformed or path-traversing ``weight_map`` must not
+    make the loader read files outside the selected component directory.
+    """
+
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取 safetensors 索引 {index_path}: {exc}") from exc
+
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"safetensors 索引缺少非空 weight_map：{index_path}")
+
+    # Keep the component path itself resolved, but do not resolve shard paths:
+    # Hugging Face snapshots commonly store each file as a symlink to a blob
+    # outside ``snapshots/<revision>/<component>``.
+    component_dir = index_path.parent.resolve()
+    raw_names = list(weight_map.values())
+    if not all(isinstance(name, str) and name for name in raw_names):
+        raise ValueError(f"safetensors 索引包含非字符串 shard 名称：{index_path}")
+    names = sorted(set(raw_names))
+
+    files: list[Path] = []
+    for name in names:
+        relative_name = Path(name)
+        if relative_name.is_absolute() or ".." in relative_name.parts:
+            raise ValueError(
+                f"safetensors 索引 shard 路径非法：{index_path}: {name}"
+            )
+        candidate = component_dir / name
+        try:
+            candidate.relative_to(component_dir)
+        except ValueError as exc:
+            raise ValueError(
+                f"safetensors 索引 shard 超出组件目录：{index_path}: {name}"
+            ) from exc
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"safetensors 索引声明的 shard 不存在：{candidate}（索引：{index_path}）"
+            )
+        files.append(candidate)
+    return tuple(files)
+
+
+def _load_indexed_component(
+    wl: Any,
+    comp: Any,
+    component_path: Path,
+    index_path: Path,
+    raw_cache: dict[tuple, dict] | None = None,
+) -> tuple[dict[str, Any], int | None, str | None]:
+    """Load a Diffusers-indexed component and apply its normal mflux mapping."""
+
+    shard_files = _indexed_safetensor_files(index_path)
+    cache_key = (str(component_path), comp.loading_mode, tuple(str(path) for path in shard_files))
+    if raw_cache is not None and cache_key in raw_cache:
+        raw = raw_cache[cache_key]
+    else:
+        raw: dict[str, Any] = {}
+        for shard in shard_files:
+            shard_weights, _metadata = mx.load(str(shard), return_metadata=True)
+            for name, value in dict(shard_weights).items():
+                if name in raw:
+                    raise ValueError(f"safetensors 分片包含重复权重键 {name!r}：{index_path}")
+                raw[name] = value
+        if raw_cache is not None:
+            raw_cache[cache_key] = raw
+
+    if comp.weight_prefix_filters is not None:
+        raw = {
+            key: value
+            for key, value in raw.items()
+            if any(key.startswith(prefix) for prefix in comp.weight_prefix_filters)
+        }
+
+    if comp.key_transform is not None:
+        transformed = {}
+        for key, value in raw.items():
+            transformed_key = comp.key_transform(key)
+            if transformed_key is not None:
+                transformed[transformed_key] = value
+        raw = transformed
+
+    if comp.weight_transform is not None:
+        raw = {key: comp.weight_transform(key, value) for key, value in raw.items()}
+
+    if comp.precision is not None:
+        raw = wl._convert_precision(raw, comp.precision)
+
+    if comp.mapping_getter is None:
+        if comp.bulk_transform is not None:
+            raw = {key: comp.bulk_transform(value) for key, value in raw.items()}
+        from mlx.utils import tree_unflatten  # type: ignore
+
+        return tree_unflatten(list(raw.items())), None, None
+
+    mapped = runtime.import_object(
+        "mflux.models.common.weights.mapping.weight_mapper:WeightMapper"
+    ).apply_mapping(
+        hf_weights=raw,
+        mapping=comp.mapping_getter(),
+        num_blocks=comp.num_blocks,
+        num_layers=comp.num_layers,
+    )
+    return mapped, None, None
 
 
 def _load_single_file(wl: Any, comp: Any, file: Path) -> tuple[dict[str, Any], int | None, str | None]:

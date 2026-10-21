@@ -3,7 +3,9 @@
 - `MlxVAEDecodeRawPIL`（原节点，保留以兼容既有工作流）：自带
   `model_type/model_path/precision/quantize` widget，一步到位解出 PIL；
 - `MlxVAEDecoder`（新）：从 `vae` handle（MlxVAELoader 输出）+ `latents` 解出 PIL，
-  与 `MlxVAEEncoder` 接同一个 handle 时必然共用同一份 VAE 实例。
+  与 `MlxVAEEncoder` 接同一个 handle 时必然共用同一份 VAE 实例。Fibo-2
+  例外：统一采样器已经完成 native MLX VAE 解码，节点只转发采样器缓存的图片，
+  不会再次解码。
 
 两个节点的 VAE 缓存键**完全相同**（都走 `pipeline.vae_component`），因此同一条
 工作流里只会驻留一份 VAE（键里含 model_type，升级后首次运行会重新加载一次，
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 from .. import image, paths, pipeline, runtime
 from ..cache import CACHE
+from ..fibo2 import backend as fibo2_backend
 from ..types import (
     MlxPilImage,
     MlxVaeHandle,
@@ -55,6 +58,31 @@ def _cached_latents(latents):
     if not hit:
         raise RuntimeError("latent 数组不在缓存里，请重新运行 MlxKSamplerMLX")
     return arr
+
+
+def _cached_fibo2_images(latents, batch_index: int) -> MlxPilImage:
+    """Return the image already decoded by the native Fibo-2 sampler.
+
+    Fibo-2's ``latents`` output is a handle for the sampler's internal MLX
+    state, not a generic VAE latent contract.  The sampler nevertheless keeps
+    the decoded PIL payload so workflows made against the older
+    ``latents -> MlxVAEDecoder`` layout remain usable.
+    """
+
+    cached, hit = CACHE.get("fibo2_images", latents.cache_key)
+    if not hit:
+        raise RuntimeError(
+            "Fibo-2 的已解码图片不在缓存里，请重新运行 MlxKSamplerMLX；"
+            "推荐直接连接采样器的 images 输出"
+        )
+    if not isinstance(cached, MlxPilImage):
+        raise RuntimeError("Fibo-2 图片缓存格式无效，请重新运行 MlxKSamplerMLX")
+    return MlxPilImage(
+        images=cached.images,
+        batch_index=batch_index,
+        fps=cached.fps,
+        audio=cached.audio,
+    )
 
 
 def _decode_breeze(latents, batch_index: int) -> MlxPilImage:
@@ -163,6 +191,10 @@ class MlxVAEDecodeRawPIL:
 
     def decode(self, latents, model_type, model_path, precision, quantize, batch_index,
                audio_vae=None):
+        if model_type == "fibo2":
+            raise ValueError(
+                "Fibo 2 由统一 MlxKSamplerMLX 直接输出 IMAGE；不会生成可由 MLX VAE 解码的 latent"
+            )
         entry = entry_for(model_type)
         validate_model_family(model_type, model_path)
         if not entry.supported:
@@ -216,6 +248,15 @@ class MlxVAEDecoder:
     CATEGORY = "MLX/Gen"
 
     def decode(self, vae, latents, batch_index, audio_vae=None):
+        if isinstance(vae, fibo2_backend.Fibo2VaeHandle):
+            if getattr(latents, "model", "") != "fibo2":
+                raise ValueError("Fibo-2 VAE 只能解码 Fibo-2 MLX latent")
+            return (_cached_fibo2_images(latents, batch_index),)
+        if getattr(latents, "model", "") == "fibo2":
+            raise ValueError(
+                "Fibo-2 latent 必须连接 Fibo-2 VAE handle；"
+                "推荐直接使用 MlxKSamplerMLX 的 images 输出"
+            )
         if vae is None or not isinstance(vae, MlxVaeHandle):
             raise ValueError(
                 "必须连接「MLX VAE 加载器」的输出；"
