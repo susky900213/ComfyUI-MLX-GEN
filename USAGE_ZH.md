@@ -145,6 +145,67 @@ mlx/
 模型下拉框是在扫描模型目录后生成的。新放入模型后如果下拉框没有更新，请完整重启
 ComfyUI，而不只是刷新浏览器。
 
+### 1.4 MOSS 提示词强化（本地 OpenAI 兼容服务）
+
+新增节点 **MOSS 提示词强化（本地 OpenAI）**，用于把简短描述交给本地大语言模型，
+生成 MOSS-Image-Base 更容易理解的提示词。节点不加载额外图像模型，只通过 Python 标准库
+调用 OpenAI 兼容接口，默认地址为：
+
+```text
+http://127.0.0.1:8001/v1/chat/completions
+```
+
+本地服务需要提供非流式 `POST /v1/chat/completions`，请求和响应遵循常见 OpenAI 格式，
+响应至少应包含：
+
+```json
+{"choices": [{"message": {"content": "expanded prompt"}}]}
+```
+
+节点中的 `model` 默认填写 `MOSS-Image-Base`，但实际本地服务使用的模型名可能不同，
+请按服务的模型 ID 修改。`base_url` 可以填写 `http://127.0.0.1:8001`、带 `/v1` 的
+地址，或完整的 `/v1/chat/completions` 地址；需要鉴权时再填写 `api_key`，本地服务通常
+留空即可。
+
+`mode` 有三种：
+
+- **自然语言**：输出一个连贯的详细正向提示词，适合普通文生图。
+- **标签**：只输出逗号分隔的标签，按 MOSS 文档建议的
+  `Quality → Score → Meta → Year → Character → Series → Artist → General` 排序。
+- **JSON 布局**：输出并校验 MOSS layout JSON，包括 `summary`、`items`、
+  `bbox_coord_space="abs_centralized"` 和 `bbox_format="yxyx"`。`canvas_width` /
+  `canvas_height` 用于告诉服务如何规划中心坐标。
+
+节点还有一个可选的 `image` 输入。可以把 ComfyUI 的 **Load Image** 节点或其他
+`IMAGE` 输出连接到这里；节点会取第一张图，与文字提示词一起发送给支持视觉输入的
+MOSS/OpenAI 兼容服务。这样模型会根据参考图的内容，并结合你填写的提示词生成新的提示词。
+如果不连接图片，节点仍按纯文本模式工作。
+
+节点支持两种记忆。`context_turns` 会把当前节点最近几轮“用户请求 → 增强结果”
+作为上下文发给服务，适合连续修改同一张图的提示词；设为 `0` 即关闭上下文。打开
+`save_memory` 后，本次成功结果还会保存为该节点的长期记忆，后续请求会将其作为偏好
+和连续性参考发送给模型。图片本身不会写入记忆文件，只保存文字请求和文字结果。
+
+节点上的 **清除上下文** 和 **删除长期记忆** 按钮可以手动清除对应内容。记忆按 ComfyUI
+节点 ID 隔离，不同 MOSS 节点不会互相串用；记忆文件默认保存在 ComfyUI 用户目录下的
+`comfyui_mlx_gen_moss_memory.json`。如需改位置，可设置环境变量
+`COMFYUI_MLX_GEN_MOSS_MEMORY_FILE`。如果服务不接受带历史的多轮消息，可将
+`context_turns` 设为 `0`，并删除长期记忆。
+
+输出是 `STRING`，可以直接连接到 **MLX 文本编码器**的 `prompt` 输入。执行完成后，
+节点还会自动把生成结果写入所有已连接的文本编码器输入框（`text` widget），因此在
+ComfyUI 画布中会直接看到生成后的提示词：
+
+```text
+MOSS 提示词强化（本地 OpenAI）.enhanced_prompt
+    └─→ MlxTextEncoder.prompt
+MlxTextEncoder.condition
+    └─→ MlxKSamplerMLX.positive
+```
+
+MOSS 的自然语言、标签和 JSON layout 规则以 `src/comfyui_mlx_gen/moss/moss.md` 为准。
+图像采样本身仍使用 MOSS 的 Loader、VAE 和采样器；该节点只负责提示词增强。
+
 ### 1.5 Raon Speech 节点
 
 Raon 的 `Raon Speech 模型加载` 是轻量配置 Loader；它不会在排队 Loader 时加载 21B

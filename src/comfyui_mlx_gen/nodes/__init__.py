@@ -34,6 +34,7 @@ from .qwen_image_21_folder_replace import MlxQwenImage21FolderReplace
 from .flux3_klein_folder_edit import MlxFlux3KleinFolderEdit
 from .whisper_transcribe import MlxWhisperTranscribe
 from .qwen_image_pe import MlxQwenImagePEI2I, MlxQwenImagePET2I
+from .moss_prompt_enhancer import MlxMossPromptEnhancer
 from .yue2_melody import MlxYue2MelodyFromAudio
 from .yue2_abc import MlxYue2LoadABC
 from .raon import RaonModelLoader, RaonTTS, RaonSTT, RaonSpeechChat, RaonSpeechChatAudio
@@ -74,6 +75,7 @@ __all__ = [
     "MlxWhisperTranscribe",
     "MlxQwenImagePET2I",
     "MlxQwenImagePEI2I",
+    "MlxMossPromptEnhancer",
     "MlxYue2MelodyFromAudio",
     "MlxYue2LoadABC",
     "RaonModelLoader",
