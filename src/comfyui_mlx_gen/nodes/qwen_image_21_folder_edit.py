@@ -100,16 +100,33 @@ def _comfy_input_directory() -> Path:
 
 
 def _resolve_input_directory(folder_token: str) -> Path:
-    """Resolve a folder-picker token below ComfyUI's ``input/`` directory."""
+    """Resolve either an uploaded token or a manually entered local path.
+
+    Folder-picker selections are represented by a relative token below
+    ComfyUI's ``input/`` directory. When the user types a path directly, it
+    is interpreted on the machine running ComfyUI (not on the browser
+    machine), so an absolute path is accepted as well.
+    """
 
     token = str(folder_token).strip().replace("\\", "/")
     if not token:
-        raise ValueError("请先点击「选择输入文件夹」并选择图片文件夹")
+        raise ValueError("请点击「选择输入文件夹」，或输入 ComfyUI 服务器上的文件夹路径")
+
+    manual_path = Path(token).expanduser()
+    if manual_path.is_absolute():
+        input_path = manual_path.resolve()
+        if not input_path.is_dir():
+            raise ValueError(f"手动输入的文件夹不存在或不是目录：{input_path}")
+        return input_path
+
     relative = Path(token)
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("输入文件夹必须是 ComfyUI input/ 下的相对目录，不能使用绝对路径或 ..")
+    if ".." in relative.parts:
+        raise ValueError("输入文件夹不能包含 ..")
     if not relative.parts or relative.parts[0] != UPLOAD_ROOT:
-        raise ValueError(f"输入文件夹必须来自「选择输入文件夹」上传的 {UPLOAD_ROOT}/ 目录")
+        raise ValueError(
+            f"相对路径必须来自「选择输入文件夹」上传的 {UPLOAD_ROOT}/ 目录；"
+            "手动输入时请填写服务器上的绝对路径"
+        )
 
     root = _comfy_input_directory().expanduser().resolve()
     input_path = (root / relative).resolve()
@@ -153,7 +170,7 @@ class MlxQwenImage21FolderEdit:
                     {
                         "default": "",
                         "multiline": False,
-                        "tooltip": "点击「选择输入文件夹」选择图片文件夹；图片会上传到 ComfyUI input/",
+                        "tooltip": "可点击「选择输入文件夹」上传图片，也可直接输入 ComfyUI 服务器上的文件夹绝对路径",
                     },
                 ),
                 "vae": (vae, {}),

@@ -84,7 +84,7 @@ class MlxLoadImagesFromDirectory:
 
     def load(self, input_directory):
         images, filenames = _load_images(input_directory)
-        payload = MlxPilImage(images=tuple(images), batch_index=-1)
+        payload = MlxPilImage(images=tuple(images), batch_index=-1, filenames=filenames)
         print(f"[MlxLoadImagesFromDirectory] 已读取 {len(images)} 张图片：{input_directory}")
         return payload, "\n".join(filenames), len(filenames)
 

@@ -101,7 +101,9 @@ function installFolderPicker(node) {
   if (!directoryWidget || typeof node.addWidget !== "function") return;
 
   node.__mlxQwenImage21FolderPicker = true;
-  directoryWidget.hidden = true;
+  // Keep the STRING widget visible so users can type a folder path manually.
+  // The button below it is the optional browser-folder upload flow.
+  directoryWidget.hidden = false;
   const button = node.addWidget(
     "button",
     "选择输入文件夹",
@@ -110,12 +112,12 @@ function installFolderPicker(node) {
     { serialize: false },
   );
 
-  // addWidget appends by default. Put the visible folder control where the
-  // hidden directory value used to be, before the model handles and prompts.
+  // addWidget appends by default. Put the optional picker immediately after
+  // the editable directory field, before the model handles and prompts.
   const directoryIndex = node.widgets.indexOf(directoryWidget);
   const buttonIndex = node.widgets.indexOf(button);
   node.widgets.splice(buttonIndex, 1);
-  node.widgets.splice(directoryIndex, 0, button);
+  node.widgets.splice(directoryIndex + 1, 0, button);
 
   const folderName = node.properties?.mlx_qwen_image_21_folder_name;
   const imageCount = node.properties?.mlx_qwen_image_21_image_count;

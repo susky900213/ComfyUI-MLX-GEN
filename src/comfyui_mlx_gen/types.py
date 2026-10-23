@@ -451,7 +451,7 @@ class MlxReferenceImages:
 class MlxPilImage:
     """图片 / 帧序列载荷（H3 用它同时携带帧率与音频轨）。
 
-    图片链路只用 `images` / `batch_index`（`fps` / `audio` 保持默认值）；
+    图片链路使用 `images` / `batch_index` / `filenames`（`fps` / `audio` 保持默认值）；
     MiniMax-H3 会把一段视频的帧（`images`，按顺序）+ 帧率（`fps=24`）+
     立体声波形（`audio`，`h3/video.py` 的 `AudioTrack`）一起装在这里，
     交给 `MlxPilToTorch` 转成 ComfyUI 的 IMAGE / MASK / AUDIO。
@@ -461,6 +461,7 @@ class MlxPilImage:
     batch_index: int = -1  # -1 = 整批
     fps: float = 24.0  # 播放帧率（H3 固定 24；图片链路不看）
     audio: Any = None  # H3 / YuE2 的 AudioTrack（图片链路恒为 None）
+    filenames: tuple[str, ...] = ()  # 可选的源文件名（与 images 一一对应）
 
 
 # --- 模型配置（数据） ---

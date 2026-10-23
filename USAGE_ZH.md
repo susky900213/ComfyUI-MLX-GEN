@@ -1054,7 +1054,7 @@ conditional 与 unconditional 两套 Transformer。
 | **MLX VAE 解码** `MlxVAEDecoder` | `vae`、`latents`、`batch_index`，H3 可选第二个 `audio_vae` | 插件内部小写 `images` | 推荐解码节点。图片得到 PIL 图像；H3 可在一个载荷中得到视频帧和音轨；YuE2/Breeze 得到音轨。`batch_index=-1` 表示保留全部批次。解码器与采样器的 `model_type` 必须一致。 |
 | **MLX VAE 解码（PIL）** `MlxVAEDecodeRawPIL` | `latents`，以及节点内的 `model_type`、`model_path`、`precision`、`quantize`、`batch_index`；H3 可选 `audio_vae` | 插件内部小写 `images` | 旧的一体式解码节点，为已有工作流保留。它把 VAE 选择 widget 内置在解码节点中；新工作流建议使用 `MlxVAELoader → MlxVAEDecoder`。 |
 | **MLX PIL → 张量** `MlxPilToTorch` | 插件内部小写 `images` | 原生 `IMAGE`、`MASK`、`AUDIO` | 把载荷转换为 ComfyUI 可预览/保存的类型。图片/视频使用 `IMAGE`，YuE2、Breeze 和带声音的 H3 使用 `AUDIO`。纯音频载荷会给图片输出一个 1×1 黑图占位。 |
-| **MLX 保存图片** `MlxSaveImage` | 插件内部小写 `images`、`filename_prefix`、`capture` | 无（输出节点） | 不经过 Torch，直接保存内部 PIL。实际目录固定为本仓库 `output/MlxSaveImage/<filename_prefix>/`，不是 ComfyUI 主目录的 `output/`。`capture=<auto>` 时写时间戳 PNG 及同名 JSON；自定义时写 `<capture>_<序号>.png` 且不写 JSON。只保存图片，不保存音频。 |
+| **MLX 保存图片** `MlxSaveImage` | 插件内部小写 `images`、`filename_prefix`、`capture`；可选 `output_directory`、`source_filenames` | 无（输出节点） | 不经过 Torch，直接保存内部 PIL。默认写入本仓库 `output/MlxSaveImage/<filename_prefix>/`，也可在 `output_directory` 指定文件夹。`filename_prefix` 留空时按源文件名保存（扩展名统一为 `.png`；没有源文件名时回退为 `image_0000.png`）；非空时，`capture=<auto>` 写时间戳 PNG 及同名 JSON，自定义时写 `<capture>_<序号>.png` 且不写 JSON。只保存图片，不保存音频。 |
 
 ### 5.6 语音识别节点
 
@@ -1091,6 +1091,10 @@ conditional 与 unconditional 两套 Transformer。
 ```text
 <ComfyUI-MLX-GEN>/output/MlxSaveImage/<filename_prefix>/
 ```
+
+也可以填写 `output_directory` 指定任意保存文件夹。要让文件夹输入节点的源文件名继续传到保存节点，
+可以把 `MlxLoadImagesFromDirectory.filenames` 接到 `MlxSaveImage.source_filenames`；该节点也会优先使用
+`images` 载荷中携带的源文件名。此时把 `filename_prefix` 清空，输出会使用源文件主名并统一保存为 PNG。
 
 当 `capture=<auto>` 时，会同时写入同名 metadata JSON。
 

@@ -625,18 +625,23 @@ def test_folder_picker_keeps_selected_folder_name_and_image_output():
     assert "const subfolder = `${UPLOAD_ROOT}/${folderName}`;" in picker
     assert "node.properties.mlx_qwen_image_21_output_directory = `${subfolder}/image`;" in picker
     assert "输出：image/" in picker
+    assert "directoryWidget.hidden = false;" in picker
+    assert "node.widgets.splice(directoryIndex + 1, 0, button);" in picker
 
 
-def test_folder_token_resolves_only_below_comfy_input(tmp_path, monkeypatch):
+def test_folder_token_and_manual_path_resolve_to_input_directories(tmp_path, monkeypatch):
     comfy_input = tmp_path / "comfy-input"
     selected = comfy_input / "mlx_qwen_image_21" / "batch"
     selected.mkdir(parents=True)
     monkeypatch.setattr(folder_module, "_comfy_input_directory", lambda: comfy_input)
 
     assert folder_module._resolve_input_directory("mlx_qwen_image_21/batch") == selected
-    with pytest.raises(ValueError, match=r"不能使用绝对路径或 \.\."):
-        folder_module._resolve_input_directory(str(selected))
-    with pytest.raises(ValueError, match=r"不能使用绝对路径或 \.\."):
+    manual = tmp_path / "manually-entered"
+    manual.mkdir()
+    assert folder_module._resolve_input_directory(str(manual)) == manual.resolve()
+    with pytest.raises(ValueError, match="手动输入的文件夹不存在或不是目录"):
+        folder_module._resolve_input_directory(str(tmp_path / "missing"))
+    with pytest.raises(ValueError, match=r"不能包含 \.\."):
         folder_module._resolve_input_directory("mlx_qwen_image_21/../outside")
     with pytest.raises(ValueError, match="必须来自.*选择输入文件夹"):
         folder_module._resolve_input_directory("other-folder/batch")
