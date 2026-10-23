@@ -25,6 +25,18 @@ FIBO2_TRANSFORMER_CLASS = "BriaFibo2Transformer2DModel"
 FIBO2_MAX_IMAGES = 5
 FIBO2_TURBO_STEPS = 4
 FIBO2_TURBO_GUIDANCE = 1.0
+# Hugging Face Diffusers' BriaFibo2Pipeline uses 4096 for
+# ``tokenizer_max_length`` and ``max_sequence_length``.  Keep this name
+# implementation-specific: Bria's public Fibo-2 materials do not document
+# 4096 as a model-architecture hard context limit, while the underlying
+# Qwen3-VL tokenizer advertises a larger ``model_max_length``.
+FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH = 4096
+# The bundled Qwen3-VL tokenizer advertises this model context size.  Expose it
+# as the configurable ceiling rather than treating Diffusers' 4096 runtime
+# default as a hard stop.  Values above 4096 are experimental for Fibo-2 and
+# can require substantially more unified memory because attention is quadratic
+# in the resulting text + visual sequence length.
+FIBO2_TOKENIZER_MODEL_MAX_LENGTH = 262_144
 # Fibo 2 was merged after the latest released Diffusers used by ComfyUI
 # Desktop.  Pin the known-good upstream commit instead of asking users to
 # guess an unreleased version number.
@@ -59,6 +71,9 @@ class Fibo2ModelHandle:
     cache_key: str = ""
     loras: tuple[LoraRef, ...] = ()
     quantize: int = 0
+    # Native MLX free-buffer cache limit selected by the unified Transformer
+    # loader.  It is a runtime policy, not part of the checkpoint weights.
+    compile_cache_limit: int = 0
 
     @property
     def model_type(self) -> str:
@@ -71,9 +86,9 @@ class Fibo2ModelHandle:
 class Fibo2ClipHandle:
     """Lazy CLIP/text-component configuration for the unified CLIP socket.
 
-    Fibo 2 owns its Qwen3-VL component inside the Diffusers pipeline.  This
-    handle deliberately carries configuration and LoRA references only; it is
-    never an MLX text encoder and is materialized by ``run_pipeline``.
+    Fibo 2 owns its Qwen3-VL component inside the model snapshot.  This handle
+    deliberately carries configuration and LoRA references only; it is never
+    an MLX text encoder and is materialized by the sampler backend.
     """
 
     model_path: str
@@ -82,6 +97,7 @@ class Fibo2ClipHandle:
     cache_key: str = ""
     loras: tuple[LoraRef, ...] = ()
     quantize: int = 0
+    max_length: int = FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH
 
     @property
     def model_type(self) -> str:
@@ -90,6 +106,9 @@ class Fibo2ClipHandle:
     @property
     def path(self) -> str:
         return self.model_path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_length", normalize_sequence_length(self.max_length))
 
 
 @dataclass(frozen=True)
@@ -113,6 +132,21 @@ class Fibo2VaeHandle:
 
 
 _PIPELINE_CACHE: dict[tuple[Any, ...], Any] = {}
+
+
+def normalize_sequence_length(value: int) -> int:
+    """Validate a user-selected native MLX Fibo-2 sequence budget."""
+
+    try:
+        length = int(value)
+    except (TypeError, ValueError) as exc:
+        raise Fibo2ValidationError(f"Fibo-2 max_length 必须是整数，收到 {value!r}") from exc
+    if length < 1 or length > FIBO2_TOKENIZER_MODEL_MAX_LENGTH:
+        raise Fibo2ValidationError(
+            "Fibo-2 max_length 必须在 1 到 "
+            f"{FIBO2_TOKENIZER_MODEL_MAX_LENGTH} 之间，收到 {length}"
+        )
+    return length
 
 
 def model_cache_key(

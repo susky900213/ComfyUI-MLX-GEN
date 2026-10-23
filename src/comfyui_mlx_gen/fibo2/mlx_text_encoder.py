@@ -12,6 +12,7 @@ from mlx import nn
 from ..h3.model.h3_text_encoder.qwen3_vl_model import rope_index
 from ..h3.model.h3_text_encoder.qwen3_vl_text_model import Qwen3VLTextModel
 from ..h3.model.h3_text_encoder.qwen3_vl_vision_model import Qwen3VLVisionModel, preprocess_image
+from .backend import FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH, normalize_sequence_length
 
 
 VISION_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
@@ -79,9 +80,9 @@ def generation_prompt(prompt: str) -> str:
 class Fibo2TextEncoder(nn.Module):
     """Qwen3-VL-4B, retaining the six hidden-state bundles Fibo-2 consumes."""
 
-    def __init__(self, *, max_length: int = 4096):
+    def __init__(self, *, max_length: int = FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH):
         super().__init__()
-        self.max_length = int(max_length)
+        self.max_length = normalize_sequence_length(max_length)
         self.language_model = Qwen3VLTextModel(
             vocab_size=151936,
             hidden_size=2560,
@@ -144,7 +145,17 @@ class Fibo2TextEncoder(nn.Module):
             output.append(hidden)
         return output
 
-    def encode(self, tokenizer: Any, prompt: str, images: Sequence[Any] = ()) -> tuple[mx.array, mx.array]:
+    def encode(
+        self,
+        tokenizer: Any,
+        prompt: str,
+        images: Sequence[Any] = (),
+        *,
+        max_length: int | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        budget = normalize_sequence_length(
+            self.max_length if max_length is None else max_length
+        )
         selected = list(images)
         body = edit_prompt(prompt, len(selected)) if selected else generation_prompt(prompt)
         raw = PROMPT_TEMPLATE.format(body)
@@ -169,8 +180,13 @@ class Fibo2TextEncoder(nn.Module):
                 expanded.extend([IMAGE_TOKEN_ID] * (grid[0] * grid[1] * grid[2] // (merge * merge)))
                 image_index += 1
             ids = expanded
-        if len(ids) > self.max_length:
-            raise ValueError(f"Fibo-2 prompt 编码后超过 max_length={self.max_length}")
+        if len(ids) > budget:
+            raise ValueError(
+                f"Fibo-2 prompt 编码后有 {len(ids)} tokens，超过当前 MLX 编码预算 "
+                f"max_length={budget}；请在 MlxClipLoader 提高 max_length，或缩短提示词/"
+                "减少参考图，并确认参考图由当前版本的 MlxVAEEncoder 预处理。超过 4096 的预算"
+                "不是 Fibo-2 官方验证范围，且会显著增加统一内存占用"
+            )
         states = self._hidden_states(np.asarray(ids, dtype=np.int32), image_patches, image_grids)
         bundles = []
         for layers in TEXT_ENCODER_OUT_LAYERS:

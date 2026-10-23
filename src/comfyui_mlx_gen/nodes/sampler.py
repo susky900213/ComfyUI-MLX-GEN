@@ -53,26 +53,13 @@ from ..fibo2 import backend as fibo2_backend
 from ..h3 import pipeline as h3_pipeline
 from ..h3.latent_creator.h3_layout import valid_frame_counts
 from ..moss import lora as moss_lora
+from ..progress import SamplingProgress
 from ..qwen_image_21 import sampling as qwen21_sampling
-from ..types import (
-    CLIP,
-    condition,
-    entry_for,
-    model,
-    model_types,
-    ref_images,
-    vae,
-    validate_model_family,
-    MlxPilImage,
-)
+from ..types import condition, entry_for, model, model_types, ref_images, validate_model_family
 
 SCHEDULERS = [
     "linear",
     "flow_match_euler_discrete",
-    # Kept for Fibo-2 workflows created before the unified node used the
-    # generic flow-match label.  Fibo-2's official Diffusers pipeline owns its
-    # scheduler; the value is accepted for workflow validation only.
-    "fibo_flow_match_euler",
     "flux3_flow_map",
     "seedvr2_euler",
     "ideogram4_default",
@@ -179,28 +166,10 @@ class MlxKSamplerMLX:
                         "tooltip": "YuE2 外部 ABC 旋律；连接后跳过自动 ABC 规划",
                     },
                 ),
-                # Fibo 2 only: the official pipeline owns its Qwen3-VL and
-                # FLUX.2 VAE; these optional handles carry their LoRAs/config.
-                "clip": (CLIP, {}),
-                "vae": (vae, {}),
-                "prompt": (
-                    "STRING",
-                    {"forceInput": True, "tooltip": "Fibo 2 可选直接 prompt；优先于 positive condition"},
-                ),
-                "negative_prompt": (
-                    "STRING",
-                    {"forceInput": True, "tooltip": "Fibo 2 可选 negative prompt"},
-                ),
-                "image": ("IMAGE", {"tooltip": "Fibo 2 source image"}),
-                "mask": ("MASK", {"tooltip": "Fibo 2 mask；只能与一张 source image 一起使用"}),
-                "reference_1": ("IMAGE", {}),
-                "reference_2": ("IMAGE", {}),
-                "reference_3": ("IMAGE", {}),
             },
         }
 
-    RETURN_TYPES = ("latents", "images")
-    RETURN_NAMES = ("latents", "images")
+    RETURN_TYPES = ("latents",)
     FUNCTION = "sample"
     CATEGORY = "MLX/Gen"
 
@@ -224,39 +193,9 @@ class MlxKSamplerMLX:
         cot="full",
         max_tokens=9000,
         abc=None,
-        clip=None,
-        vae=None,
-        prompt=None,
-        negative_prompt=None,
-        image=None,
-        mask=None,
-        reference_1=None,
-        reference_2=None,
-        reference_3=None,
     ):
         if model is None:
             raise ValueError("必须连接 MlxTransformerLoader 的输出")
-        if isinstance(model, fibo2_backend.Fibo2ModelHandle):
-            if scheduler not in {"fibo_flow_match_euler", "flow_match_euler_discrete"}:
-                raise ValueError("Fibo-2 MLX 需要 scheduler=fibo_flow_match_euler")
-            return self._sample_fibo2(
-                model,
-                positive,
-                negative,
-                seed,
-                steps,
-                width,
-                height,
-                batch_size,
-                guidance,
-                clip=clip,
-                vae=vae,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=image,
-                mask=mask,
-                references=(reference_1, reference_2, reference_3),
-            )
         if positive is None or negative is None:
             raise ValueError(
                 "必须分别连接 MlxTextEncoder 的输出作为正/负条件，"
@@ -269,6 +208,21 @@ class MlxKSamplerMLX:
         if positive.clip.model_type != model.model_type:
             raise ValueError(
                 f"文本编码器选的是 {positive.clip.model_type}，与采样器的 {model.model_type} 不匹配"
+            )
+        if isinstance(model, fibo2_backend.Fibo2ModelHandle):
+            if scheduler != "flow_match_euler_discrete":
+                raise ValueError("Fibo-2 MLX 需要 scheduler=flow_match_euler_discrete")
+            return self._sample_fibo2(
+                model,
+                positive,
+                negative,
+                seed,
+                steps,
+                width,
+                height,
+                batch_size,
+                guidance,
+                ref_images=ref_images,
             )
         # if positive.clip.path != model.model_path:
         #     raise ValueError(
@@ -592,7 +546,7 @@ class MlxKSamplerMLX:
             # 闭包跨越采样节点继续持有整套权重。
             comps = None
             pipeline.release_sampler_components(entry, model, CACHE)
-        return (handle, None)
+        return (handle,)
 
     @staticmethod
     def _sample_fibo2(
@@ -606,64 +560,74 @@ class MlxKSamplerMLX:
         batch_size,
         guidance,
         *,
-        clip,
-        vae,
-        prompt,
-        negative_prompt,
-        image,
-        mask,
-        references,
+        ref_images,
     ):
-        """Run Fibo-2 entirely through the native MLX backend."""
+        """Run Fibo-2 through the unchanged sampler contract."""
 
-        from .. import image as image_mod
         from ..fibo2 import mlx_backend
 
-        positive_clip = getattr(positive, "clip", None) if positive is not None else None
-        negative_clip = getattr(negative, "clip", None) if negative is not None else None
-        clip = clip or positive_clip
-        if negative_clip is not None and clip is not None and negative_clip != clip:
-            raise ValueError("Fibo 2 正/负条件必须使用同一个 CLIP handle")
-        if clip is not None and not isinstance(clip, fibo2_backend.Fibo2ClipHandle):
+        requested_width, requested_height = int(width), int(height)
+        width, height = mlx_backend.aligned_dimensions(requested_width, requested_height)
+        if (width, height) != (requested_width, requested_height):
+            print(
+                f"[Fibo-2 采样] 目标画布自动对齐到 16 的倍数："
+                f"{requested_width}×{requested_height} → {width}×{height}",
+                flush=True,
+            )
+        if not isinstance(positive.clip, fibo2_backend.Fibo2ClipHandle):
             raise ValueError("Fibo 2 的 clip 必须连接统一 CLIP Loader 的 Fibo2ClipHandle")
-        if vae is not None and not isinstance(vae, fibo2_backend.Fibo2VaeHandle):
-            raise ValueError("Fibo 2 的 vae 必须连接统一 VAE Loader 的 Fibo2VaeHandle")
-
-        source_images = mlx_backend.image_batch_to_pil(image)
-        if fibo2_backend.is_edit_turbo_model_path(model.model_path) and not source_images:
-            raise ValueError("Fibo-2.0-edit-turbo 必须连接 image source；reference 不能替代 source")
-        if mask is not None:
-            raise NotImplementedError("Fibo-2 MLX 当前不支持 mask inpainting；请先断开 mask")
-        prompt_text = str(prompt if prompt is not None else getattr(positive, "text", "") or "")
-        negative_text = (
-            str(negative_prompt)
-            if negative_prompt is not None
-            else str(getattr(negative, "text", "") or "")
-        )
+        if positive.clip.model_path != model.model_path:
+            raise ValueError(
+                "Fibo 2 的文本编码器与 Transformer 必须选择同一个 checkpoint："
+                f"{positive.clip.model_path!r} != {model.model_path!r}"
+            )
+        prompt_text = str(positive.text or "")
+        negative_text = str(negative.text or "")
         if not prompt_text.strip():
-            raise ValueError("Fibo 2 prompt 不能为空；请连接 positive condition 或 prompt")
-        all_images = list(source_images)
-        for reference in references:
-            all_images.extend(mlx_backend.image_batch_to_pil(reference))
+            raise ValueError("Fibo 2 prompt 不能为空；请连接非空 positive condition")
+        images = None
+        context_latents = None
+        reference_size_routes = None
+        if ref_images is not None:
+            if getattr(ref_images, "model_type", "") != "fibo2" or getattr(
+                ref_images, "edit_kind", ""
+            ) != "fibo2":
+                raise ValueError("Fibo 2 的 ref_images 必须由 Fibo-2 VAE handle 编码")
+            if int(ref_images.width) != int(width) or int(ref_images.height) != int(height):
+                raise ValueError(
+                    "Fibo 2 的 ref_images 目标画布必须与采样器一致："
+                    f"参考图是 {ref_images.width}×{ref_images.height}，"
+                    f"采样器是 {int(width)}×{int(height)}"
+                )
+            encoded, hit = CACHE.get("ref_encoding", ref_images.cache_key)
+            if not hit:
+                raise RuntimeError("Fibo-2 参考图不在缓存里，请重新运行 MlxVAEEncoder")
+            images = encoded["images"]
+            context_latents = encoded["latents"]
+            reference_size_routes = encoded.get("size_routes")
+        if fibo2_backend.is_edit_turbo_model_path(model.model_path) and not images:
+            raise ValueError("Fibo-2.0-edit-turbo 必须通过 ref_images 连接 source image")
+        # Fibo-2 uses a dedicated sampler path and therefore does not reach the
+        # common apply_cache_limit call below.  Apply the loader selection before
+        # its Transformer/Qwen weights and denoising buffers are materialized.
+        runtime.apply_cache_limit(model.compile_cache_limit, label="fibo2")
+        progress = SamplingProgress(int(steps) + 4 + int(float(guidance) > 1.0))
         latent = mlx_backend.run(
             model,
+            clip=positive.clip,
             prompt=prompt_text,
             negative_prompt=negative_text or None,
-            images=all_images or None,
+            images=images,
+            context_latents=context_latents,
+            reference_size_routes=reference_size_routes,
             seed=int(seed),
             steps=int(steps),
             guidance=float(guidance),
             width=int(width),
             height=int(height),
             batch_size=int(batch_size),
+            on_progress=lambda _label, current, total: progress.update_absolute(
+                current, total
+            ),
         )
-        array, hit = CACHE.get("component_weights", latent.cache_key)
-        if not hit:
-            raise RuntimeError("Fibo-2 MLX latent 不在缓存里，请重新运行采样器")
-        decoded = mlx_backend.decode_latent(model, array)
-        images = MlxPilImage(images=image_mod.to_pil(decoded))
-        # Fibo-2 的 latent 是 native MLX handle，不是通用 VAE decoder 可再次
-        # 物化的 latent。保存已完成的解码结果，既服务于 images 输出，也兼容
-        # 早期工作流中 latents → MlxVAEDecoder 的旧连线。
-        CACHE.get_or_create("fibo2_images", latent.cache_key, lambda: images)
-        return (latent, images)
+        return (latent,)

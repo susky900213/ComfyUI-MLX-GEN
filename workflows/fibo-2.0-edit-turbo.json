@@ -1,0 +1,258 @@
+{
+  "id": "mlx-fibo-2-0-edit-turbo",
+  "revision": 0,
+  "last_node_id": 13,
+  "last_link_id": 14,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [40, 40],
+      "size": [380, 240],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "CLIP", "type": "CLIP", "links": [2, 3], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxClipLoader"},
+      "title": "Fibo 2 文本编码器（Native MLX）",
+      "widgets_values": ["fibo2", "text_encoder", "Fibo-2.0-edit-turbo", "bfloat16", 4096, 8]
+    },
+    {
+      "id": 2,
+      "type": "MlxTransformerLoader",
+      "pos": [40, 320],
+      "size": [380, 240],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "model", "type": "model", "links": [1], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTransformerLoader"},
+      "title": "Fibo-2.0-edit-turbo Transformer（Native MLX）",
+      "widgets_values": ["fibo2", "Fibo-2.0-edit-turbo", 8, "bfloat16", false, 2]
+    },
+    {
+      "id": 3,
+      "type": "MlxVAELoader",
+      "pos": [40, 600],
+      "size": [380, 220],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "vae", "type": "mlx_vae", "links": [4, 10], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAELoader"},
+      "title": "Fibo 2 VAE（参考图编码 + 结果解码）",
+      "widgets_values": ["fibo2", "Fibo-2.0-edit-turbo", "bfloat16", 8, "vae"]
+    },
+    {
+      "id": 4,
+      "type": "LoadImage",
+      "pos": [470, 40],
+      "size": [360, 360],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [5], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "title": "选择要编辑的源图",
+      "widgets_values": ["example.png"]
+    },
+    {
+      "id": 5,
+      "type": "MlxVAEEncoder",
+      "pos": [470, 440],
+      "size": [380, 280],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 4, "slot_index": 0},
+        {"name": "images", "type": "IMAGE", "link": 5, "slot_index": 1}
+      ],
+      "outputs": [
+        {"name": "ref_images", "type": "mlx_ref_images", "links": [8], "slot_index": 0},
+        {"name": "width", "type": "INT", "links": null, "slot_index": 1},
+        {"name": "height", "type": "INT", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxVAEEncoder"},
+      "title": "Fibo 2 源图条件（512×512）",
+      "widgets_values": [1, "stretch", 512, 512]
+    },
+    {
+      "id": 6,
+      "type": "MlxTextEncoder",
+      "pos": [900, 40],
+      "size": [440, 240],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": 2, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "condition", "type": "condition", "links": [6], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "编辑指令（描述希望得到的结果）",
+      "widgets_values": ["保持主体身份、姿态和画面构图不变，把背景替换成日落时的海滩，使用自然的电影感光线，细节清晰真实。"]
+    },
+    {
+      "id": 7,
+      "type": "MlxTextEncoder",
+      "pos": [900, 330],
+      "size": [440, 200],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": 3, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "condition", "type": "condition", "links": [7], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxTextEncoder"},
+      "title": "负向提示词（guidance=1 时不参与 CFG）",
+      "widgets_values": [""]
+    },
+    {
+      "id": 8,
+      "type": "MlxKSamplerMLX",
+      "pos": [1390, 180],
+      "size": [440, 540],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "model", "link": 1, "slot_index": 0},
+        {"name": "positive", "type": "condition", "link": 6, "slot_index": 1},
+        {"name": "negative", "type": "condition", "link": 7, "slot_index": 2},
+        {"name": "ref_images", "type": "mlx_ref_images", "link": 8, "slot_index": 3}
+      ],
+      "outputs": [
+        {"name": "latents", "type": "latents", "links": [9], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxKSamplerMLX"},
+      "title": "Fibo 2 Edit Turbo（固定 4 步 / guidance 1）",
+      "widgets_values": [0, 4, 512, 512, 1, 1.0, "flow_match_euler_discrete", 5, 12.0, 3.0, "auto", "full", 9000]
+    },
+    {
+      "id": 9,
+      "type": "MlxVAEDecoder",
+      "pos": [1880, 220],
+      "size": [360, 260],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "mlx_vae", "link": 10, "slot_index": 0},
+        {"name": "latents", "type": "latents", "link": 9, "slot_index": 1}
+      ],
+      "outputs": [
+        {"name": "images", "type": "images", "links": [11, 12], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "MlxVAEDecoder"},
+      "title": "Fibo 2 VAE 解码",
+      "widgets_values": [-1]
+    },
+    {
+      "id": 10,
+      "type": "MlxSaveImage",
+      "pos": [2290, 40],
+      "size": [350, 190],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "images", "link": 11, "slot_index": 0}
+      ],
+      "outputs": [],
+      "properties": {"Node name for S&R": "MlxSaveImage"},
+      "title": "保存 MLX PIL 输出",
+      "widgets_values": ["fibo-2-edit-turbo", "<auto>"]
+    },
+    {
+      "id": 11,
+      "type": "MlxPilToTorch",
+      "pos": [2290, 280],
+      "size": [350, 170],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "images", "link": 12, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [13, 14], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1},
+        {"name": "AUDIO", "type": "AUDIO", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "MlxPilToTorch"},
+      "title": "转换为 ComfyUI IMAGE",
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "SaveImage",
+      "pos": [2690, 240],
+      "size": [320, 300],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "IMAGE", "link": 13, "slot_index": 0}
+      ],
+      "outputs": [],
+      "properties": {"Node name for S&R": "SaveImage"},
+      "title": "ComfyUI 保存",
+      "widgets_values": ["ComfyUI-MLX-GEN-fibo-2-edit"]
+    },
+    {
+      "id": 13,
+      "type": "PreviewImage",
+      "pos": [2690, 590],
+      "size": [320, 300],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "IMAGE", "link": 14, "slot_index": 0}
+      ],
+      "outputs": [],
+      "properties": {"Node name for S&R": "PreviewImage"},
+      "title": "编辑结果预览",
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 2, 0, 8, 0, "model"],
+    [2, 1, 0, 6, 0, "CLIP"],
+    [3, 1, 0, 7, 0, "CLIP"],
+    [4, 3, 0, 5, 0, "mlx_vae"],
+    [5, 4, 0, 5, 1, "IMAGE"],
+    [6, 6, 0, 8, 1, "condition"],
+    [7, 7, 0, 8, 2, "condition"],
+    [8, 5, 0, 8, 3, "mlx_ref_images"],
+    [9, 8, 0, 9, 1, "latents"],
+    [10, 3, 0, 9, 0, "mlx_vae"],
+    [11, 9, 0, 10, 0, "images"],
+    [12, 9, 0, 11, 0, "images"],
+    [13, 11, 0, 12, 0, "IMAGE"],
+    [14, 11, 0, 13, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"ds": {"scale": 0.8, "offset": [20, 20]}},
+  "version": 0.4
+}

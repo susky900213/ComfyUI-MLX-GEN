@@ -23,6 +23,8 @@ VAE 由「MLX VAE 加载器」提供，本节点按 handle 物化 VAE 并编码�
 - qwen_image_21：每张图保持比例缩放到目标面积并对齐 32 倍数，同一份 RGBA 像素
   经原生 VAE encoder 变成 64 通道参考 latent，白底 RGB 副本交给 Qwen3-VL；最多
   10 张，支持 `ref_source` 保留异尺寸图的顺序。
+- fibo2：沿用同一个 `images` 入口和 `ref_images` 输出；本节点按官方处理语义生成
+  context latent，采样器只读取缓存，不接收 VAE 或 IMAGE，也不执行 VAE 编解码。
 
 数组存进 cache.py 的 "ref_encoding" 桶，输出 MlxReferenceImages（只带键）。
 输出类型 `mlx_ref_images` 只能接到 MlxKSamplerMLX 的可选入口 `ref_images`；
@@ -35,10 +37,13 @@ resize_mode, width, height`）——既有文档 / 冒烟脚本里的位置调�
 
 from __future__ import annotations
 
+import time
+
 from .. import image as image_mod
-from .. import pipeline
+from .. import pipeline, runtime
 from ..cache import CACHE
 from ..fibo2 import backend as fibo2_backend
+from ..progress import SamplingProgress
 from ..types import (
     MlxRefImageSource,
     MlxReferenceImages,
@@ -167,7 +172,7 @@ class MlxVAEEncoder:
             # ref_encoding 只保存编码后的数组 / PIL；参考图编码节点不应把 VAE
             # 继续留给后续采样器。
             vae_module = None
-            if isinstance(vae, MlxVaeHandle):
+            if isinstance(vae, (MlxVaeHandle, fibo2_backend.Fibo2VaeHandle)):
                 pipeline.release_vae_component(vae, CACHE)
 
     def _encode(
@@ -181,10 +186,132 @@ class MlxVAEEncoder:
         ref_source=None,
     ):
         if isinstance(vae, fibo2_backend.Fibo2VaeHandle):
-            raise ValueError(
-                "Fibo-2 的参考图由统一 MLX 采样器按官方 image processor 语义编码；"
-                "当前不能把 Fibo-2 handle 接到通用参考图编码节点"
+            from ..fibo2 import mlx_backend
+
+            if ref_source is not None:
+                raise ValueError("Fibo-2 参考图请通过 images 批次输入，暂不支持 ref_source")
+            if images is None:
+                raise ValueError("Fibo-2 编辑必须连接 source image 到 MlxVAEEncoder.images")
+            pils = list(image_mod.to_pil_batch(images))
+            count = min(
+                len(pils), max(1, int(max_reference_images)), fibo2_backend.FIBO2_MAX_IMAGES
             )
+            if count <= 0:
+                raise ValueError("Fibo-2 参考图为空")
+            requested_width = int(width) or pils[0].width
+            requested_height = int(height) or pils[0].height
+            use_width, use_height = mlx_backend.aligned_dimensions(
+                requested_width, requested_height
+            )
+            if (use_width, use_height) != (requested_width, requested_height):
+                print(
+                    f"[Fibo-2 参考图] 目标画布自动对齐到 16 的倍数："
+                    f"{requested_width}×{requested_height} → {use_width}×{use_height}",
+                    flush=True,
+                )
+            mlx_backend.validate_dimensions(use_width, use_height)
+            cache_key = runtime.cache_key(
+                {
+                    "kind": "fibo2_ref_encoding",
+                    "metadata_version": 1,
+                    "vae": vae,
+                    "digest": image_mod.digest(images),
+                    "count": count,
+                    "width": use_width,
+                    "height": use_height,
+                    "text_encoder_image_size": mlx_backend.FIBO2_TEXT_ENCODER_IMAGE_SIZE,
+                }
+            )
+            progress = SamplingProgress(count + 1)
+            selected = pils[:count]
+            source_sizes = "、".join(
+                f"图 {index + 1}={image.width}×{image.height}"
+                for index, image in enumerate(selected)
+            )
+            print(
+                f"[Fibo-2 参考图] 收到 {count} 张图片：{source_sizes}；"
+                f"目标生成/单图 VAE 画布 {use_width}×{use_height}",
+                flush=True,
+            )
+
+            def build_payload():
+                started = time.perf_counter()
+                print(
+                    f"[Fibo-2 参考图] 阶段 1/{count + 1}：加载 VAE"
+                    "（首次运行需要读取权重）…",
+                    flush=True,
+                )
+                vae_module = mlx_backend.load_vae(vae, CACHE)
+                print(
+                    f"[Fibo-2 参考图] 阶段 1/{count + 1} 完成：加载 VAE，"
+                    f"耗时 {time.perf_counter() - started:.2f}s | "
+                    f"{runtime.memory_snapshot()}",
+                    flush=True,
+                )
+                progress.update_absolute(1, count + 1)
+                qwen_images = tuple(
+                    mlx_backend.preprocess_text_encoder_context(
+                        selected, use_width, use_height
+                    )
+                )
+                vae_sizes = mlx_backend.context_target_sizes(
+                    selected, use_width, use_height
+                )
+                size_routes = tuple(
+                    (
+                        source.width,
+                        source.height,
+                        vae_width,
+                        vae_height,
+                        qwen_image.width,
+                        qwen_image.height,
+                    )
+                    for source, (vae_width, vae_height), qwen_image in zip(
+                        selected, vae_sizes, qwen_images, strict=True
+                    )
+                )
+                print(
+                    f"[Fibo-2 参考图] 尺寸链路："
+                    f"{mlx_backend.format_size_routes(size_routes)}；"
+                    f"最终生成目标 {use_width}×{use_height}",
+                    flush=True,
+                )
+                return {
+                    "images": qwen_images,
+                    "latents": mlx_backend.encode_context(
+                        vae_module,
+                        selected,
+                        use_width,
+                        use_height,
+                        on_progress=lambda current, total: progress.update_absolute(
+                            current + 1, total + 1
+                        ),
+                    ),
+                    "size_routes": size_routes,
+                }
+
+            payload, hit = CACHE.get_or_create("ref_encoding", cache_key, build_payload)
+            if hit:
+                route_text = mlx_backend.format_size_routes(payload.get("size_routes", ()))
+                print(
+                    f"[Fibo-2 参考图] 命中编码缓存"
+                    + (f"；尺寸链路：{route_text}" if route_text else ""),
+                    flush=True,
+                )
+                progress.complete()
+            handle = MlxReferenceImages(
+                model_type="fibo2",
+                vae_path=vae.model_path,
+                count=count,
+                height=use_height,
+                width=use_width,
+                cache_key=cache_key,
+                vae_cache_key=vae.cache_key,
+                precision=vae.dtype,
+                quantize=vae.quantize,
+                edit_kind="fibo2",
+            )
+            return (handle, use_width, use_height)
         if vae is None or not isinstance(vae, MlxVaeHandle):
             raise ValueError(
                 "必须连接「MLX VAE 加载器」的输出；"

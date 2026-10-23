@@ -40,3 +40,19 @@ class SamplingProgress:
     def complete(self) -> None:
         """缓存命中等没有逐步回调的路径也应在 UI 中显示完成。"""
         self.update_absolute(self.total)
+
+
+def throw_if_interrupted() -> None:
+    """在可安全停止的阶段边界响应 ComfyUI 的“取消当前任务”。
+
+    MLX/Metal 的单次 kernel 执行期间不能从 Python 抢占；调用方应在进入昂贵阶段
+    之前、以及每个采样 step 之间调用本函数。独立测试环境没有 ComfyUI 时静默跳过。
+    """
+
+    try:
+        from comfy import model_management
+    except (ImportError, AttributeError):
+        return
+    checker = getattr(model_management, "throw_exception_if_processing_interrupted", None)
+    if callable(checker):
+        checker()

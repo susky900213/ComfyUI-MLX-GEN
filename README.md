@@ -32,6 +32,18 @@ Transformer 默认建议选择 `quantize=8` 以降低 Apple Silicon 统一内存
 Transformer 使用约 3.6B hidden width、44 层、128 维 head，完整推理仍需要很大的统一内存。
 `Fibo-2.0-edit-turbo` 固定 4 步、guidance 1.0；`Fibo-2.0-dev` 默认 30 步、guidance 5.0。
 
+`MlxClipLoader.max_length` 会作为 Fibo-2 原生 MLX Qwen3-VL 每次编码的总 token 预算。
+示例工作流保留 Diffusers 对齐的 `4096` 默认预算，也可以显式设为 `8192`、`16384` 等更高值，
+最高允许使用 Qwen3-VL tokenizer 声明的 `262144`。这只是解除插件的固定截断保护，不表示
+Fibo-2 已在这些长度上经过官方验证；自注意力的内存/计算开销会随总序列长度快速增长。
+高分辨率参考图仍会按官方语义裁切并把 VLM 输入最长边限制为 768 像素，不因提高长度而取消。
+
+FIBO 2.0 的文生图和图生图 VGL 提示词增强节点支持与 MOSS 提示词节点一致的两层记忆：
+`context_turns` 自动带入最近几轮成功请求，`save_memory` 控制是否把本次文字请求和已校验
+VGL 同时保存为长期偏好。记忆按节点 ID 隔离且不保存参考图片；节点上的按钮可分别清除
+上下文和长期记忆。默认文件为 ComfyUI 用户目录下的
+`comfyui_mlx_gen_fibo2_memory.json`，也可通过 `COMFYUI_MLX_GEN_FIBO2_MEMORY_FILE` 指定。
+
 `requirements-fibo2.txt` 现在只保留给旧的显式 Torch/Diffusers 兼容 API 使用；统一 MLX
 工作流不需要安装它。旧版 `BriaFiboEditPipeline` 仍不是 Fibo-2，插件不会把它当作替代品。
 

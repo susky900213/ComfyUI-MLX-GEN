@@ -75,6 +75,7 @@ class MlxTransformerLoader:
                 device=normalized_device,
                 quantize=int(quantize),
                 cache_key=fibo2_backend.model_cache_key(path, normalized_dtype, normalized_device, int(quantize)),
+                compile_cache_limit=int(compile_cache_limit),
             )
             return (handle,)
         # 未知大类 → 直接报错（不静默回退，避免加载到错的类）；

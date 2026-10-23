@@ -428,11 +428,12 @@ class MlxReferenceImages:
       `cond_image_grid` 的 patch 尺寸。
     - qwen_image_21（最多十图）：缓存值同时保存预处理后的 PIL、每张归一化 64 通道
       latent 与 latent 网格；同一份数据供 Qwen3-VL 条件和 block-causal DiT 使用。
+    - fibo2（最多五图）：缓存值包含原始 PIL 和按官方图像处理语义编码的 context latent。
 
     采样器按 `edit_kind` 分派取用方式，两个大类的缓存键互不干扰。
     """
 
-    model_type: str  # 产出它的模型大类（"flux2" | "qwen_edit" | "qwen_image_21"）
+    model_type: str  # 产出它的模型大类（"flux2" | "qwen_edit" | "qwen_image_21" | "fibo2"）
     vae_path: str  # 编码它的 VAE 权重集目录名（信息性）
     count: int  # 实际参与编码的参考图张数
     height: int  # qwen_edit：目标编辑高度（= 采样器该用的高度）；flux2：建议生成高度
@@ -441,7 +442,7 @@ class MlxReferenceImages:
     vae_cache_key: str = ""  # 与 MlxVaeHandle.cache_key 同源（诊断用）
     precision: str = ""
     quantize: int = 0
-    edit_kind: str = "flux2"  # "flux2" | "flux3" | "qwen_edit" | "qwen_image_21"
+    edit_kind: str = "flux2"  # "flux2" | "flux3" | "qwen_edit" | "qwen_image_21" | "fibo2"
     cond_grid: tuple[int, int, int] | None = None  # qwen_edit：(1, height//16, width//16)
     seq_len: int = 0  # 参考图 token 数（诊断/打印用）
 

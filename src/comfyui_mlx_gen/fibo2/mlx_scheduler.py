@@ -9,6 +9,9 @@ import numpy as np
 
 
 def calculate_shift(image_seq_len: int, base_seq_len: int = 256, max_seq_len: int = 4096, base_shift: float = 0.5, max_shift: float = 1.15) -> float:
+    # ``max_seq_len`` belongs to the scheduler's image-latent shift
+    # interpolation (copied from Diffusers Flux); it is unrelated to the
+    # Qwen3-VL/Fibo-2 prompt context budget.
     slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     return image_seq_len * slope + base_shift - slope * base_seq_len
 

@@ -104,6 +104,10 @@ class MlxClipLoader:
                         "default": QWEN_IMAGE_21_MAX_LENGTH,
                         "min": 1,
                         "max": QWEN_IMAGE_21_MAX_LENGTH,
+                        "tooltip": (
+                            "条件编码总 token 预算。Fibo-2 示例默认 4096；可提高到 Qwen3-VL "
+                            "tokenizer 声明的 262144，但超过 4096 未经 Fibo-2 官方验证且会显著增加内存。"
+                        ),
                     },
                 ),
                 # 0 = 不量化；MiniMax-H3 请选 8（选 0 时「MLX 文本编码器」会直接报错）
@@ -121,13 +125,21 @@ class MlxClipLoader:
                 raise ValueError(f"未知组件: {component}")
             selected = fibo2_backend.resolve_model_selection(path)
             normalized_precision = normalize_precision(precision)
+            max_length = fibo2_backend.normalize_sequence_length(max_length)
             handle = fibo2_backend.Fibo2ClipHandle(
                 model_path=selected,
                 dtype=normalized_precision,
                 device="auto",
                 quantize=int(quantize),
-                cache_key=fibo2_backend.model_cache_key(
-                    selected, normalized_precision, "auto", int(quantize)
+                max_length=max_length,
+                cache_key=runtime.cache_key(
+                    {
+                        "base": fibo2_backend.model_cache_key(
+                            selected, normalized_precision, "auto", int(quantize)
+                        ),
+                        "component": "text_encoder",
+                        "max_length": max_length,
+                    }
                 ),
             )
             return (handle,)

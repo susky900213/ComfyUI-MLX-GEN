@@ -5,6 +5,7 @@ from mflux.models.common.tokenizer import LanguageTokenizer
 from mflux.models.common.weights.loading.weight_definition import ComponentDefinition, TokenizerDefinition
 
 from ..moss.weight_definition import _vae_mapping
+from .backend import FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH
 from .weight_mapping import Fibo2WeightMapping
 
 
@@ -60,7 +61,9 @@ class Fibo2WeightDefinition:
                 hf_subdir="processor",
                 tokenizer_class="Qwen2TokenizerFast",
                 encoder_class=LanguageTokenizer,
-                max_length=4096,
+                # Runtime default used by Diffusers' BriaFibo2Pipeline; this
+                # is not a published Bria model-architecture hard limit.
+                max_length=FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH,
                 add_special_tokens=False,
             )
         ]

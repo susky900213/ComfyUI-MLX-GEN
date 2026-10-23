@@ -8,6 +8,7 @@ ComfyUI tensor/PIL boundary.
 from __future__ import annotations
 
 import json
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -32,11 +33,11 @@ from comfyui_mlx_gen.nodes.fibo2 import (  # noqa: E402
 from comfyui_mlx_gen.nodes.loader import MlxTransformerLoader  # noqa: E402
 from comfyui_mlx_gen.nodes.lora import MlxClipLoraApply, MlxModelLoraApply, MlxVaeLoraApply  # noqa: E402
 from comfyui_mlx_gen.nodes.sampler import MlxKSamplerMLX  # noqa: E402
-from comfyui_mlx_gen.nodes.sampler import SCHEDULERS  # noqa: E402
 from comfyui_mlx_gen.nodes.text_encoder import MlxTextEncoder  # noqa: E402
 from comfyui_mlx_gen.nodes.vae_decode import MlxVAEDecoder  # noqa: E402
+from comfyui_mlx_gen.nodes.vae_encoder import MlxVAEEncoder  # noqa: E402
 from comfyui_mlx_gen.nodes.vae_loader import MlxVAELoader  # noqa: E402
-from comfyui_mlx_gen.types import MlxConditioning, MlxPilImage  # noqa: E402
+from comfyui_mlx_gen.types import MlxConditioning, MlxPilImage, MlxReferenceImages  # noqa: E402
 from comfyui_mlx_gen import weights as weight_loader  # noqa: E402
 
 
@@ -128,7 +129,7 @@ def test_fibo2_uses_unified_nodes_and_keeps_backend_unregistered():
     assert NODE_CLASS_MAPPINGS["MlxVAELoader"] is MlxVAELoader
     assert NODE_CLASS_MAPPINGS["MlxKSamplerMLX"] is MlxKSamplerMLX
     assert NODE_CLASS_MAPPINGS["MlxVaeLoraApply"] is MlxVaeLoraApply
-    assert MlxKSamplerMLX.RETURN_TYPES == ("latents", "images")
+    assert MlxKSamplerMLX.RETURN_TYPES == ("latents",)
 
 
 def test_fibo2_backend_import_has_no_eager_diffusers_import():
@@ -152,9 +153,48 @@ def test_fibo2_legacy_diffusers_error_is_actionable(monkeypatch):
     assert sys.executable in message
 
 
-def test_fibo2_scheduler_alias_is_kept_for_old_workflows():
-    assert "fibo_flow_match_euler" in SCHEDULERS
-    assert "fibo_flow_match_euler" in MlxKSamplerMLX.INPUT_TYPES()["required"]["scheduler"][0]
+def test_fibo2_does_not_change_sampler_public_contract():
+    inputs = MlxKSamplerMLX.INPUT_TYPES()
+    assert tuple(inputs["required"]) == (
+        "model",
+        "positive",
+        "negative",
+        "seed",
+        "steps",
+        "width",
+        "height",
+        "batch_size",
+        "guidance",
+        "scheduler",
+        "num_frames",
+        "video_shift",
+        "audio_shift",
+    )
+    assert tuple(inputs["optional"]) == ("ref_images", "kv_cache", "cot", "max_tokens", "abc")
+    assert "fibo_flow_match_euler" not in inputs["required"]["scheduler"][0]
+    assert tuple(inspect.signature(MlxKSamplerMLX.sample).parameters) == (
+        "self",
+        "model",
+        "positive",
+        "negative",
+        "seed",
+        "steps",
+        "width",
+        "height",
+        "batch_size",
+        "guidance",
+        "scheduler",
+        "num_frames",
+        "video_shift",
+        "audio_shift",
+        "ref_images",
+        "kv_cache",
+        "cot",
+        "max_tokens",
+        "abc",
+    )
+    assert MlxKSamplerMLX.RETURN_TYPES == ("latents",)
+    assert not hasattr(MlxKSamplerMLX, "RETURN_NAMES")
 
 
 def test_fibo2_local_checkpoint_is_identified_and_component_paths_resolve(tmp_path):
@@ -177,6 +217,8 @@ def test_unified_loaders_and_lora_nodes_create_fibo2_handles(tmp_path, monkeypat
     assert isinstance(clip, backend.Fibo2ClipHandle)
     assert isinstance(vae, backend.Fibo2VaeHandle)
     assert model.model_type == clip.model_type == vae.model_type == "fibo2"
+    assert model.compile_cache_limit == 2
+    assert clip.max_length == 512
 
     model_lora = MlxModelLoraApply().apply(model, "model.safetensors", 0.7)[0]
     clip_lora = MlxClipLoraApply().apply(clip, "clip.safetensors", 0.4)[0]
@@ -184,6 +226,24 @@ def test_unified_loaders_and_lora_nodes_create_fibo2_handles(tmp_path, monkeypat
         MlxVaeLoraApply().apply(vae, "vae.safetensors", 0.5)
     assert model_lora.loras[0].strength == 0.7
     assert clip_lora.loras[0].strength == 0.4
+
+
+def test_fibo2_loader_accepts_sequence_budgets_above_diffusers_default(tmp_path):
+    root = _checkpoint(tmp_path)
+    default = MlxClipLoader().load(
+        "fibo2", "text_encoder", str(root), "bfloat16", 4096, 0
+    )[0]
+    extended = MlxClipLoader().load(
+        "fibo2", "text_encoder", str(root), "bfloat16", 8192, 0
+    )[0]
+
+    assert default.max_length == backend.FIBO2_DIFFUSERS_MAX_SEQUENCE_LENGTH
+    assert extended.max_length == 8192
+    assert extended.cache_key != default.cache_key
+    with pytest.raises(backend.Fibo2ValidationError, match="262144"):
+        MlxClipLoader().load(
+            "fibo2", "text_encoder", str(root), "bfloat16", 262145, 0
+        )
 
 
 def test_fibo2_text_encoder_only_forwards_condition_text(tmp_path):
@@ -235,13 +295,16 @@ def test_loader_normalizes_dtype_and_device_for_a_lazy_handle(tmp_path):
     assert '"family": "fibo2"' in handle.cache_key
 
 
-def test_edit_turbo_node_does_not_treat_reference_as_source(monkeypatch):
+def test_edit_turbo_requires_source_through_existing_ref_images_input():
     model = backend.Fibo2ModelHandle("briaai/Fibo-2.0-edit-turbo", device="cpu")
-    with pytest.raises(ValueError, match="必须连接 image source"):
+    clip = backend.Fibo2ClipHandle("briaai/Fibo-2.0-edit-turbo", device="cpu")
+    positive = MlxConditioning(clip=clip, text="edit")
+    negative = MlxConditioning(clip=clip, text="")
+    with pytest.raises(ValueError, match="ref_images"):
         MlxKSamplerMLX().sample(
             model=model,
-            positive=None,
-            negative=None,
+            positive=positive,
+            negative=negative,
             seed=0,
             steps=4,
             width=512,
@@ -249,64 +312,218 @@ def test_edit_turbo_node_does_not_treat_reference_as_source(monkeypatch):
             batch_size=1,
             guidance=1.0,
             scheduler="flow_match_euler_discrete",
-            reference_1=None,
         )
 
 
 def test_unified_sampler_routes_fibo_to_native_mlx_latent(monkeypatch):
-    model = backend.Fibo2ModelHandle("briaai/Fibo-2.0-dev", device="cpu")
-    clip = backend.Fibo2ClipHandle("briaai/Fibo-2.0-dev", device="cpu")
+    model = backend.Fibo2ModelHandle(
+        "briaai/Fibo-2.0-dev", device="cpu", compile_cache_limit=6
+    )
+    clip = backend.Fibo2ClipHandle(
+        "briaai/Fibo-2.0-dev", device="cpu", max_length=8192
+    )
     positive = MlxConditioning(clip=clip, text="a red cube")
     negative = MlxConditioning(clip=clip, text="blurry")
     from comfyui_mlx_gen.fibo2 import mlx_backend
-    from comfyui_mlx_gen.cache import CACHE
-    import mlx.core as mx
-
     latent = SimpleNamespace(cache_key="fibo-latent", shape=(1, 32, 64, 64))
     captured = {}
+    cache_limits = []
 
     def fake_run(handle, **kwargs):
         captured.update(kwargs)
         assert handle is model
-        CACHE.get_or_create("component_weights", latent.cache_key, lambda: mx.zeros(latent.shape))
         return latent
 
     monkeypatch.setattr(mlx_backend, "run", fake_run)
-    monkeypatch.setattr(mlx_backend, "decode_latent", lambda *_args, **_kwargs: mx.zeros((1, 3, 512, 512)))
-    latents, images = MlxKSamplerMLX().sample(
+    monkeypatch.setattr(
+        "comfyui_mlx_gen.nodes.sampler.runtime.apply_cache_limit",
+        lambda limit, *, label="": cache_limits.append((limit, label)),
+    )
+    result = MlxKSamplerMLX().sample(
         model=model,
         positive=positive,
         negative=negative,
         seed=3,
         steps=4,
-        width=512,
-        height=512,
+        width=689,
+        height=981,
         batch_size=1,
         guidance=1.0,
         scheduler="flow_match_euler_discrete",
-        clip=clip,
     )
-    assert latents is latent
-    assert isinstance(images, MlxPilImage)
-    assert len(images.images) == 1
+    assert result == (latent,)
     assert captured["prompt"] == "a red cube"
+    assert captured["clip"] is clip
+    assert captured["clip"].max_length == 8192
     assert captured["negative_prompt"] == "blurry"
+    assert captured["images"] is None
+    assert captured["context_latents"] is None
+    assert (captured["width"], captured["height"]) == (688, 976)
+    assert cache_limits == [(6, "fibo2")]
 
 
-def test_fibo_vae_decoder_reuses_sampler_decoded_images(monkeypatch):
+def test_fibo2_sampler_alignment_matches_reference_encoder_canvas(monkeypatch):
+    from comfyui_mlx_gen.cache import Cache
+    from comfyui_mlx_gen.fibo2 import mlx_backend
+    from comfyui_mlx_gen.nodes import sampler as sampler_node
+
+    cache = Cache()
+    monkeypatch.setattr(sampler_node, "CACHE", cache)
+    cache.get_or_create(
+        "ref_encoding",
+        "aligned-ref",
+        lambda: {
+            "images": [object()],
+            "latents": ["context-latent"],
+            "size_routes": ((689, 981, 688, 976, 541, 768),),
+        },
+    )
+    ref = MlxReferenceImages(
+        model_type="fibo2",
+        vae_path="/tmp/Fibo-2.0-dev",
+        count=1,
+        width=688,
+        height=976,
+        cache_key="aligned-ref",
+        edit_kind="fibo2",
+    )
+    model = backend.Fibo2ModelHandle("briaai/Fibo-2.0-dev", device="cpu")
+    clip = backend.Fibo2ClipHandle("briaai/Fibo-2.0-dev", device="cpu")
+    positive = MlxConditioning(clip=clip, text="edit")
+    negative = MlxConditioning(clip=clip, text="")
+    captured = {}
+
+    monkeypatch.setattr(
+        mlx_backend,
+        "run",
+        lambda _model, **kwargs: captured.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(sampler_node.runtime, "apply_cache_limit", lambda *_args, **_kwargs: None)
+
+    MlxKSamplerMLX().sample(
+        model=model,
+        positive=positive,
+        negative=negative,
+        seed=3,
+        steps=4,
+        width=689,
+        height=981,
+        batch_size=1,
+        guidance=1.0,
+        scheduler="flow_match_euler_discrete",
+        ref_images=ref,
+    )
+
+    assert (captured["width"], captured["height"]) == (688, 976)
+    assert captured["images"] == cache.get("ref_encoding", "aligned-ref")[0]["images"]
+    assert captured["context_latents"] == ["context-latent"]
+
+
+def test_fibo_vae_decoder_decodes_sampler_latent(monkeypatch):
     from comfyui_mlx_gen.cache import Cache
     from comfyui_mlx_gen.nodes import vae_decode as vae_decode_node
+    from comfyui_mlx_gen.fibo2 import mlx_backend
 
     cache = Cache()
     monkeypatch.setattr(vae_decode_node, "CACHE", cache)
-    latent = SimpleNamespace(model="fibo2", cache_key="fibo-decoded-images")
-    payload = MlxPilImage(images=("decoded-image",))
-    cache.get_or_create("fibo2_images", latent.cache_key, lambda: payload)
+    latent = SimpleNamespace(model="fibo2", cache_key="fibo-latent")
+    cached = mx.zeros((1, 32, 2, 2))
+    cache.get_or_create("component_weights", latent.cache_key, lambda: cached)
     vae = backend.Fibo2VaeHandle("/tmp/Fibo-2.0-dev")
+    calls = []
+
+    def fake_decode(handle, value, passed_cache, **kwargs):
+        calls.append((handle, value, passed_cache, kwargs))
+        return mx.zeros((1, 3, 4, 4))
+
+    monkeypatch.setattr(mlx_backend, "decode_latent", fake_decode)
 
     result = MlxVAEDecoder().decode(vae, latent, -1)
 
-    assert result == (payload,)
+    assert isinstance(result[0], MlxPilImage)
+    assert len(result[0].images) == 1
+    assert len(calls) == 1
+    assert calls[0][:3] == (vae, cached, cache)
+    assert callable(calls[0][3]["on_progress"])
+
+
+def test_fibo_vae_encoder_builds_existing_ref_images_contract(monkeypatch):
+    from comfyui_mlx_gen.cache import Cache
+    from comfyui_mlx_gen.fibo2 import mlx_backend
+    from comfyui_mlx_gen.nodes import vae_encoder as vae_encoder_node
+
+    cache = Cache()
+    monkeypatch.setattr(vae_encoder_node, "CACHE", cache)
+    vae = backend.Fibo2VaeHandle("/tmp/Fibo-2.0-dev", cache_key="fibo-vae")
+    torch = pytest.importorskip("torch")
+    Image = pytest.importorskip("PIL.Image")
+    pixels = torch.zeros((1, 16, 16, 3), dtype=torch.float32)
+    # This would produce 4,356 merged Qwen3-VL visual tokens if the original
+    # source were cached unchanged, exceeding this backend's Diffusers-aligned
+    # 4,096-token default before the text tokens are added.
+    source = Image.new("RGB", (2112, 2112))
+    context = [mx.zeros((1, 32, 2, 2))]
+    monkeypatch.setattr(vae_encoder_node.image_mod, "to_pil_batch", lambda _images: [source])
+    monkeypatch.setattr(mlx_backend, "load_vae", lambda handle, passed_cache: object())
+    monkeypatch.setattr(
+        mlx_backend,
+        "encode_context",
+        lambda _vae, images, width, height, **_kwargs: context,
+    )
+
+    ref, width, height = MlxVAEEncoder().encode(
+        images=pixels,
+        vae=vae,
+        max_reference_images=5,
+        width=512,
+        height=512,
+    )
+
+    assert isinstance(ref, MlxReferenceImages)
+    assert ref.model_type == ref.edit_kind == "fibo2"
+    assert (width, height) == (512, 512)
+    payload, hit = cache.get("ref_encoding", ref.cache_key)
+    assert hit is True
+    assert len(payload["images"]) == 1
+    assert payload["images"][0].size == (512, 512)
+    assert payload["latents"] is context
+    assert payload["size_routes"] == ((2112, 2112, 512, 512, 512, 512),)
+
+
+def test_fibo2_reference_encoder_auto_aligns_source_canvas(monkeypatch, capsys):
+    from comfyui_mlx_gen.cache import Cache
+    from comfyui_mlx_gen.fibo2 import mlx_backend
+    from comfyui_mlx_gen.nodes import vae_encoder as vae_encoder_node
+
+    cache = Cache()
+    monkeypatch.setattr(vae_encoder_node, "CACHE", cache)
+    torch = pytest.importorskip("torch")
+    Image = pytest.importorskip("PIL.Image")
+    pixels = torch.zeros((1, 16, 16, 3), dtype=torch.float32)
+    source = Image.new("RGB", (689, 981))
+    vae = backend.Fibo2VaeHandle("/tmp/Fibo-2.0-dev", cache_key="fibo-vae")
+    monkeypatch.setattr(vae_encoder_node.image_mod, "to_pil_batch", lambda _images: [source])
+    monkeypatch.setattr(mlx_backend, "load_vae", lambda *_args, **_kwargs: object())
+    dimensions = []
+    monkeypatch.setattr(
+        mlx_backend, "encode_context",
+        lambda _vae, _images, width, height, **_kwargs: (
+            dimensions.append((width, height)) or [mx.zeros((1, 32, 122, 86))]
+        ),
+    )
+
+    ref, width, height = MlxVAEEncoder().encode(
+        images=pixels,
+        vae=vae,
+        max_reference_images=1,
+        width=689,
+        height=981,
+    )
+
+    assert (width, height) == (688, 976)
+    assert (ref.width, ref.height) == (688, 976)
+    assert dimensions == [(688, 976)]
+    assert "689×981 → 688×976" in capsys.readouterr().out
 
 
 def test_fake_pipeline_receives_list_image_single_mask_and_is_cached(monkeypatch):
