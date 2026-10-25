@@ -142,7 +142,7 @@ def test_unprefixed_peft_payload_is_injected(monkeypatch):
                 "layers.0.proj.q.lora_A": {"dtype": "BF16", "shape": [1, 3]},
                 "layers.0.proj.q.lora_B": {"dtype": "BF16", "shape": [2, 1]},
             },
-            {"lora_adapter_metadata": '{"r": 1, "lora_alpha": 1}'},
+            {},
         ),
     )
     model = _handle(loras=(LoraRef(path, 1.0),))
@@ -191,6 +191,41 @@ def _write_header(path: Path, *, omit: str | None = None, bad_shape: str | None 
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded)
 
 
+def _write_standard_header(
+    path: Path,
+    metadata: dict | None = None,
+    *,
+    omit: set[tuple[int, str, str]] | None = None,
+    rank_overrides: dict[tuple[int, str], int] | None = None,
+):
+    tensors = {}
+    omit = omit or set()
+    rank_overrides = rank_overrides or {}
+    for layer in range(42):
+        for projection in lora.MOSS_LORA_PROJECTIONS:
+            if projection == "ffn_down":
+                input_dim, output_dim = 8192, 3072
+            elif projection == "ffn_up_gate":
+                input_dim, output_dim = 3072, 16384
+            else:
+                input_dim = output_dim = 3072
+            rank = rank_overrides.get((layer, projection), 16)
+            for matrix, shape in (
+                ("A", [rank, input_dim]),
+                ("B", [output_dim, rank]),
+            ):
+                if (layer, projection, matrix) in omit:
+                    continue
+                tensors[lora._standard_target_key(layer, projection, matrix)] = {
+                    "dtype": "BF16",
+                    "shape": shape,
+                    "data_offsets": [0, 2],
+                }
+    header = {"__metadata__": metadata or {}, **tensors}
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded)
+
+
 def test_header_rejects_incomplete_groups_and_wrong_dynamic_rank_shape(tmp_path):
     missing = tmp_path / "moss_image_4_steps_missing.safetensors"
     _write_header(missing, omit=lora._target_key(0, "q", "alpha"))
@@ -210,6 +245,99 @@ def test_header_rejects_incomplete_groups_and_wrong_dynamic_rank_shape(tmp_path)
         assert "shape 不匹配" in str(exc)
     else:
         raise AssertionError("invalid dynamic rank shape was accepted")
+
+
+def test_standard_header_infers_rank_when_export_omits_peft_metadata(tmp_path):
+    path = tmp_path / "moss_unannotated.safetensors"
+    _write_standard_header(path)
+
+    targets = lora.validate_standard_header(path)
+
+    assert len(targets) == 42 * 6
+    assert {target.rank for target in targets.values()} == {16}
+    assert {target.alpha for target in targets.values()} == {16.0}
+
+
+def test_standard_header_accepts_legacy_ss_network_rank_alpha_metadata(tmp_path):
+    path = tmp_path / "moss_legacy_metadata.safetensors"
+    _write_standard_header(
+        path,
+        metadata={"ss_network_dim": "16", "ss_network_alpha": "8.0"},
+    )
+
+    targets = lora.validate_standard_header(path)
+
+    assert {target.rank for target in targets.values()} == {16}
+    assert {target.alpha for target in targets.values()} == {8.0}
+
+
+def test_standard_header_rejects_invalid_explicit_rank_metadata(tmp_path):
+    path = tmp_path / "moss_bad_metadata.safetensors"
+    _write_standard_header(
+        path,
+        metadata={"lora_adapter_metadata": json.dumps({"r": 0, "lora_alpha": 0.0})},
+    )
+
+    try:
+        lora.validate_standard_header(path)
+    except ValueError as exc:
+        assert "PEFT rank/alpha 无效" in str(exc)
+    else:
+        raise AssertionError("invalid explicit PEFT rank/alpha was accepted")
+
+
+def test_standard_header_rejects_explicit_zero_alpha(tmp_path):
+    path = tmp_path / "moss_zero_alpha.safetensors"
+    _write_standard_header(
+        path,
+        metadata={"lora_adapter_metadata": json.dumps({"r": 16, "lora_alpha": 0.0})},
+    )
+
+    try:
+        lora.validate_standard_header(path)
+    except ValueError as exc:
+        assert "PEFT rank/alpha 无效" in str(exc)
+    else:
+        raise AssertionError("invalid explicit PEFT alpha was accepted")
+
+
+def test_standard_header_accepts_metadata_free_projection_subset(tmp_path):
+    path = tmp_path / "moss_partial.safetensors"
+    omit = {
+        (22, projection, matrix)
+        for projection in lora.MOSS_LORA_PROJECTIONS
+        for matrix in ("A", "B")
+    }
+    _write_standard_header(path, omit=omit)
+
+    targets = lora.validate_standard_header(path)
+
+    assert len(targets) == 41 * 6
+    assert (22, "q") not in targets
+
+
+def test_standard_header_rejects_single_matrix_group(tmp_path):
+    path = tmp_path / "moss_incomplete_group.safetensors"
+    _write_standard_header(path, omit={(0, "q", "B")})
+
+    try:
+        lora.validate_standard_header(path)
+    except ValueError as exc:
+        assert "incomplete" in str(exc)
+    else:
+        raise AssertionError("incomplete standard PEFT group was accepted")
+
+
+def test_standard_header_rejects_inconsistent_inferred_ranks(tmp_path):
+    path = tmp_path / "moss_inconsistent_rank.safetensors"
+    _write_standard_header(path, rank_overrides={(0, "q"): 8})
+
+    try:
+        lora.validate_standard_header(path)
+    except ValueError as exc:
+        assert "rank 不一致" in str(exc)
+    else:
+        raise AssertionError("inconsistent metadata-free PEFT ranks were accepted")
 
 
 def test_lora_linear_keeps_base_and_adds_scaled_low_rank_branch():

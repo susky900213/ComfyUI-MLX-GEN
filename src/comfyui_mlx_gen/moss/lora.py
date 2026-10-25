@@ -62,8 +62,9 @@ class MOSSLoRATarget:
     layer: int
     projection: str
     rank: int
-    # Header validation can only verify that alpha is scalar.  Its value is
-    # read from the payload when the adapter is attached.
+    # PEFT alpha comes from metadata when available.  Some training/export
+    # tools omit it, in which case validation uses the standard alpha=rank
+    # neutral scaling fallback.
     alpha: float | None
     down_shape: tuple[int, int]
     up_shape: tuple[int, int]
@@ -205,14 +206,22 @@ def _module_specs(config: dict[str, Any] | None) -> dict[tuple[int, str], tuple[
         if match is None or not isinstance(value, dict):
             raise ValueError(f"MOSS adapter_config 包含非法 module: {name}")
         try:
-            rank = int(value["rank"])
+            rank = _metadata_rank(value["rank"])
             alpha = float(value["alpha"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"MOSS adapter_config 的 {name} rank/alpha 无效") from exc
-        if not 1 <= rank <= MOSS_LORA_MAX_RANK or not math.isfinite(alpha):
+        if not 1 <= rank <= MOSS_LORA_MAX_RANK or not math.isfinite(alpha) or alpha <= 0:
             raise ValueError(f"MOSS adapter_config 的 {name} rank/alpha 无效：rank={rank}, alpha={alpha}")
         specs[(int(match.group(1)), match.group(2))] = (rank, alpha)
     return specs
+
+
+def _metadata_rank(value: Any) -> int:
+    """Parse an integer PEFT rank from numeric JSON or string metadata."""
+    number = float(value)
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"rank={value!r} 不是整数")
+    return int(number)
 
 
 def is_image_edit_adapter(path: str | Path) -> bool:
@@ -353,37 +362,63 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
         adapter_metadata = raw_adapter_metadata
 
     module_specs = _module_specs(config)
-    try:
-        global_rank = int(adapter_metadata.get("r", 0))
-        global_alpha = float(adapter_metadata.get("lora_alpha", global_rank))
-    except (TypeError, ValueError) as exc:
-        if not module_specs:
+    global_rank: int | None = None
+    global_alpha: float | None = None
+    if raw_adapter_metadata is not None:
+        try:
+            global_rank = _metadata_rank(adapter_metadata["r"])
+            global_alpha = float(adapter_metadata.get("lora_alpha", global_rank))
+        except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"{file.name} 的 PEFT rank/alpha 元数据无效") from exc
-        global_rank = global_alpha = 0
-    if module_specs:
-        if len(module_specs) != MOSS_LORA_LAYERS * len(MOSS_LORA_PROJECTIONS):
-            raise ValueError(
-                f"{file.name} 的 MOSS adapter_config 目标覆盖不完整："
-                f"实际 {len(module_specs)}，期望 {MOSS_LORA_LAYERS * len(MOSS_LORA_PROJECTIONS)}"
-            )
-    elif not 1 <= global_rank <= MOSS_LORA_MAX_RANK or not math.isfinite(global_alpha):
+    elif "ss_network_dim" in metadata or "ss_network_alpha" in metadata:
+        # ai-toolkit / sd-scripts exports commonly use these legacy fields
+        # instead of PEFT's lora_adapter_metadata JSON object.
+        try:
+            global_rank = _metadata_rank(metadata["ss_network_dim"])
+            global_alpha = float(metadata.get("ss_network_alpha", global_rank))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{file.name} 的 PEFT rank/alpha 元数据无效") from exc
+    if global_rank is not None and (
+        not 1 <= global_rank <= MOSS_LORA_MAX_RANK
+        or global_alpha is None
+        or not math.isfinite(global_alpha)
+        or global_alpha <= 0
+    ):
         raise ValueError(
             f"{file.name} 的 PEFT rank/alpha 无效：rank={global_rank}, alpha={global_alpha}"
         )
+    if module_specs and len(module_specs) != MOSS_LORA_LAYERS * len(MOSS_LORA_PROJECTIONS):
+        raise ValueError(
+            f"{file.name} 的 MOSS adapter_config 目标覆盖不完整："
+            f"实际 {len(module_specs)}，期望 {MOSS_LORA_LAYERS * len(MOSS_LORA_PROJECTIONS)}"
+        )
 
     key_map = _standard_key_map(entries)
-    expected_targets = {
-        (layer, projection, matrix)
-        for layer in range(MOSS_LORA_LAYERS)
-        for projection in MOSS_LORA_PROJECTIONS
-        for matrix in ("A", "B")
-    }
     actual_targets = set(key_map)
-    if actual_targets != expected_targets:
-        missing = sorted(expected_targets - actual_targets)
-        extra = sorted(actual_targets - expected_targets)
+    actual_modules = {(layer, projection) for layer, projection, _ in actual_targets}
+    invalid_modules = sorted(
+        (layer, projection)
+        for layer, projection in actual_modules
+        if not 0 <= layer < MOSS_LORA_LAYERS
+    )
+    incomplete_modules = sorted(
+        (layer, projection)
+        for layer, projection in actual_modules
+        if {(item[2]) for item in actual_targets if item[:2] == (layer, projection)}
+        != {"A", "B"}
+    )
+    if invalid_modules or incomplete_modules:
         raise ValueError(
-            f"{file.name} 的 MOSS 普通 LoRA 层覆盖不完整："
+            f"{file.name} 的 MOSS 普通 LoRA tensor group 无效："
+            f"invalid={invalid_modules[:4]}, incomplete={incomplete_modules[:4]}"
+        )
+    if not actual_modules:
+        raise ValueError(f"{file.name} 不包含 MOSS 普通 LoRA tensor")
+    if module_specs and actual_modules != set(module_specs):
+        missing = sorted(set(module_specs) - actual_modules)
+        extra = sorted(actual_modules - set(module_specs))
+        raise ValueError(
+            f"{file.name} 的 MOSS adapter_config 目标与 tensor 不匹配："
             f"missing={missing[:4]}, extra={extra[:4]}"
         )
 
@@ -401,19 +436,40 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
         old = targets.get((layer, projection))
         down_shape = shape if matrix == "A" else (old.down_shape if old else ())
         up_shape = shape if matrix == "B" else (old.up_shape if old else ())
-        rank, alpha = module_specs.get((layer, projection), (global_rank, global_alpha))
         targets[(layer, projection)] = MOSSLoRATarget(
             layer,
             projection,
-            rank,
-            alpha,
+            0,
+            None,
             down_shape,
             up_shape,
         )
 
+    inferred_rank: int | None = None
     for (layer, projection), target in targets.items():
-        rank, alpha = module_specs.get((layer, projection), (global_rank, global_alpha))
+        if module_specs:
+            rank, alpha = module_specs[(layer, projection)]
+        elif global_rank is not None:
+            rank, alpha = global_rank, global_alpha
+        else:
+            # A number of ai-toolkit exports contain a complete PEFT payload
+            # but omit all rank/alpha metadata.  lora_A/lora_B shapes are the
+            # authoritative rank in that case; alpha=rank preserves the usual
+            # neutral PEFT scale instead of applying an arbitrary multiplier.
+            rank = target.down_shape[0]
+            alpha = float(rank)
+            if inferred_rank is None:
+                inferred_rank = rank
+            elif rank != inferred_rank:
+                raise ValueError(
+                    f"{file.name} 的 PEFT tensor rank 不一致："
+                    f"已推断 {inferred_rank}，layers.{layer}.proj.{projection} 为 {rank}"
+                )
         input_dims, output_dims = _expected_shapes(projection)
+        if not 1 <= rank <= MOSS_LORA_MAX_RANK or alpha is None or not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError(
+                f"{file.name} 的 PEFT rank/alpha 无效：rank={rank}, alpha={alpha}"
+            )
         if target.down_shape != (rank, input_dims) or target.up_shape != (output_dims, rank):
             raise ValueError(
                 f"{file.name} 的 layers.{layer}.proj.{projection} shape 不匹配："
