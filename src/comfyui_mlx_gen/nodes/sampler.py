@@ -55,7 +55,16 @@ from ..h3.latent_creator.h3_layout import valid_frame_counts
 from ..moss import lora as moss_lora
 from ..progress import SamplingProgress
 from ..qwen_image_21 import sampling as qwen21_sampling
-from ..types import condition, entry_for, model, model_types, ref_images, validate_model_family
+from ..types import (
+    MlxMossReferenceImage,
+    condition,
+    entry_for,
+    model,
+    model_types,
+    moss_ref_image,
+    ref_images,
+    validate_model_family,
+)
 
 SCHEDULERS = [
     "linear",
@@ -148,6 +157,7 @@ class MlxKSamplerMLX:
                 # 连上 → 编辑（flux2 单图编辑 / qwen_edit 多图编辑）；不连 → 文生图
                 # （z_image / flux2；qwen_edit 必须有参考图，不连会直接报错）
                 "ref_images": (ref_images, {}),
+                "moss_reference": (moss_ref_image, {}),
                 # 只有 kv 版权重（配置 supports_kv_cache=True）才会有实际作用
                 "kv_cache": (KV_CACHE_MODES, {"default": "auto"}),
                 # 仅 YuE2：off 直接生成 codec；melody/full 先生成 ABC 规划。
@@ -193,6 +203,7 @@ class MlxKSamplerMLX:
         cot="full",
         max_tokens=9000,
         abc=None,
+        moss_reference=None,
     ):
         if model is None:
             raise ValueError("必须连接 MlxTransformerLoader 的输出")
@@ -465,15 +476,43 @@ class MlxKSamplerMLX:
             ref_count = int(ref_images.count)
 
         if entry.family == "moss":
+            if ref_images is not None:
+                raise ValueError("MOSS 请使用专用 moss_reference 入口，不能连接通用 ref_images")
+            if moss_reference is not None and not isinstance(moss_reference, MlxMossReferenceImage):
+                raise ValueError("moss_reference 必须由 MlxMossReferenceImageEncoder 生成")
+            if moss_reference is not None:
+                # MOSS Image Edit is a reference-size edit: the target latent
+                # must use the first reference's spatial shape.  Do not rely
+                # on ComfyUI's optional widget-to-input conversion here; a
+                # workflow can keep the ordinary width/height widgets and the
+                # sampler derives the exact dimensions from the reference.
+                width = int(moss_reference.width)
+                height = int(moss_reference.height)
             if int(width) % 16 or int(height) % 16:
                 raise ValueError("MOSS-Image 的 width / height 必须是 16 的倍数")
-            if ref_images is not None:
-                raise ValueError("MOSS-Image-SFT 是纯文生图链路，不支持 ref_images")
+            if moss_lora.has_image_edit_adapter(tuple(model.loras)) and moss_reference is None:
+                raise ValueError(
+                    "MOSS Image Edit LoRA 必须连接 MlxMossReferenceImageEncoder 的 moss_reference 输出"
+                )
             if scheduler != "moss_flow_match_euler":
                 print(
                     f"[MlxKSamplerMLX] MOSS 固定使用 moss_flow_match_euler，已忽略 scheduler={scheduler!r}"
                 )
                 scheduler = "moss_flow_match_euler"
+        elif moss_reference is not None:
+            raise ValueError("moss_reference 只支持 MOSS 模型")
+
+        moss_kv_cache_key = ""
+        if entry.family == "moss" and moss_reference is not None:
+            if not moss_reference.cache_key:
+                raise ValueError(
+                    "MOSS 参考图的 latent 缓存键为空，请重新运行 MlxMossReferenceImageEncoder"
+                )
+            moss_kv_cache_key = pipeline.moss_reference_kv_cache_key(
+                model,
+                moss_reference.cache_key,
+                positive.encoding_key,
+            )
 
         params = {
             "seed": int(seed),
@@ -493,6 +532,13 @@ class MlxKSamplerMLX:
             # edit 用：进 latent 缓存键 → 换参考图必然重新采样
             "ref_cache_key": ref_key,
             "ref_count": ref_count,
+            "moss_ref_cache_key": (
+                moss_reference.cache_key if moss_reference is not None else ""
+            ),
+            "moss_kv_cache_key": moss_kv_cache_key,
+            # v10: target image-edit latent starts from fp32 Gaussian noise;
+            # reference image remains a clean t=0 K/V prefix.
+            "moss_sampling_version": 10 if entry.family == "moss" else 0,
             "kv_cache": kv_cache,
         }
         if entry.family == "flux3":

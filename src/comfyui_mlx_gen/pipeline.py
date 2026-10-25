@@ -69,7 +69,6 @@ from .moss.scheduler import MOSSImageScheduler, to_mlx_timestep
 from .types import (
     MlxH3VisualCondition,
     MlxLatentHandle,
-    MlxModelEntry,
     MlxPilImage,
     entry_for,
     validate_model_family,
@@ -389,6 +388,51 @@ def _attach_vl(comps: dict[str, Any]) -> None:
 def transformer_cache_key(model_handle, role: str = "transformer") -> str:
     """transformer 单独一项（Ideogram 4 的两套 transformer 按 role 分键）。"""
     return runtime.cache_key({"kind": "transformer", "role": role, "model": model_handle})
+
+
+def moss_reference_kv_cache_key(
+    model_handle,
+    reference_cache_key: str,
+    conditioning_cache_key: str,
+) -> str:
+    """Return the cache key for one MOSS reference/text K/V branch.
+
+    The reference latent is encoded before the sampler has materialized the
+    transformer, so the reference-image node cannot create this key by itself.
+    Include the resolved transformer key here: changing the base checkpoint,
+    precision, quantization, or LoRA composition must never reuse K/V tensors
+    produced by another transformer.
+    """
+    if not reference_cache_key:
+        raise ValueError("MOSS 参考图 latent 缓存键为空，请重新运行 MlxMossReferenceImageEncoder")
+    if not conditioning_cache_key:
+        raise ValueError("MOSS 文本条件编码键为空，请重新运行 MlxTextEncoder")
+    return runtime.cache_key(
+        {
+            "kind": "moss_reference_kv",
+            # v9: official split-half RoPE storage, Diffusers sigma*1000
+            # timestep units, and image-only t=0 reference prefix; never reuse
+            # K/V built by incompatible layouts.
+            "version": 9,
+            "reference": reference_cache_key,
+            "conditioning": conditioning_cache_key,
+            "transformer": transformer_cache_key(model_handle),
+        }
+    )
+
+
+def moss_reference_kv_identity_key(reference_cache_key: str) -> str:
+    """Return the reference-only identity carried by a MOSS reference handle.
+
+    This is metadata, not a materialized K/V cache entry.  The sampler adds
+    the conditioning and transformer identities before it uses the result as
+    the ``moss_ref_kv`` cache key.
+    """
+    if not reference_cache_key:
+        raise ValueError("MOSS 参考图 latent 缓存键为空，请重新运行 MlxMossReferenceImageEncoder")
+    return runtime.cache_key(
+        {"kind": "moss_reference_kv_identity", "reference": reference_cache_key}
+    )
 
 
 def vae_component(handle, cache) -> Any:
@@ -897,6 +941,77 @@ def prepare_reference_image(pil, resize_mode: str):
     return pil.crop((left, top, left + width, top + height))
 
 
+def prepare_moss_reference_image(pil):
+    """MOSS reference preprocessing: Flux.2 cap + 16-pixel center crop."""
+    return prepare_reference_image(pil.convert("RGB"), "aspect_area_crop")
+
+
+def encode_moss_reference_image(vae, pil, cache, cache_key: str):
+    """Encode one PIL image into MOSS's normalized spatial reference latent."""
+    image_util = runtime.import_object("mflux.utils.image_util:ImageUtil")
+    vae_util = runtime.import_object("mflux.models.common.vae.vae_util:VAEUtil")
+    helpers = runtime.import_object(
+        "mflux.models.flux2.variants.edit.flux2_klein_edit_helpers:_Flux2KleinEditHelpers"
+    )
+
+    def build():
+        encoded = vae_util.encode(
+            vae=vae, image=image_util.to_array(pil), tiling_config=None
+        )
+        encoded = helpers.ensure_4d_latents(encoded)
+        encoded = helpers.crop_to_even_spatial(encoded)
+        if not hasattr(vae, "bn"):
+            raise ValueError("MOSS VAE 缺少 Flux.2 batch-norm 统计量，无法编码参考图")
+        latent = moss_latent.prepare_reference_latent(
+            encoded,
+            mean=vae.bn.running_mean,
+            variance=vae.bn.running_var,
+        )
+        moss_latent.validate_reference_latent(latent)
+        mx.eval(latent)
+        return latent
+
+    value, _hit = cache.get_or_create("moss_ref_encoding", cache_key, build)
+    return value
+
+
+def cached_moss_reference(cache, key: str):
+    if not key:
+        raise RuntimeError("MOSS 参考图缓存键为空，请重新运行 MlxMossReferenceImageEncoder")
+    value, hit = cache.get("moss_ref_encoding", key)
+    if not hit or value is None:
+        raise RuntimeError("MOSS 参考图 latent 已失效，请重新运行 MlxMossReferenceImageEncoder")
+    moss_latent.validate_reference_latent(value)
+    return value
+
+
+def build_moss_reference_kv(transformer, reference_latent, conditioning, cache, cache_key: str):
+    """Build/cached per-block MOSS reference K/V with clean timestep zero."""
+    if not cache_key:
+        raise RuntimeError(
+            "MOSS 参考 K/V 缓存键为空；请让 MlxKSamplerMLX 接收有效的 moss_reference"
+        )
+
+    def build():
+        value = transformer.build_reference_kv(
+            reference_latent,
+            mx.array([0.0], dtype=mx.float32),
+            conditioning.embeddings[:1],
+            conditioning.attention_mask[:1],
+        )
+        mx.eval(
+            *[
+                array
+                for layer in value.layers
+                for array in (layer.keys, layer.values, layer.rope)
+            ]
+        )
+        return value
+
+    value, _hit = cache.get_or_create("moss_ref_kv", cache_key, build)
+    return value
+
+
 def encode_reference_images(
     entry,
     vae,
@@ -1264,8 +1379,8 @@ def encode_edit_reference_latents(
 
     def build():
         packed = []
-        for image in selected:
-            prepared = prepare_qwen_edit_reference_image(image, use_w, use_h, resize_mode)
+        for source_image in selected:
+            prepared = prepare_qwen_edit_reference_image(source_image, use_w, use_h, resize_mode)
             encoded = vae_util.encode(
                 vae=vae, image=image_util.to_array(prepared), tiling_config=None
             )
@@ -2125,7 +2240,7 @@ def _sample_ideogram4(defn, comps, params, cache, on_progress=None):
     return stacked
 
 
-def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
+def _sample_moss(defn, model_handle, comps, params, cache, guidance, on_progress=None):
     """MOSS native spatial-latent sampling with official negative-layer CFG."""
     positive = cached_encoding(cache, params["positive_encoding_key"], "正")
     negative = (
@@ -2134,8 +2249,43 @@ def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
         else None
     )
     transformer = comps["transformer"]
+    reference_kv = None
+    negative_reference_kv = None
+    reference_cache_key = params.get("moss_ref_cache_key", "")
+    if reference_cache_key:
+        kv_cache_key = params.get("moss_kv_cache_key", "")
+        if not kv_cache_key:
+            raise RuntimeError(
+                "MOSS 参考图已连接，但 moss_kv_cache_key 缺失；"
+                "请重新运行 MlxMossReferenceImageEncoder 和 MlxKSamplerMLX"
+            )
+        reference_latent = cached_moss_reference(cache, reference_cache_key)
+        reference_kv = build_moss_reference_kv(
+            transformer,
+            reference_latent,
+            positive,
+            cache,
+            kv_cache_key,
+        )
+        if negative is not None:
+            negative_reference_kv = build_moss_reference_kv(
+                transformer,
+                reference_latent,
+                negative,
+                cache,
+                moss_reference_kv_cache_key(
+                    model_handle,
+                    reference_cache_key,
+                    params["negative_encoding_key"],
+                ),
+            )
     final = []
     for batch_index in range(int(params["batch_size"])):
+        # The reference branch is clean t=0 and is supplied through the
+        # cached K/V prefix.  The target branch still follows the official
+        # flow-matching contract and starts from fp32 Gaussian noise; a zero
+        # target is outside the DiT's training distribution and collapses the
+        # decoded image into a nearly constant color.
         current = moss_latent.create_noise(
             int(params["seed"]) + batch_index,
             int(params["height"]),
@@ -2152,6 +2302,7 @@ def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
                 timestep_tensor,
                 positive.embeddings,
                 positive.attention_mask,
+                reference_kv=reference_kv,
             ).astype(mx.float32)
             if negative is None:
                 prediction = cond
@@ -2164,6 +2315,7 @@ def _sample_moss(defn, comps, params, cache, guidance, on_progress=None):
                     # Official MOSS-SFT CFG skips zero-based block 22 only
                     # for the negative branch.
                     skip_layers=(22,),
+                    reference_kv=negative_reference_kv,
                 ).astype(mx.float32)
                 prediction = uncond + float(guidance) * (cond - uncond)
             current = scheduler.step(prediction, timestep_value, current)
@@ -2233,7 +2385,9 @@ def run_sampler(defn, model_handle, comps, params, cache):
                 "qwen_image_21 的 edit 路径）"
             )
         if defn.family == "moss":
-            return _sample_moss(defn, comps, params, cache, guidance, progress.update)
+            return _sample_moss(
+                defn, model_handle, comps, params, cache, guidance, progress.update
+            )
         if defn.family == "flux2":
             return _sample_flux2(
                 defn, comps, params, cache, model_config, guidance, progress.update

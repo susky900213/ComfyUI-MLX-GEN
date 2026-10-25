@@ -16,6 +16,8 @@ from .h3_two_stage import (
     MlxH3SecondPassSampler,
 )
 from .lora import MlxClipLoraApply, MlxModelLoraApply, MlxMoss4StepLoraApply, MlxVaeLoraApply
+from .moss_image_edit_lora import MlxMossImageEditLoraApply
+from .moss_reference_encoder import MlxMossReferenceImageEncoder
 from .text_encoder import MlxTextEncoder
 from .qwen_edit import MlxQwenEditEncoder
 from .ref_image_set import MlxRefImageSet
@@ -57,6 +59,8 @@ __all__ = [
     "MlxTransformerLoader",
     "MlxModelLoraApply",
     "MlxMoss4StepLoraApply",
+    "MlxMossImageEditLoraApply",
+    "MlxMossReferenceImageEncoder",
     "MlxClipLoraApply",
     "MlxVaeLoraApply",
     "MlxKSamplerMLX",

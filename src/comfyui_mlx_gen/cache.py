@@ -21,6 +21,10 @@ _TYPE_CAPS: dict[str, int] = {
     # qwen_image_21：预处理 PIL + 64 通道 latent + 各图网格），
     # 换图 / 换尺寸才会有第二条
     "ref_encoding": 2,
+    # MOSS Image Edit 的 Flux.2-normalized spatial reference latent，以及按
+    # 正/负文本分别建立的 block K/V；两者都只保留当前工作流的一份。
+    "moss_ref_encoding": 2,
+    "moss_ref_kv": 2,
     # 参考图集（MlxRefImageSet 的有序 PIL 元组，uint8 ≈ 3MB/MP）：当前用的一份 + 刚换掉的一份
     "ref_source": 2,
     # --- MiniMax-H3（不与图片链路共用桶：单条配置的组件就多、每条都几十 GB）---

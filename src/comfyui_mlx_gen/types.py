@@ -35,6 +35,7 @@ condition = "condition"  # 单条提示词 + 编码它所用的组件配置
 vae = "mlx_vae"  # MLX VAE handle（MlxVAELoader → MlxVAEEncoder / MlxVAEDecoder）
 ref_images = "mlx_ref_images"  # Flux.2 参考图条件（打包好的参考图 latent + grid ids）
 ref_source = "mlx_ref_image_src"  # 有序参考图源（多图，各自保留原尺寸；MlxRefImageSet → MlxVAEEncoder）
+moss_ref_image = "mlx_moss_ref_image"  # MOSS Image Edit 专用参考 latent（不与通用 ref_images 混用）
 # H3 视觉条件（首 / 尾帧锚点 + 多图参考；图片本体留在缓存，handle 只带键、顺序与画布）
 h3_keyframes = "mlx_h3_keyframes"
 FIBO2_FAMILY = "fibo2"
@@ -445,6 +446,33 @@ class MlxReferenceImages:
     edit_kind: str = "flux2"  # "flux2" | "flux3" | "qwen_edit" | "qwen_image_21" | "fibo2"
     cond_grid: tuple[int, int, int] | None = None  # qwen_edit：(1, height//16, width//16)
     seq_len: int = 0  # 参考图 token 数（诊断/打印用）
+
+
+@dataclass(frozen=True)
+class MlxMossReferenceImage:
+    """MOSS Image Edit 参考条件。
+
+    MOSS 的参考分支不是 Flux.2/Qwen 的 packed-latent 条件：VAE latent 在
+    Flux.2 的 2×2 patchify + BN 归一化后，恢复为 MOSS 的空间布局，采样器
+    先以 timestep=0 前向并缓存每个 DiT block 的 reference image K/V。
+    数组本体保存在 ``cache.py`` 的 ``moss_ref_encoding`` 桶里。
+    """
+
+    model_type: str
+    vae_path: str
+    count: int
+    height: int
+    width: int
+    cache_key: str
+    vae_cache_key: str = ""
+    precision: str = ""
+    quantize: int = 0
+    latent_height: int = 0
+    latent_width: int = 0
+    # Reference-branch identity derived from cache_key.  The actual K/V cache
+    # key also includes the sampler's transformer and text-conditioning keys,
+    # because neither is available to the reference-image encoder.
+    kv_cache_key: str = ""
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ DiT.  It is intentionally not implemented through the Flux.2 transformer.
 """
 
 from .config import MOSSConfig, load_config, validate_config
-from .latent import create_noise, unpack_latents, validate_dimensions
+from .latent import create_noise, create_zero, unpack_latents, validate_dimensions
 from .scheduler import MOSSImageScheduler
 from .transformer import MOSSImageTransformer
 
@@ -14,6 +14,7 @@ __all__ = [
     "MOSSImageScheduler",
     "MOSSImageTransformer",
     "create_noise",
+    "create_zero",
     "load_config",
     "unpack_latents",
     "validate_config",

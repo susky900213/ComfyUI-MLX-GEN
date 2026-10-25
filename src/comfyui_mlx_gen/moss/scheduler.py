@@ -57,10 +57,10 @@ class MOSSImageScheduler:
         if len(snapped) > 1:
             keep = np.concatenate(([True], snapped[1:] != snapped[:-1]))
             snapped = snapped[keep]
-        # Diffusers' FlowMatchEulerDiscreteScheduler converts custom sigmas
-        # to timesteps with ``sigma * num_train_timesteps`` and appends a
-        # terminal zero sigma.  Keep that exact contract rather than using
-        # the latent grid's ``num_train_timesteps - 1`` scale.
+        # The official Diffusers scheduler receives already-snapped sigmas,
+        # keeps them as the Euler integration grid, and exposes
+        # ``timestep = sigma * num_train_timesteps`` to the transformer.  MOSS
+        # then computes its sinusoid directly from that 0..1000 timestep.
         self.sigmas = np.concatenate([snapped, np.zeros((1,), dtype=np.float32)])
         self.timesteps = (snapped * float(self.num_train_timesteps)).astype(np.float32)
         self._step_index = 0

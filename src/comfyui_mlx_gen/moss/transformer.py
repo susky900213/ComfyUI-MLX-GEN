@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Iterable
 
 import mlx.core as mx
@@ -40,16 +41,29 @@ def _activation_dtype(module: nn.Module, fallback: mx.Dtype) -> mx.Dtype:
 
 
 def _rope_rotate(x: mx.array, rope: mx.array) -> mx.array:
-    """Apply the official MOSS split-half rotary convention.
+    """Apply ComfyUI's official split-half 2×2 rotary matrices.
 
-    ``x`` is ``[B,S,heads,head_dim]`` and ``rope`` is ``[1,S,head_dim]``.
+    The upstream ``rope_split_half`` first reshapes a head as
+    ``[..., 2, head_dim // 2]`` and moves the pair axis to the end.  Each pair
+    is therefore ``(x[i], x[i + head_dim // 2])``; after rotation the result is
+    moved back to the original ``[first_half | second_half]`` storage order.
+
+    ``x`` is ``[B,S,heads,head_dim]`` and ``rope`` is
+    ``[1,S,head_dim // 2,2,2]``.
     """
-    sin, cos = mx.split(rope, 2, axis=-1)
-    sin = mx.concatenate([sin, sin], axis=-1)[:, :, None, :].astype(x.dtype)
-    cos = mx.concatenate([cos, cos], axis=-1)[:, :, None, :].astype(x.dtype)
-    first, second = mx.split(x, 2, axis=-1)
-    rotated = mx.concatenate([-second, first], axis=-1)
-    return x * cos + rotated * sin
+    half = x.shape[-1] // 2
+    rotation_dtype = rope.dtype
+    pairs = x.astype(rotation_dtype).reshape(*x.shape[:-1], 2, half).transpose(
+        *range(len(x.shape) - 1), len(x.shape), len(x.shape) - 1
+    )
+    matrices = rope[:, :, None, ...]
+    first = pairs[..., 0][..., None]
+    second = pairs[..., 1][..., None]
+    rotated = matrices[..., 0] * first + matrices[..., 1] * second
+    restored = rotated.transpose(
+        *range(len(x.shape) - 1), len(x.shape), len(x.shape) - 1
+    )
+    return restored.reshape(x.shape).astype(x.dtype)
 
 
 def _attention(
@@ -59,6 +73,7 @@ def _attention(
     rope: mx.array,
     heads: int,
     attention_mask: mx.array | None = None,
+    reference_kv: "MOSSBlockKVCache | None" = None,
 ) -> mx.array:
     batch, sequence, _ = q.shape
     head_dim = q.shape[-1] // heads
@@ -66,8 +81,23 @@ def _attention(
     key = k.reshape(batch, sequence, heads, head_dim)
     value = v.reshape(batch, sequence, heads, head_dim)
     query = _rope_rotate(query, rope).transpose(0, 2, 1, 3)
-    key = _rope_rotate(key, rope).transpose(0, 2, 1, 3)
+    key = _rope_rotate(key, rope)
+    if reference_kv is not None:
+        ref_key = reference_kv.keys.reshape(batch, -1, heads, head_dim)
+        ref_value = reference_kv.values.reshape(batch, -1, heads, head_dim)
+        # The official MOSS attention keeps the current image/text sequence
+        # first and appends the cached reference prefix to its K/V sequence.
+        # ``reference_kv.keys`` is already RoPE-rotated when it is captured;
+        # applying the reference RoPE again here would rotate it twice.
+        key = mx.concatenate([key, ref_key], axis=1)
+        value = mx.concatenate([value, ref_value], axis=1)
+    key = key.transpose(0, 2, 1, 3)
     value = value.transpose(0, 2, 1, 3)
+    if attention_mask is not None and reference_kv is not None:
+        reference_mask = mx.ones(
+            (batch, 1, 1, reference_kv.keys.shape[1]), dtype=mx.bool_
+        )
+        attention_mask = mx.concatenate([attention_mask, reference_mask], axis=-1)
     output = mx.fast.scaled_dot_product_attention(
         query,
         key,
@@ -76,6 +106,34 @@ def _attention(
         mask=attention_mask,
     )
     return output.transpose(0, 2, 1, 3).reshape(batch, sequence, -1)
+
+
+@dataclass(frozen=True)
+class MOSSBlockKVCache:
+    """One block's reference K/V and its reference RoPE metadata.
+
+    ``keys`` is stored after RoPE, matching ComfyUI's ``preprocess_refs``
+    path.  ``rope`` is retained as metadata for cache validation/inspection.
+    """
+
+    keys: mx.array
+    values: mx.array
+    rope: mx.array
+
+
+@dataclass(frozen=True)
+class MOSSReferenceKVCache:
+    """All reference-branch attention K/V tensors for one MOSS sample."""
+
+    layers: tuple[MOSSBlockKVCache, ...]
+    image_tokens: int
+    text_tokens: int
+
+    def __post_init__(self) -> None:
+        if not self.layers:
+            raise ValueError("MOSS reference KV cache 不能为空")
+        if self.image_tokens <= 0 or self.text_tokens < 0:
+            raise ValueError("MOSS reference KV cache 必须包含 image token，text token 数不能为负")
 
 
 class MOSSImageTextBlock(nn.Module):
@@ -101,6 +159,8 @@ class MOSSImageTextBlock(nn.Module):
         rope: mx.array,
         token_mask: mx.array | None = None,
         activation_dtype: mx.Dtype = mx.bfloat16,
+        reference_kv: MOSSBlockKVCache | None = None,
+        capture_kv: bool = False,
     ) -> mx.array:
         q, k, value = mx.split(self.qkv(self.norm1(x)), 3, axis=-1)
         batch, sequence, _ = q.shape
@@ -162,6 +222,8 @@ class MOSSImageBlock(nn.Module):
         modulation: mx.array,
         token_mask: mx.array | None = None,
         activation_dtype: mx.Dtype = mx.bfloat16,
+        reference_kv: MOSSBlockKVCache | None = None,
+        capture_kv: bool = False,
     ) -> mx.array:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mx.split(modulation, 6, axis=1)
         # mx.split(axis=1) already returns [B,1,D], which is the broadcast
@@ -177,39 +239,96 @@ class MOSSImageBlock(nn.Module):
         head_dim = q.shape[-1] // self.heads
         q = self.q_norm(q.reshape(batch, sequence, self.heads, head_dim)).reshape(batch, sequence, -1)
         k = self.k_norm(k.reshape(batch, sequence, self.heads, head_dim)).reshape(batch, sequence, -1)
+        rotated_k = _rope_rotate(
+            k.reshape(batch, sequence, self.heads, head_dim), rope
+        ).reshape(batch, sequence, -1)
         attention_mask = None
         if token_mask is not None:
             attention_mask = token_mask[:, None, :, None] & token_mask[:, None, None, :]
         x = x + self.proj["o"](
-            _attention(q, k, value, rope, self.heads, attention_mask)
+            _attention(q, k, value, rope, self.heads, attention_mask, reference_kv)
         ) * gate_a
         normalized = self.norm2(x) * (1.0 + scale_f) + shift_f
         normalized = normalized.astype(_activation_dtype(self.proj["ffn_up_gate"], activation_dtype))
         hidden, gate = mx.split(self.proj["ffn_up_gate"](normalized), 2, axis=-1)
-        return x + self.proj["ffn_down"](_situ(hidden, gate)) * gate_f
+        output = x + self.proj["ffn_down"](_situ(hidden, gate)) * gate_f
+        if capture_kv:
+            return output, MOSSBlockKVCache(rotated_k, value, rope)
+        return output
 
 
 class MOSSImageRoPE:
     def __init__(self, head_dim: int, base: float):
         self.num_bands = head_dim // 8
+        self.axis_dim = head_dim // 4
         self.base = float(base)
 
-    def __call__(self, height: int, width: int, text_length: int) -> mx.array:
-        bands = 1.0 / (self.base ** (mx.arange(self.num_bands, dtype=mx.float32) / self.num_bands))
+    def _matrices(self, positions: mx.array) -> mx.array:
+        """Turn ``[S,4]`` MOSS coordinates into split-half RoPE matrices."""
+        # Match the official MOSS reference pipeline's fp32 construction:
+        # ``arange(num_bands) / num_bands``.  For the released head width this
+        # is numerically the same endpoint as Flux's per-axis formulation.
+        exponent = mx.arange(self.num_bands, dtype=mx.float32) / self.num_bands
+        bands = 1.0 / (self.base**exponent)
+        phase = positions[:, :, None] * bands[None, None, :]
+        sine = mx.sin(phase)
+        cosine = mx.cos(phase)
+        row0 = mx.stack([cosine, -sine], axis=-1)
+        row1 = mx.stack([sine, cosine], axis=-1)
+        # [S,4,bands,2,2] → [1,S,4*bands,2,2].  The axis/band order is
+        # exactly the order produced by ComfyUI's per-axis rope concatenation.
+        return mx.stack([row0, row1], axis=-2).reshape(
+            1, positions.shape[0], self.num_bands * 4, 2, 2
+        )
+
+    def __call__(
+        self,
+        height: int,
+        width: int,
+        text_length: int,
+        f_offset: float = 0.0,
+    ) -> mx.array:
+        """RoPE for the target image followed by its refined text tokens."""
         rows = mx.arange(height, dtype=mx.float32)
         cols = mx.arange(width, dtype=mx.float32)
         grid_h, grid_w = mx.meshgrid(rows, cols, indexing="ij")
         image = mx.stack(
-            [mx.zeros_like(grid_h), mx.full_like(grid_h, float(text_length)), grid_h, grid_w], axis=-1
+            [
+                mx.zeros_like(grid_h),
+                mx.full_like(grid_h, float(text_length) + float(f_offset)),
+                grid_h,
+                grid_w,
+            ],
+            axis=-1,
         ).reshape(-1, 4)
         image = image.at[:, 2].add(-(height - 1) / 2.0)
         image = image.at[:, 3].add(-(width - 1) / 2.0)
         text = mx.zeros((text_length, 4), dtype=mx.float32)
-        text[:, 1] = mx.arange(text_length, dtype=mx.float32)
-        positions = mx.concatenate([image, text], axis=0)
-        phase = positions[:, :, None] * bands[None, None, :]
-        # [S,4,bands] -> [S,head_dim], matching torch.cat((sin,cos), -2).flatten(-2)
-        return mx.concatenate([mx.sin(phase), mx.cos(phase)], axis=1).reshape(1, -1, self.num_bands * 8)
+        text[:, 1] = mx.arange(text_length, dtype=mx.float32) + float(f_offset)
+        return self._matrices(mx.concatenate([image, text], axis=0))
+
+    def reference(self, height: int, width: int, reference_index: int = 1) -> mx.array:
+        """RoPE for one clean reference image at ``t=0``.
+
+        The official MOSS edit path caches only reference image tokens.  Their
+        temporal/reference coordinate is ``r=1, f=0``; no text tokens are part
+        of this prefix-only cache.
+        """
+        rows = mx.arange(height, dtype=mx.float32)
+        cols = mx.arange(width, dtype=mx.float32)
+        grid_h, grid_w = mx.meshgrid(rows, cols, indexing="ij")
+        image = mx.stack(
+            [
+                mx.full_like(grid_h, float(reference_index)),
+                mx.zeros_like(grid_h),
+                grid_h,
+                grid_w,
+            ],
+            axis=-1,
+        ).reshape(-1, 4)
+        image = image.at[:, 2].add(-(height - 1) / 2.0)
+        image = image.at[:, 3].add(-(width - 1) / 2.0)
+        return self._matrices(image)
 
 
 def _timestep_embedding(timestep: mx.array, freq_dim: int) -> mx.array:
@@ -221,6 +340,9 @@ def _timestep_embedding(timestep: mx.array, freq_dim: int) -> mx.array:
     embedding directly to bf16 changes the modulation vector at every denoising
     step and produces a visibly corrupted image.
     """
+    # The official MOSS pipeline computes this directly from the scheduler's
+    # sigma/timestep.  Unlike ComfyUI's generic timestep_embedding helper, it
+    # does not apply an additional time_factor=1000.
     values = timestep.astype(mx.float32).reshape(-1, 1)
     half = freq_dim // 2
     frequencies = mx.exp(-math.log(10_000.0) * mx.arange(half, dtype=mx.float32) / half)
@@ -269,6 +391,7 @@ class MOSSImageTransformer(nn.Module):
         encoder_hidden_states: mx.array,
         encoder_attention_mask: mx.array | None = None,
         skip_layers: Iterable[int] | None = None,
+        reference_kv: MOSSReferenceKVCache | None = None,
     ) -> mx.array:
         if hidden_states.ndim != 4 or hidden_states.shape[1] != self.latent_channels:
             raise ValueError("MOSS hidden_states 必须是 [B,128,H,W]")
@@ -301,6 +424,11 @@ class MOSSImageTransformer(nn.Module):
         head = self.video_head_modulation(
             time.astype(_activation_dtype(self.video_head_modulation, dtype))
         ).reshape(batch, 2, -1)
+        if reference_kv is not None and len(reference_kv.layers) != len(self.layers):
+            raise ValueError(
+                "MOSS reference KV cache 的 block 数量与 Transformer 不一致："
+                f"{len(reference_kv.layers)} != {len(self.layers)}"
+            )
         outputs = []
         for index in range(batch):
             valid = mask[index].astype(mx.bool_)
@@ -317,8 +445,18 @@ class MOSSImageTransformer(nn.Module):
             context = encoder_hidden_states[index : index + 1, :valid_length]
             video = hidden_states[index : index + 1].transpose(0, 2, 3, 1).reshape(1, height * width, -1)
             video = self.video_embedder(video.astype(dtype))
-            rope = self.rope(height, width, int(context.shape[1])).astype(video.dtype)
-            text = self.text_embedder(context, rope[:, height * width :], None, self.activation_dtype)
+            rope = self.rope(
+                height,
+                width,
+                int(context.shape[1]),
+                f_offset=-int(context.shape[1]) if reference_kv is not None else 0.0,
+            )
+            text = self.text_embedder(
+                context,
+                rope[:, height * width :],
+                None,
+                self.activation_dtype,
+            )
             value = mx.concatenate([video, text], axis=1)
             token_mask = None
             for layer_index, layer in enumerate(self.layers):
@@ -329,6 +467,7 @@ class MOSSImageTransformer(nn.Module):
                         modulation[index : index + 1],
                         token_mask,
                         self.activation_dtype,
+                        reference_kv.layers[layer_index] if reference_kv is not None else None,
                     )
             value = self.final_norm_video(
                 value[:, : height * width].astype(self.final_norm_video.weight.dtype)
@@ -339,3 +478,63 @@ class MOSSImageTransformer(nn.Module):
             )
             outputs.append(value.transpose(0, 2, 1).reshape(1, -1, height, width))
         return mx.concatenate(outputs, axis=0)
+
+    def build_reference_kv(
+        self,
+        reference_states: mx.array,
+        timestep: mx.array | float,
+        encoder_hidden_states: mx.array,
+        encoder_attention_mask: mx.array | None = None,
+    ) -> MOSSReferenceKVCache:
+        """Run the reference branch once and cache every block's K/V.
+
+        The official ``ref-prefix-only-t0`` edit path evaluates only the clean
+        reference image at timestep zero.  Text is refined independently in the
+        target branch and is not part of this cache.
+        """
+        if reference_states.ndim != 4 or reference_states.shape[1] != self.latent_channels:
+            raise ValueError("MOSS reference_states 必须是 [B,128,H,W]")
+        if reference_states.shape[0] != 1 or encoder_hidden_states.shape[0] != 1:
+            raise ValueError("MOSS reference KV cache 当前要求 batch size=1")
+        if encoder_attention_mask is not None and tuple(encoder_attention_mask.shape) != tuple(
+            encoder_hidden_states.shape[:2]
+        ):
+            raise ValueError("MOSS reference attention_mask 形状不匹配")
+
+        times = mx.array(timestep, dtype=mx.float32).reshape(-1)
+        if times.shape[0] != 1 or float(times.item()) != 0.0:
+            raise ValueError("MOSS reference KV cache 必须使用 timestep=0")
+
+        _, _, height, width = reference_states.shape
+        dtype = self.activation_dtype
+        time_input = _timestep_embedding(times, self.freq_dim)
+        time = self.time_embedding[2](
+            nn.silu(
+                self.time_embedding[0](
+                    time_input.astype(_activation_dtype(self.time_embedding[0], dtype))
+                )
+            )
+        ).astype(mx.float32)
+        modulation = self.shared_block_modulation(
+            time.astype(_activation_dtype(self.shared_block_modulation, dtype))
+        ).reshape(1, 6, -1)
+        video = reference_states.transpose(0, 2, 3, 1).reshape(1, height * width, -1)
+        video = self.video_embedder(video.astype(dtype))
+        rope = self.rope.reference(height, width)
+        value = video
+        caches: list[MOSSBlockKVCache] = []
+        for layer in self.layers:
+            value, block_cache = layer(
+                value,
+                rope,
+                modulation,
+                None,
+                self.activation_dtype,
+                capture_kv=True,
+            )
+            caches.append(block_cache)
+        return MOSSReferenceKVCache(
+            tuple(caches),
+            image_tokens=height * width,
+            text_tokens=0,
+        )

@@ -39,13 +39,22 @@ MOSS_LORA_KEY_RE = re.compile(
     r"(alpha|lora_down\.weight|lora_up\.weight)$"
 )
 MOSS_STANDARD_LORA_KEY_RE = re.compile(
-    r"^transformer\.layers\.(\d+)\.proj\."
+    r"^(?:(?:base_model\.model\.)?(?:transformer\.|diffusion_model\.)|"
+    r"base_model\.model\.|transformer\.|diffusion_model\.)?layers\."
+    r"(\d+)\.proj\."
     r"(q|k|v|o|ffn_up_gate|ffn_down)\."
-    r"lora_(A|B)\.weight$"
+    r"lora_(A|B)(?:(?:\.default)?(?:\.weight)?)?$"
 )
 MOSS_LORA_PROJECTIONS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 MOSS_LORA_LAYERS = 42
 MOSS_LORA_MAX_RANK = 128
+MOSS_IMAGE_EDIT_FORMAT = "moss-edit-lora"
+
+_MOSS_MODULE_RE = re.compile(
+    r"^(?:(?:base_model\.model\.)?(?:transformer\.|diffusion_model\.)|"
+    r"base_model\.model\.|transformer\.|diffusion_model\.)?layers\."
+    r"(\d+)\.proj\.(q|k|v|o|ffn_up_gate|ffn_down)$"
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,125 @@ def _target_key(layer: int, projection: str, suffix: str) -> str:
 
 def _standard_target_key(layer: int, projection: str, matrix: str) -> str:
     return f"transformer.layers.{layer}.proj.{projection}.lora_{matrix}.weight"
+
+
+def _standard_key_candidates(layer: int, projection: str, matrix: str) -> tuple[str, ...]:
+    """Return the PEFT spellings accepted by the native MOSS loader.
+
+    The converted image-edit adapter is intentionally not a byte-for-byte copy
+    of the usual PEFT output: it omits both ``transformer.`` and ``.weight``.
+    Keep the canonical Diffusers/PEFT spelling first so existing adapters retain
+    their established behavior, then accept the unprefixed and ``default``
+    variants emitted by different PEFT versions.
+    """
+    prefixes = (
+        "transformer.",
+        "",
+        "base_model.model.transformer.",
+        "base_model.model.",
+        "diffusion_model.",
+        "base_model.model.diffusion_model.",
+    )
+    suffixes = (
+        f"lora_{matrix}.weight",
+        f"lora_{matrix}",
+        f"lora_{matrix}.default.weight",
+        f"lora_{matrix}.default",
+    )
+    return tuple(
+        f"{prefix}layers.{layer}.proj.{projection}.{suffix}"
+        for prefix in prefixes
+        for suffix in suffixes
+    )
+
+
+def _standard_key_map(entries: dict[str, Any]) -> dict[tuple[int, str, str], str]:
+    """Normalize accepted PEFT tensor names to ``(layer, projection, A/B)``."""
+    result: dict[tuple[int, str, str], str] = {}
+    for key in entries:
+        match = MOSS_STANDARD_LORA_KEY_RE.fullmatch(key)
+        if match is None:
+            raise ValueError(f"包含非法 MOSS PEFT LoRA key: {key}")
+        target = (int(match.group(1)), match.group(2), match.group(3))
+        if target in result:
+            raise ValueError(
+                f"MOSS PEFT LoRA 为 {target} 提供了重复 tensor：{result[target]} 和 {key}"
+            )
+        result[target] = key
+    return result
+
+
+def _standard_tensor_key(keys: Any, layer: int, projection: str, matrix: str) -> str:
+    """Find the actual payload key for one normalized PEFT target."""
+    available = set(keys)
+    for candidate in _standard_key_candidates(layer, projection, matrix):
+        if candidate in available:
+            return candidate
+    raise KeyError(
+        f"missing MOSS PEFT tensor: layers.{layer}.proj.{projection}.lora_{matrix}"
+    )
+
+
+def _adapter_config(file: Path, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    """Read a PEFT directory config or the copy embedded in safetensors metadata."""
+    config_file = file.parent / "adapter_config.json"
+    raw: Any = None
+    if config_file.is_file():
+        try:
+            raw = json.loads(config_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{config_file} 不是合法的 adapter_config.json") from exc
+    elif "adapter_config" in metadata:
+        raw = metadata["adapter_config"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{file.name} 的 adapter_config metadata 不是合法 JSON") from exc
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{file.name} 的 adapter_config 必须是 object")
+    return raw
+
+
+def _module_specs(config: dict[str, Any] | None) -> dict[tuple[int, str], tuple[int, float]]:
+    """Normalize per-module rank/alpha declarations from a PEFT config."""
+    if config is None:
+        return {}
+    modules = config.get("modules", {})
+    if not isinstance(modules, dict):
+        raise ValueError("MOSS adapter_config 的 modules 必须是 object")
+    specs: dict[tuple[int, str], tuple[int, float]] = {}
+    for name, value in modules.items():
+        match = _MOSS_MODULE_RE.fullmatch(str(name))
+        if match is None or not isinstance(value, dict):
+            raise ValueError(f"MOSS adapter_config 包含非法 module: {name}")
+        try:
+            rank = int(value["rank"])
+            alpha = float(value["alpha"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"MOSS adapter_config 的 {name} rank/alpha 无效") from exc
+        if not 1 <= rank <= MOSS_LORA_MAX_RANK or not math.isfinite(alpha):
+            raise ValueError(f"MOSS adapter_config 的 {name} rank/alpha 无效：rank={rank}, alpha={alpha}")
+        specs[(int(match.group(1)), match.group(2))] = (rank, alpha)
+    return specs
+
+
+def is_image_edit_adapter(path: str | Path) -> bool:
+    """Return whether a MOSS adapter declares the dedicated image-edit format."""
+    file = Path(path)
+    config = _adapter_config(file, _header(file)[1])
+    return bool(config and config.get("format") == MOSS_IMAGE_EDIT_FORMAT)
+
+
+def has_image_edit_adapter(refs: tuple[LoraRef, ...]) -> bool:
+    """Return whether active refs include the dedicated image-edit adapter."""
+    for ref in active_loras(refs):
+        path = resolve_lora_path(ref.path)
+        if is_image_edit_adapter(path):
+            return True
+    return False
 
 
 def validate_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRATarget]:
@@ -205,6 +333,10 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
     if file.suffix.lower() != ".safetensors":
         raise ValueError(f"MOSS 普通 LoRA 必须是 .safetensors 文件: {file}")
     entries, metadata = _header(file)
+    config = _adapter_config(file, metadata)
+    if config is not None and config.get("format") not in (None, MOSS_IMAGE_EDIT_FORMAT):
+        raise ValueError(f"{file.name} 不是支持的 MOSS PEFT adapter format: {config.get('format')!r}")
+
     adapter_metadata: dict[str, Any] = {}
     raw_adapter_metadata = metadata.get("lora_adapter_metadata")
     if isinstance(raw_adapter_metadata, str):
@@ -220,34 +352,44 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
             raise ValueError(f"{file.name} 的 lora_adapter_metadata 必须是 object")
         adapter_metadata = raw_adapter_metadata
 
+    module_specs = _module_specs(config)
     try:
-        rank = int(adapter_metadata.get("r", 0))
-        alpha = float(adapter_metadata.get("lora_alpha", rank))
+        global_rank = int(adapter_metadata.get("r", 0))
+        global_alpha = float(adapter_metadata.get("lora_alpha", global_rank))
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{file.name} 的 PEFT rank/alpha 元数据无效") from exc
-    if not 1 <= rank <= MOSS_LORA_MAX_RANK or not math.isfinite(alpha):
-        raise ValueError(f"{file.name} 的 PEFT rank/alpha 无效：rank={rank}, alpha={alpha}")
+        if not module_specs:
+            raise ValueError(f"{file.name} 的 PEFT rank/alpha 元数据无效") from exc
+        global_rank = global_alpha = 0
+    if module_specs:
+        if len(module_specs) != MOSS_LORA_LAYERS * len(MOSS_LORA_PROJECTIONS):
+            raise ValueError(
+                f"{file.name} 的 MOSS adapter_config 目标覆盖不完整："
+                f"实际 {len(module_specs)}，期望 {MOSS_LORA_LAYERS * len(MOSS_LORA_PROJECTIONS)}"
+            )
+    elif not 1 <= global_rank <= MOSS_LORA_MAX_RANK or not math.isfinite(global_alpha):
+        raise ValueError(
+            f"{file.name} 的 PEFT rank/alpha 无效：rank={global_rank}, alpha={global_alpha}"
+        )
 
-    expected_keys = {
-        _standard_target_key(layer, projection, matrix)
+    key_map = _standard_key_map(entries)
+    expected_targets = {
+        (layer, projection, matrix)
         for layer in range(MOSS_LORA_LAYERS)
         for projection in MOSS_LORA_PROJECTIONS
         for matrix in ("A", "B")
     }
-    actual_keys = set(entries)
-    if actual_keys != expected_keys:
-        missing = sorted(expected_keys - actual_keys)
-        extra = sorted(actual_keys - expected_keys)
+    actual_targets = set(key_map)
+    if actual_targets != expected_targets:
+        missing = sorted(expected_targets - actual_targets)
+        extra = sorted(actual_targets - expected_targets)
         raise ValueError(
             f"{file.name} 的 MOSS 普通 LoRA 层覆盖不完整："
             f"missing={missing[:4]}, extra={extra[:4]}"
         )
 
     targets: dict[tuple[int, str], MOSSLoRATarget] = {}
-    for key, value in entries.items():
-        match = MOSS_STANDARD_LORA_KEY_RE.fullmatch(key)
-        if match is None:
-            raise ValueError(f"{file.name} 包含非法 MOSS 普通 LoRA key: {key}")
+    for (layer, projection, matrix), key in key_map.items():
+        value = entries[key]
         if value.get("dtype") != "BF16":
             raise ValueError(
                 f"{file.name} 的 {key} dtype={value.get('dtype')!r}，"
@@ -256,12 +398,10 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
         shape = tuple(int(item) for item in value.get("shape", ()))
         if len(shape) != 2:
             raise ValueError(f"{file.name} 的 {key} 必须是二维矩阵，收到 shape={shape}")
-        layer = int(match.group(1))
-        projection = match.group(2)
-        matrix = match.group(3)
         old = targets.get((layer, projection))
         down_shape = shape if matrix == "A" else (old.down_shape if old else ())
         up_shape = shape if matrix == "B" else (old.up_shape if old else ())
+        rank, alpha = module_specs.get((layer, projection), (global_rank, global_alpha))
         targets[(layer, projection)] = MOSSLoRATarget(
             layer,
             projection,
@@ -272,6 +412,7 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
         )
 
     for (layer, projection), target in targets.items():
+        rank, alpha = module_specs.get((layer, projection), (global_rank, global_alpha))
         input_dims, output_dims = _expected_shapes(projection)
         if target.down_shape != (rank, input_dims) or target.up_shape != (output_dims, rank):
             raise ValueError(
@@ -279,7 +420,31 @@ def validate_standard_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRA
                 f"lora_A={target.down_shape}, lora_B={target.up_shape}，"
                 f"期望 lora_A=({rank},{input_dims}), lora_B=({output_dims},{rank})"
             )
+        targets[(layer, projection)] = MOSSLoRATarget(
+            target.layer,
+            target.projection,
+            rank,
+            alpha,
+            target.down_shape,
+            target.up_shape,
+        )
     return targets
+
+
+def validate_image_edit_header(path: str | Path) -> dict[tuple[int, str], MOSSLoRATarget]:
+    """Validate the dedicated MOSS image-edit PEFT adapter contract."""
+    file = Path(path)
+    entries, metadata = _header(file)
+    config = _adapter_config(file, metadata)
+    if config is None or config.get("format") != MOSS_IMAGE_EDIT_FORMAT:
+        actual = None if config is None else config.get("format")
+        raise ValueError(
+            f"{file.name} 不是 MOSS image-edit adapter（format={actual!r}）；"
+            f"需要 format={MOSS_IMAGE_EDIT_FORMAT!r}"
+        )
+    if config.get("format_version") != 1:
+        raise ValueError(f"{file.name} 的 MOSS image-edit adapter format_version 不支持")
+    return validate_standard_header(file)
 
 
 class MOSSLoRALinear(nn.Module):
@@ -552,8 +717,12 @@ def apply_standard_lora(transformer: Any, model_handle: Any, *, role: str = "tra
         try:
             strength = float(ref.strength)
             for (layer_index, projection), target in targets.items():
-                down = weights[_standard_target_key(layer_index, projection, "A")]
-                up = weights[_standard_target_key(layer_index, projection, "B")]
+                down = weights[
+                    _standard_tensor_key(weights, layer_index, projection, "A")
+                ]
+                up = weights[
+                    _standard_tensor_key(weights, layer_index, projection, "B")
+                ]
                 mx.eval(down, up)
                 _attach_branch(
                     layers,
@@ -630,6 +799,11 @@ def validate_generic_node_selection(model_handle: Any, selection: str, strength:
         raise ValueError("MOSS 普通 LoRA 选择不能为空")
     path = resolve_lora_path(selection)
     entries, _metadata = _header(path)
+    if is_image_edit_adapter(path):
+        raise ValueError(
+            "MOSS image-edit LoRA 不能接通用「MLX 模型 LoRA」节点；"
+            "请使用「MLX MOSS Image Edit LoRA」节点"
+        )
     if any(MOSS_STANDARD_LORA_KEY_RE.fullmatch(key) for key in entries):
         validate_standard_header(path)
         return path

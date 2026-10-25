@@ -16,11 +16,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from comfyui_mlx_gen.moss import lora  # noqa: E402
 from comfyui_mlx_gen.nodes.lora import MlxModelLoraApply, MlxMoss4StepLoraApply  # noqa: E402
+from comfyui_mlx_gen.nodes.moss_image_edit_lora import (  # noqa: E402
+    MlxMossImageEditLoraApply,
+    scan_moss_image_edit_loras,
+)
 from comfyui_mlx_gen.types import LoraRef, MlxModelHandle  # noqa: E402
 
 
 LORA_PATH = Path.home() / "ComfyUI-Shared/models/mlx/lora/moss_image_sft_4_steps_lora_v2_600_avg_rank_72_bf16.safetensors"
 STANDARD_LORA_PATH = Path.home() / "ComfyUI-Shared/models/mlx/lora/moss-sft-nsfw-pytorch_lora_weights.safetensors"
+IMAGE_EDIT_LORA_DIR = Path.home() / "ComfyUI-Shared/models/mlx/lora/moss_image_edit_lora"
+IMAGE_EDIT_LORA_PATH = IMAGE_EDIT_LORA_DIR / "adapter_model.safetensors"
 
 
 def _handle(*, loras=(), quantize=0, precision="bfloat16"):
@@ -55,6 +61,96 @@ def test_standard_header_is_fixed_rank_and_covers_all_moss_blocks():
     assert {target.alpha for target in targets.values()} == {16.0}
     assert targets[(0, "ffn_down")].down_shape == (16, 8192)
     assert targets[(0, "ffn_down")].up_shape == (3072, 16)
+
+
+def test_image_edit_header_uses_directory_config_and_covers_all_targets():
+    targets = lora.validate_image_edit_header(IMAGE_EDIT_LORA_PATH)
+    assert len(targets) == 42 * 6
+    assert {target.layer for target in targets.values()} == set(range(42))
+    assert {target.projection for target in targets.values()} == set(lora.MOSS_LORA_PROJECTIONS)
+    assert {target.rank for target in targets.values()} == {64}
+    assert {target.alpha for target in targets.values()} == {64.0}
+    assert targets[(0, "ffn_down")].down_shape == (64, 8192)
+    assert targets[(0, "ffn_down")].up_shape == (3072, 64)
+
+
+def test_image_edit_scan_only_returns_valid_peft_directories():
+    assert "moss_image_edit_lora" in scan_moss_image_edit_loras()
+
+
+def test_image_edit_node_registers_adapter_file_and_is_idempotent():
+    model = _handle()
+    node = MlxMossImageEditLoraApply()
+    adapted, = node.apply(model, "moss_image_edit_lora", 0.75)
+    assert adapted.loras == (LoraRef(str(IMAGE_EDIT_LORA_PATH.absolute()), 0.75),)
+    repeated, = node.apply(adapted, "moss_image_edit_lora", 0.75)
+    assert repeated is adapted
+
+
+def test_image_edit_adapter_is_not_accepted_by_the_shared_model_lora_node():
+    try:
+        MlxModelLoraApply().apply(_handle(), str(IMAGE_EDIT_LORA_PATH), 1.0)
+    except ValueError as exc:
+        assert "MOSS Image Edit LoRA" in str(exc)
+    else:
+        raise AssertionError("image-edit MOSS LoRA was accepted by the shared model-LoRA node")
+
+
+def test_standard_key_normalization_accepts_peft_prefix_default_and_weight_variants():
+    variants = (
+        "layers.0.proj.q.lora_A",
+        "layers.0.proj.q.lora_B.weight",
+        "transformer.layers.1.proj.k.lora_A.weight",
+        "base_model.model.layers.2.proj.v.lora_B.default",
+        "base_model.model.transformer.layers.3.proj.o.lora_A.default.weight",
+        "diffusion_model.layers.4.proj.ffn_down.lora_B.weight",
+    )
+    normalized = lora._standard_key_map({key: {} for key in variants})
+    assert set(normalized) == {
+        (0, "q", "A"),
+        (0, "q", "B"),
+        (1, "k", "A"),
+        (2, "v", "B"),
+        (3, "o", "A"),
+        (4, "ffn_down", "B"),
+    }
+
+
+def test_unprefixed_peft_payload_is_injected(monkeypatch):
+    base = nn.Linear(3, 2, bias=False)
+    base.weight = mx.zeros((2, 3), dtype=mx.float32)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(proj={"q": base})],
+        parameters=lambda: {},
+    )
+    down = mx.array([[1.0, 0.0, 0.0]], dtype=mx.float32)
+    up = mx.array([[2.0], [0.0]], dtype=mx.float32)
+    monkeypatch.setattr(lora, "MOSS_LORA_LAYERS", 1)
+    monkeypatch.setattr(lora, "MOSS_LORA_PROJECTIONS", ("q",))
+    monkeypatch.setattr(lora, "_expected_shapes", lambda projection: (3, 2))
+    monkeypatch.setattr(lora, "resolve_lora_path", lambda path: path)
+    monkeypatch.setattr(lora.mx, "load", lambda path, format=None: {
+        "layers.0.proj.q.lora_A": down,
+        "layers.0.proj.q.lora_B": up,
+    })
+    path = "image_edit/adapter_model.safetensors"
+    monkeypatch.setattr(
+        lora,
+        "_header",
+        lambda ignored: (
+            {
+                "layers.0.proj.q.lora_A": {"dtype": "BF16", "shape": [1, 3]},
+                "layers.0.proj.q.lora_B": {"dtype": "BF16", "shape": [2, 1]},
+            },
+            {"lora_adapter_metadata": '{"r": 1, "lora_alpha": 1}'},
+        ),
+    )
+    model = _handle(loras=(LoraRef(path, 1.0),))
+
+    lora.apply_lora(transformer, model)
+    output = transformer.layers[0].proj["q"](mx.array([[4.0, 5.0, 9.0]], dtype=mx.float32))
+    mx.eval(output)
+    assert output.tolist() == [[8.0, 0.0]]
 
 
 def _write_header(path: Path, *, omit: str | None = None, bad_shape: str | None = None):
