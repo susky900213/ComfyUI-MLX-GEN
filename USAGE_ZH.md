@@ -35,6 +35,85 @@ cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
 如果 ComfyUI 不是虚拟环境安装，把命令开头换成启动 ComfyUI 时实际使用的 Python。
 安装完成后重启 ComfyUI。
 
+### 1.1.3 SenseNova-6.8-Code2Video（代码生成视频）
+
+本仓库的 `SenseNova Code2Video（代码生成视频）` 节点默认使用
+`mlx-vlm` 的 **原生 MLX/Metal Qwen3.5 后端**生成代码，不是扩散视频模型，不使用
+MLX VAE、采样器或 latent 链路。模型先生成一个 Python renderer，再在独立任务目录中
+执行 renderer，最后把任务目录中的 `out/final.mp4` 包装为 ComfyUI 原生 `VIDEO`，可以
+直接连接核心 `SaveVideo`。
+
+### 先将 Transformers 权重转换为 MLX-VLM
+
+SenseNova 官方下载目录是 Transformers 原始 checkpoint，不能直接被 MLX 读取。先确认
+原始目录至少包含 `config.json`、`chat_template.jinja`、`tokenizer.json` 和全部
+`model-*.safetensors` 分片，然后使用仓库工具转换到独立目录：
+
+```bash
+cd /你的/ComfyUI/custom_nodes/ComfyUI-MLX-GEN
+/你的/ComfyUI/.venv/bin/python tools/convert_code2video_to_mlx.py \
+  --hf-path /Users/apple/ComfyUI-Shared/models/mlx/transformer/Code2Video \
+  --mlx-path /Users/apple/ComfyUI-Shared/models/mlx/transformer/Code2Video-MLX \
+  --dtype bfloat16
+```
+
+如果统一内存或磁盘压力较大，可以在转换时使用 MLX 4-bit 权重量化：
+
+```bash
+/你的/ComfyUI/.venv/bin/python tools/convert_code2video_to_mlx.py \
+  --hf-path /absolute/path/to/Code2Video \
+  --mlx-path /absolute/path/to/Code2Video-MLX-4bit \
+  --quantize --q-bits 4 --q-group-size 64
+```
+
+转换会读取并重写约 54.7 GB 权重，输出目录必须与输入目录分开，并预留足够磁盘空间。
+转换工具调用 `mlx-vlm` 官方 Qwen3.5 模型转换器，不在插件内私自重命名 tensor。
+
+默认节点路径是转换后的目录：
+
+```text
+/Users/apple/ComfyUI-Shared/models/mlx/transformer/Code2Video-MLX/
+```
+
+也可以通过环境变量覆盖 MLX 模型路径和任务路径：
+
+```bash
+export COMFYUI_CODE2VIDEO_MLX_MODEL=/absolute/path/to/Code2Video-MLX
+export COMFYUI_CODE2VIDEO_TASK_ROOT=/absolute/path/to/code2video-tasks
+```
+
+节点的 `backend` 默认是 `mlx_vlm`，`device=auto`/`mps` 使用 Apple Metal；MLX 后端不
+支持 CUDA。`transformers` 是保留的显式兼容/对比选项，只有选择该 backend 时才会走
+PyTorch，不是 MLX 路径的回退机制。
+
+导入示例工作流：
+
+```text
+workflows/code2video-t2v.json
+```
+
+工作流连线为：
+
+```text
+MlxCode2Video.video → SaveVideo.video
+```
+
+节点会返回 `VIDEO`、生成的 Python 源码和任务目录。任务目录还会保留
+`render.py`、`model_response.txt`、`SPEC.md`、`render.log`、`VERIFY.md` 和
+`out/final.mp4`，便于检查或复现。每次执行会创建独立的 `code2video-*` 子目录，并对
+renderer 设置超时、CPU 时间和单文件大小上限；执行结束后会检查 MP4、分辨率、FPS 和时长。
+
+官方发布流程通常是服务端模型配合 Claude Code 的 `code-video` skill，本节点提供的是
+本地 MLX-VLM 适配。当前原始模型权重约 54.7 GB；MLX 4-bit 转换可以显著降低权重占用，
+但实际质量、速度和峰值统一内存仍需在本机实测。每次执行会在任务目录写入
+`generation_metrics.json`，包括后端、模型加载时间、生成 token 数、token/s 和 MLX 峰值
+内存，便于建立真实基线。
+
+> 重要安全限制：生成的 `render.py` 是任意 Python 代码。独立工作目录、无交互 stdin、
+> 超时、进程组终止和资源限制只能降低误操作风险，**不是安全沙箱**；节点不能阻止恶意
+> renderer 访问网络、读取宿主机文件或启动其他程序。只使用可信模型权重、可信提示词，
+> 并在需要时用独立用户/容器运行 ComfyUI。
+
 ### 1.1.2 Fibo 2.0 原生 MLX
 
 Fibo 2.0 使用统一 Loader，但现在由仓库内的 native MLX backend 执行：Qwen3-VL 的六组

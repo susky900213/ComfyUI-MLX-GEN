@@ -24,6 +24,7 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     lora,
     moss_image_edit_lora,
     moss_reference_encoder,
+    moss_folder_edit,
     pil_to_torch,
     qwen_edit,
     ref_image_set,
@@ -40,6 +41,7 @@ from comfyui_mlx_gen.nodes import (  # noqa: E402
     yue2_melody,
     yue2_abc,
     raon as raon_nodes,
+    MlxCode2Video,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -61,6 +63,7 @@ NODE_CLASS_MAPPINGS = {
     "MlxMoss4StepLoraApply": lora.MlxMoss4StepLoraApply,
     "MlxMossImageEditLoraApply": moss_image_edit_lora.MlxMossImageEditLoraApply,
     "MlxMossReferenceImageEncoder": moss_reference_encoder.MlxMossReferenceImageEncoder,
+    "MlxMossFolderEdit": moss_folder_edit.MlxMossFolderEdit,
     "MlxClipLoraApply": lora.MlxClipLoraApply,
     "MlxVaeLoraApply": lora.MlxVaeLoraApply,
     "MlxKSamplerMLX": sampler.MlxKSamplerMLX,
@@ -91,6 +94,7 @@ NODE_CLASS_MAPPINGS = {
     "RaonSTT": raon_nodes.RaonSTT,
     "RaonSpeechChat": raon_nodes.RaonSpeechChat,
     "RaonSpeechChatAudio": raon_nodes.RaonSpeechChatAudio,
+    "MlxCode2Video": MlxCode2Video,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -112,6 +116,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MlxMoss4StepLoraApply": "MLX MOSS 4 步 LoRA",
     "MlxMossImageEditLoraApply": "MLX MOSS Image Edit LoRA",
     "MlxMossReferenceImageEncoder": "MLX MOSS 参考图编码",
+    "MlxMossFolderEdit": "MLX MOSS 文件夹逐张编辑",
     "MlxClipLoraApply": "MLX CLIP LoRA",
     "MlxVaeLoraApply": "MLX VAE LoRA",
     "MlxKSamplerMLX": "MLX 采样器",
@@ -142,6 +147,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RaonSTT": "Raon Speech 语音转文字",
     "RaonSpeechChat": "Raon Speech 语音对话",
     "RaonSpeechChatAudio": "Raon Speech 语音对话（语音回答）",
+    "MlxCode2Video": "SenseNova Code2Video（代码生成视频）",
 }
 
 WEB_DIRECTORY = "./web"

@@ -309,7 +309,20 @@ def check_workflow(path: Path, plugin_classes, core_types) -> None:
         print(f"  [info] 只查存在性的 ComfyUI 自带节点：{', '.join(sorted(set(existence_only)))}")
 
     visual_spec = condition_spec(workflow, plugin_classes)
-    loader = next(item for item in workflow["nodes"] if item["type"] == "MlxTransformerLoader")
+    loader = next(
+        (item for item in workflow["nodes"] if item["type"] == "MlxTransformerLoader"),
+        None,
+    )
+    if loader is None:
+        # Code2Video and similar nodes may be complete workflows without the
+        # MLX diffusion loader.  Their node/socket checks above are still
+        # meaningful; the model-tier checks below are specific to diffusion
+        # workflows.
+        check(
+            visual_spec is None,
+            "独立工作流不包含 MlxTransformerLoader（跳过 MLX 档位检查）",
+        )
+        return
     # 「MLX 模型加载」里这个 widget 就叫 model_path（目录名 / 单文件名，相对 models/mlx）
     model_path = str(widget_map(loader, plugin_classes["MlxTransformerLoader"]).get("model_path", ""))
     exists = (ml_paths.component_dir("transformer") / model_path).exists()

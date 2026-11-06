@@ -18,6 +18,7 @@ from .h3_two_stage import (
 from .lora import MlxClipLoraApply, MlxModelLoraApply, MlxMoss4StepLoraApply, MlxVaeLoraApply
 from .moss_image_edit_lora import MlxMossImageEditLoraApply
 from .moss_reference_encoder import MlxMossReferenceImageEncoder
+from .moss_folder_edit import MlxMossFolderEdit
 from .text_encoder import MlxTextEncoder
 from .qwen_edit import MlxQwenEditEncoder
 from .ref_image_set import MlxRefImageSet
@@ -41,6 +42,7 @@ from .fibo2_prompt_enhancer import MlxFibo2PromptEnhancerI2I, MlxFibo2PromptEnha
 from .yue2_melody import MlxYue2MelodyFromAudio
 from .yue2_abc import MlxYue2LoadABC
 from .raon import RaonModelLoader, RaonTTS, RaonSTT, RaonSpeechChat, RaonSpeechChatAudio
+from .code2video import MlxCode2Video
 
 __all__ = [
     "MlxBreezeSampler",
@@ -61,6 +63,7 @@ __all__ = [
     "MlxMoss4StepLoraApply",
     "MlxMossImageEditLoraApply",
     "MlxMossReferenceImageEncoder",
+    "MlxMossFolderEdit",
     "MlxClipLoraApply",
     "MlxVaeLoraApply",
     "MlxKSamplerMLX",
@@ -91,4 +94,5 @@ __all__ = [
     "RaonSTT",
     "RaonSpeechChat",
     "RaonSpeechChatAudio",
+    "MlxCode2Video",
 ]

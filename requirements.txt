@@ -9,3 +9,5 @@ mlx-audio==0.5.1
 mlx-whisper==0.4.3
 # YuE2 固定文本 / ABC tokenizer（生成在 ComfyUI 进程内完成，不需要 FastAPI）。
 tiktoken>=0.9
+# SenseNova-6.8-Code2Video 的 Qwen3.5 MLX-VLM 推理与 Transformers 转换工具。
+transformers>=5.17.0

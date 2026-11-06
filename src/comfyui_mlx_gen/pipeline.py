@@ -2365,6 +2365,16 @@ def run_sampler(defn, model_handle, comps, params, cache):
     def sample():
         # 接了参考图 → 编辑（edit）分支；按大类分派，不静默降级
         # （qwen_image 是文生图大类，接参考图在「MLX KSampler」里就被挡掉了）
+        # MOSS keeps its spatial reference latent in a separate cache bucket and
+        # therefore deliberately does not populate the generic ref_cache_key.
+        # Check its own key first so Image Edit is not silently routed through
+        # ordinary MOSS text-to-image sampling.
+        if params.get("moss_ref_cache_key"):
+            if defn.family != "moss":
+                raise ValueError("moss_ref_cache_key 只支持 MOSS 模型")
+            return _sample_moss(
+                defn, model_handle, comps, params, cache, guidance, progress.update
+            )
         if params.get("ref_cache_key"):
             if defn.family == "flux2":
                 return _sample_flux2_edit(

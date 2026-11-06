@@ -1,0 +1,273 @@
+{
+  "id": "mlx-moss-folder-edit",
+  "revision": 0,
+  "last_node_id": 7,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MlxClipLoader",
+      "pos": [40, 40],
+      "size": [380, 220],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [2],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxClipLoader"
+      },
+      "title": "MOSS Qwen3.5 条件加载",
+      "widgets_values": [
+        "moss",
+        "text_encoder",
+        "OpenMOSS-Team--MOSS-Image-SFT",
+        "bfloat16",
+        4096,
+        8
+      ]
+    },
+    {
+      "id": 2,
+      "type": "MlxTransformerLoader",
+      "pos": [40, 320],
+      "size": [410, 240],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "model",
+          "links": [3],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxTransformerLoader"
+      },
+      "title": "MOSS-Image-SFT Transformer（dense bfloat16）",
+      "widgets_values": [
+        "moss",
+        "OpenMOSS-Team--MOSS-Image-SFT",
+        0,
+        "bfloat16",
+        false,
+        32
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MlxVAELoader",
+      "pos": [40, 620],
+      "size": [410, 220],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "links": [1],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxVAELoader"
+      },
+      "title": "MOSS 专用 VAE（float32）",
+      "widgets_values": [
+        "moss",
+        "OpenMOSS-Team--MOSS-Image-SFT",
+        "float32",
+        0,
+        "vae"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MlxMossFolderEdit",
+      "pos": [560, 100],
+      "size": [700, 760],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae",
+          "type": "mlx_vae",
+          "link": 1,
+          "slot_index": 1
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2,
+          "slot_index": 2
+        },
+        {
+          "name": "model",
+          "type": "model",
+          "link": 3,
+          "slot_index": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "links": [4],
+          "slot_index": 0
+        },
+        {
+          "name": "saved_files",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "success_count",
+          "type": "INT",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxMossFolderEdit"
+      },
+      "title": "MOSS 文件夹逐张参考编辑（可断点续跑）",
+      "widgets_values": [
+        "",
+        "保持原图主体、构图和视角，只按照提示词编辑图像。",
+        "低清晰度，模糊，畸形，水印，黑边，裁切主体",
+        42,
+        50,
+        3.0,
+        1.0,
+        "采样时降分辨率"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "MlxPilToTorch",
+      "pos": [1360, 260],
+      "size": [340, 160],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "images",
+          "link": 4,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [5, 6],
+          "slot_index": 0
+        },
+        {
+          "name": "masks",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null,
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MlxPilToTorch"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 6,
+      "type": "SaveImage",
+      "pos": [1780, 200],
+      "size": [320, 280],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "title": "ComfyUI 预览批处理结果",
+      "widgets_values": [
+        "ComfyUI-MLX-GEN-moss-folder-edit"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "PreviewImage",
+      "pos": [1780, 540],
+      "size": [320, 280],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 6,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "预览最后输出批次",
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 3, 0, 4, 0, "mlx_vae"],
+    [2, 1, 0, 4, 1, "CLIP"],
+    [3, 2, 0, 4, 2, "model"],
+    [4, 4, 0, 5, 0, "images"],
+    [5, 5, 0, 6, 0, "IMAGE"],
+    [6, 5, 0, 7, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [0, 0]
+    },
+    "workflow_notes": "MOSS 文件夹逐张参考编辑模板。当前 MOSS 节点没有浏览器文件夹选择器：请先把图片文件夹直接放入 ComfyUI 的 input/mlx_moss/ 下（例如 input/mlx_moss/my_images/），再把节点 input_directory 填为相对 token mlx_moss/my_images；不要填写绝对路径。节点会按自然排序逐张处理，并将正式 PNG 保存到 output/moss-folder-edit/mlx_moss/my_images/。已有且有效的 PNG 会自动跳过，损坏或未完成的 PNG 会重试。MOSS Transformer 必须使用 dense bfloat16、quantize=0；MOSS VAE 必须使用 float32、quantize=0。默认 50 步、guidance 3.0，符合 MOSS 官方 Image Edit 推荐范围。MlxPilToTorch 后面的 SaveImage / PreviewImage 仅用于 ComfyUI 预览；文件夹节点自身的 saved_files/report/success_count 输出保留在节点上。"
+  },
+  "version": "0.4"
+}
